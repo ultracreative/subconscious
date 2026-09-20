@@ -12,6 +12,7 @@ members = [
     "crates/subc-mcp",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",
+    "crates/uc-discussions",
     "cortexkit-release",
 ]
 

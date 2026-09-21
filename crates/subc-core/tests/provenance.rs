@@ -14,7 +14,8 @@ use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
 use subc_control::RunningImageUnavailableReason;
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, RunningImageAgreement,
+    ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, ModuleProtocol,
+    RunningImageAgreement,
 };
 #[cfg(target_os = "linux")]
 use subc_daemon::test_support::TestTempDir;
@@ -218,6 +219,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
             )],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
     wait_for_registration(&daemon, "provenance-replacement").await;
@@ -251,6 +253,7 @@ fn stub_spec(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
             .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 

@@ -13,7 +13,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, SupervisorEntry, SupervisorHealthStatus,
+    ClientControlRequest, ClientControlResponse, ModuleProtocol, SupervisorEntry,
+    SupervisorHealthStatus,
 };
 use subc_daemon::{
     read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
@@ -1582,6 +1583,13 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     write_program("ck-hang", "sleep 30");
     write_program("ck-aft", "exit 1");
     write_program("ck-mc", "exit 1");
+    // A rollback snapshot beside a live binary. It is the SAME program as
+    // ck-yes and would answer the handshake if asked; the count below proves
+    // it is never asked, because a dotted name is not a domain.
+    write_program(
+        "ck-yes.bak-20260914T004527",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf x >> \"$CK_DOMAIN_PROBE_COUNT\"; echo \"stale snapshot answering\"; exit 0; fi",
+    );
 
     // The production probe deadline is two seconds; under a full parallel
     // suite a shell-script domain has taken longer than that just to start,
@@ -1621,7 +1629,15 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         !help_text.contains("\n  aft "),
         "module binary leaked into help:\n{help_text}"
     );
-    assert_eq!(fs::read_to_string(&count).expect("probe count"), "x");
+    assert_eq!(
+        fs::read_to_string(&count).expect("probe count"),
+        "x",
+        "exactly one probe: the dotted rollback snapshot must never be spawned"
+    );
+    assert!(
+        !help_text.contains("yes.bak"),
+        "rollback snapshot leaked into help as a domain:\n{help_text}"
+    );
 
     let second_help = ck_command()
         .arg("--help")
@@ -1738,16 +1754,18 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     let run_logs = data_home.join("cortexkit").join("run").join("logs");
     fs::create_dir_all(&module_logs).unwrap();
     fs::create_dir_all(&run_logs).unwrap();
+    // Fleet-logging r2 layout: ONE dated segment per module carries every lane
+    // (the module process and each harness plugin), told apart by the
+    // `harness=` bound field on the line rather than by file name. The
+    // daemon's own log is `subc.<date>.log` in the run directory. The stderr
+    // capture is raw child bytes and is deliberately not in the fleet format.
     fs::write(
-        module_logs.join(format!("{module_id}.log")),
+        module_logs.join(format!("{module_id}.2026-09-05.log")),
         format!(
-            "2026-09-05T10:00:00.000Z DEBUG {module_id} hidden debug\n2026-09-05T10:00:03.000Z INFO  {module_id} module line\n"
+            "2026-09-05T10:00:00.000Z DEBUG {module_id}: hidden debug\n\
+             2026-09-05T10:00:01.000Z INFO  {module_id}: [harness=opencode] plugin line\n\
+             2026-09-05T10:00:03.000Z INFO  {module_id}.perf: module line ms=7\n"
         ),
-    )
-    .unwrap();
-    fs::write(
-        module_logs.join(format!("{module_id}.opencode.log")),
-        format!("2026-09-05T10:00:01.000Z INFO  {module_id} plugin line\n"),
     )
     .unwrap();
     fs::write(
@@ -1756,9 +1774,10 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     )
     .unwrap();
     fs::write(
-        run_logs.join("subc.log"),
+        run_logs.join("subc.2026-09-05.log"),
         format!(
-            "2026-09-05T10:00:02.000Z WARN  subc daemon line module_id={module_id}\n2026-09-05T10:00:05.000Z INFO  subc unrelated module_id=other\n"
+            "2026-09-05T10:00:02.000Z WARN  subc: daemon line module_id={module_id}\n\
+             2026-09-05T10:00:05.000Z INFO  subc: unrelated module_id=other\n"
         ),
     )
     .unwrap();
@@ -1786,15 +1805,17 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     assert_eq!(
         text(&output.stdout),
         concat!(
-            "opencode     2026-09-05T10:00:01.000Z INFO  merged-logs plugin line\n",
-            "daemon       2026-09-05T10:00:02.000Z WARN  subc daemon line module_id=merged-logs\n",
-            "mod          2026-09-05T10:00:03.000Z INFO  merged-logs module line\n",
+            "mod          2026-09-05T10:00:01.000Z INFO  merged-logs: [harness=opencode] plugin line\n",
+            "daemon       2026-09-05T10:00:02.000Z WARN  subc: daemon line module_id=merged-logs\n",
+            "mod          2026-09-05T10:00:03.000Z INFO  merged-logs.perf: module line ms=7\n",
             "stderr       2026-09-05T10:00:04.000Z ERROR merged-logs captured line\n"
         )
     );
     assert_eq!(
         text(&output.stderr),
-        "showing 4 of 6 lines (1 below requested level, 1 daemon lines hidden)\n"
+        // The stderr capture line is raw child bytes, not fleet format, and the
+        // summary says so rather than counting it as if it had parsed.
+        "showing 4 of 6 lines (1 below requested level, 1 daemon lines hidden, 1 unparsed lines shown)\n"
     );
 }
 
@@ -1922,6 +1943,69 @@ async fn module_list_renders_status_words_not_wire_booleans() {
     );
     assert!(!text(&output.stdout).contains("true"));
     assert!(!text(&output.stdout).contains("false"));
+
+    module.stop().await.unwrap();
+}
+
+/// What an operator is told about a module that speaks no subc wire.
+///
+/// `live` stays a boolean on the wire, but for this module it answers a weaker
+/// question than it does for every other row on the screen: the daemon can say
+/// the process it launched is alive and nothing more, because there is no
+/// registration to check. Rendering that as the same `running` an ordinary
+/// module gets would quietly upgrade the claim, so the gap is named instead --
+/// beside the declaration that explains it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_names_the_protocol_and_refuses_to_render_live_as_a_boolean() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let module_id = "nats";
+    let mut spec = stub_spec_with_env(module_id, vec![("FAKE_AFT_NEVER_CONNECT", "1")]);
+    spec.protocol = ModuleProtocol::None;
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {
+        entry.state == "running" && entry.protocol == ModuleProtocol::None && entry.live
+    })
+    .await;
+
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id, "--verbose"],
+    );
+    assert_exit(&output, 0);
+    let rendered = text(&output.stdout);
+    assert!(
+        rendered.contains("\n  protocol: none\n"),
+        "the declaration must appear on its own line: {rendered}"
+    );
+    assert!(
+        rendered.contains("n/a (no protocol)"),
+        "live must not render as a liveness word for a module with no wire: {rendered}"
+    );
+    assert!(
+        !rendered.contains("supervision: enabled \u{b7} running"),
+        "live rendered as if the daemon had checked a registration it never had: {rendered}"
+    );
+
+    let listed = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "list", "--verbose"],
+    );
+    assert_exit(&listed, 0);
+    let listed = text(&listed.stdout);
+    assert!(
+        listed.contains("n/a (no protocol)"),
+        "the list's live column must carry the same caveat as status: {listed}"
+    );
+
+    // `ck --json` is the machine surface and stays the wire verbatim: the
+    // renderer's caveat is a rendering, never a rewrite of the field.
+    let status_json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id, "--json"],
+    ));
+    assert_eq!(status_json["module"]["protocol"], "none");
+    assert_eq!(status_json["module"]["live"], true);
 
     module.stop().await.unwrap();
 }
@@ -2982,6 +3066,7 @@ fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
             .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 
@@ -3071,6 +3156,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         state: "running".to_string(),
         enabled: true,
         live: true,
+        protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Ok,
         last_probe_ms: None,
         last_exit_code: None,
@@ -3080,6 +3166,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         restart_count: Some(0),
         max_restarts: Some(3),
         lifetime_restarts: Some(0),
+        spawn_generation: Some(1),
         restart_window_secs: Some(600),
         drain_timeout_ms,
         restart_backoff_ms: Some(100),
@@ -3158,6 +3245,7 @@ async fn spawn_quota_stub(
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
     wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {

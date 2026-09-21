@@ -26,7 +26,7 @@ use subc_protocol::{
     },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
-        ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+        ModuleControlRequestFromModule, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
     SUBC_PROTOCOL_CRATE_VERSION,
@@ -47,11 +47,23 @@ const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
 const FAKE_AFT_BIND_NEVER_REPLY_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY";
 const FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY_AFTER";
+/// Leave the FIRST N route.bind relays unanswered, then behave normally.
+///
+/// The mirror image of `FAKE_AFT_BIND_NEVER_REPLY_AFTER`, and the shape a test
+/// needs to watch a module RECOVER inside one process: restarting the stub
+/// without the wedging variable would also replace the module connection, which
+/// is itself a reason the daemon forgets what it observed, so a restart cannot
+/// distinguish recovery from amnesia.
+const FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY_FIRST";
 const FAKE_AFT_MALFORMED_BIND_REPLY_ENV: &str = "FAKE_AFT_MALFORMED_BIND_REPLY";
 const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
 const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
     "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH";
 const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
+/// Presence makes HELLO declare `ready: false`; absence omits the field.
+const FAKE_AFT_READY_FALSE_ENV: &str = "FAKE_AFT_READY_FALSE";
+/// When this path appears, send `catalog.update { ready: true }`.
+const FAKE_AFT_READY_UPDATE_PATH_ENV: &str = "FAKE_AFT_READY_UPDATE_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
 const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
@@ -114,6 +126,45 @@ const FAKE_AFT_ORPHAN_WRITER_LINE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_LINE";
 /// Distinguishes "I am the orphan, sleep then write" from "spawn an orphan"
 /// on the same binary.
 const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
+/// Presence makes the stub NEVER dial subc: no connect, no HELLO, no
+/// registration, ever. It then stays alive until something stops it.
+///
+/// This is the shape of a third-party server supervised under
+/// `protocol: "none"` -- a `nats-server` is the first real one -- and a
+/// supervision test needs a child that is genuinely alive and genuinely
+/// unregistered at the same moment. A `sleep` binary would be both, but it
+/// cannot be asked what it did with a signal, and what it does with a signal is
+/// the other half of what these tests need to observe.
+const FAKE_AFT_NEVER_CONNECT_ENV: &str = "FAKE_AFT_NEVER_CONNECT";
+/// Where to write a marker file when SIGTERM arrives, just before exiting 0.
+///
+/// The marker is the witness that the supervisor ASKED before it forced: the
+/// file cannot exist unless the signal was delivered and this process handled
+/// it, and the accompanying exit 0 is what distinguishes a cooperative stop from
+/// the SIGKILL the drain falls back to.
+///
+/// Unix only, like the mode it configures: Windows has no SIGTERM to hand a
+/// process, so the supervisor does not send one and there is nothing to witness.
+#[cfg(unix)]
+const FAKE_AFT_SIGTERM_MARKER_PATH_ENV: &str = "FAKE_AFT_SIGTERM_MARKER_PATH";
+/// Presence installs a SIGTERM handler that does nothing, so the signal is
+/// delivered and deliberately not acted on.
+///
+/// This is the control for the marker mode above. Without it, a test that sees a
+/// clean exit cannot tell the child's cooperation from the default disposition
+/// of an unhandled SIGTERM, and a teardown that never sent a signal at all would
+/// be indistinguishable from one that did. Unix only, for the same reason.
+#[cfg(unix)]
+const FAKE_AFT_IGNORE_SIGTERM_ENV: &str = "FAKE_AFT_IGNORE_SIGTERM";
+/// Where to write a file once this process is parked AND any configured SIGTERM
+/// handler is installed.
+///
+/// A never-connecting process has no registration for a test to wait on, so
+/// without this a test would have to guess when the child is ready. The guess
+/// matters: a SIGTERM that arrives before the handler is installed gets the
+/// signal's DEFAULT disposition, and a cooperative-stop assertion would then
+/// fail for a reason that has nothing to do with the supervisor.
+const FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV: &str = "FAKE_AFT_NEVER_CONNECT_READY_PATH";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -130,6 +181,7 @@ const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
 /// assertion passes whether or not the environment ever reached the process.
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
+const READY_UPDATE_CORR: u64 = 2;
 const STUB_EGRESS_BUFFER: usize = 64;
 const FAKE_AFT_FIXTURE_SUFFIX: &str = ".fixture.json";
 
@@ -170,9 +222,68 @@ async fn main() -> Result<(), StubError> {
         run_exit_only(exit_code).await?;
         unreachable!("run_exit_only always exits the process");
     }
+    // Checked before `StubConfig::from_env()` for the same reason as the arms
+    // above: a process that never dials subc has no business requiring the
+    // `--subc` argument that only a subc-speaking child needs.
+    if env_flag(FAKE_AFT_NEVER_CONNECT_ENV) {
+        return run_never_connect().await;
+    }
 
     let config = StubConfig::from_env()?;
     run(config).await
+}
+
+/// Stay alive without ever touching subc, and respond to SIGTERM the way this
+/// run was configured to.
+///
+/// Three configured dispositions, each an observation a supervision test needs:
+///
+/// * a marker path -> write the file, exit 0. "I was asked and I complied."
+/// * ignore -> a handler that does nothing, so the signal lands and changes
+///   nothing. Forces the supervisor to spend its full budget and then kill.
+/// * neither -> no handler at all, so SIGTERM keeps its default disposition and
+///   the process dies of signal 15.
+async fn run_never_connect() -> Result<(), StubError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let marker = env::var(FAKE_AFT_SIGTERM_MARKER_PATH_ENV).ok();
+        let ignore = env_flag(FAKE_AFT_IGNORE_SIGTERM_ENV);
+        if marker.is_some() || ignore {
+            // Registering a handler at all REPLACES SIGTERM's default
+            // disposition for this process, which is what makes the ignore mode
+            // genuinely unkillable by SIGTERM rather than merely slow.
+            let mut terminate = signal(SignalKind::terminate()).map_err(StubError::Io)?;
+            // Announced only now: the handler above must already be installed,
+            // or a test that waits for this file and then signals would still
+            // race the default disposition.
+            announce_never_connect_ready()?;
+            loop {
+                terminate.recv().await;
+                if let Some(path) = marker.as_deref() {
+                    fs::write(path, b"sigterm\n").map_err(StubError::Io)?;
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    announce_never_connect_ready()?;
+
+    // Park. The supervisor's teardown -- signal, or the kill behind it -- is what
+    // ends this process; nothing here decides to stop on its own, because a test
+    // that waits for a self-terminating child is measuring the child's timer
+    // rather than the supervisor's teardown.
+    std::future::pending::<()>().await;
+    unreachable!("a pending future never resolves");
+}
+
+fn announce_never_connect_ready() -> Result<(), StubError> {
+    let Ok(path) = env::var(FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV) else {
+        return Ok(());
+    };
+    fs::write(path, b"ready\n").map_err(StubError::Io)
 }
 
 fn fixture_from_sidecar() -> Result<Option<FixtureSpec>, StubError> {
@@ -379,6 +490,17 @@ where
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
 
+    if let Some(path) = config.ready_update_path.clone() {
+        let update_writer = writer.clone();
+        let update_config = config.clone();
+        tokio::spawn(async move {
+            while !path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+            let _ = send_ready_update(&update_writer, &update_config).await;
+        });
+    }
+
     if let Some((exit_after, exit_code)) = config
         .crash_after
         .map(|after| (after, 2))
@@ -442,6 +564,7 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
             &config.tools,
             config.capabilities.clone(),
             &config.busy_gauges,
+            config.ready,
         ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: if config.advertise_health {
@@ -455,6 +578,39 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(StubError::FrameBuild)?;
     send_outbound(writer, frame).await
+}
+
+async fn send_ready_update(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+) -> Result<(), StubError> {
+    let provides = manifest(
+        &config.module_id,
+        config.role.clone(),
+        config.concurrency.clone(),
+        &config.tools,
+        config.capabilities.clone(),
+        &config.busy_gauges,
+        config.ready,
+    )
+    .provides;
+    let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+        provides,
+        capabilities: None,
+        ready: Some(true),
+    })
+    .map_err(StubError::Json)?;
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        READY_UPDATE_CORR,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, frame).await?;
+    record_event(config, json!({"kind": "catalog_ready_update_sent"}))
 }
 
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, StubError>
@@ -541,6 +697,12 @@ async fn handle_frame(
                     }),
                 )?,
             }
+            Ok(true)
+        }
+        FrameType::Response
+            if frame.header.channel == 0 && frame.header.corr == READY_UPDATE_CORR =>
+        {
+            record_event(config, json!({"kind": "catalog_ready_update_ack"}))?;
             Ok(true)
         }
         FrameType::Error => {
@@ -934,10 +1096,16 @@ async fn handle_control_request(
                 }),
             )?;
             state.route_bind_count += 1;
+            // `route_bind_count` was just incremented, so it is this bind's
+            // 1-based ordinal: `_FIRST` wedges ordinals 1..=n and `_AFTER`
+            // wedges everything past n.
             let bind_never_reply = config.bind_never_reply
                 || config
                     .bind_never_reply_after
-                    .is_some_and(|after| state.route_bind_count > after);
+                    .is_some_and(|after| state.route_bind_count > after)
+                || config
+                    .bind_never_reply_first
+                    .is_some_and(|first| state.route_bind_count <= first);
             if bind_never_reply {
                 record_event(
                     config,
@@ -1353,13 +1521,43 @@ fn record_event(config: &StubConfig, event: Value) -> Result<(), StubError> {
     append_json_line(path, event)
 }
 
+/// Appends one event as a SINGLE `write_all`, never `writeln!`.
+///
+/// `writeln!(file, "{event}")` goes through `write_fmt`, and `serde_json`'s
+/// `Display` writes the value in many small fragments -- one `write` syscall
+/// per brace, key, separator and the trailing newline. The stub handles data
+/// requests in SPAWNED TASKS (see the `tokio::spawn` in the request arm) while
+/// control frames are handled on the reader loop, so two writers share this
+/// file and their fragments INTERLEAVE mid-line. The reader
+/// (`stub_events` -> `filter_map(serde_json::from_str().ok())`) then discards
+/// every corrupted line SILENTLY, so both events vanish permanently rather
+/// than arriving late.
+///
+/// Measured with 8 concurrent appenders writing 1600 events:
+///
+///   writeln!    1600 lines,   24 parseable,  1576 LOST
+///   write_all   1600 lines, 1600 parseable,     0 lost
+///
+/// That is the mechanism behind a recurring Windows failure in
+/// `draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_ordered`,
+/// where the client had its response while the event file held NEITHER the
+/// terminal NOR the preceding draining event. Those two are written by the two
+/// racing writers, microseconds apart by design -- the drain reaches quiescence
+/// the instant the response lands -- which is why this test hits it first.
+/// An earlier fix reordered `record_terminal` before the wire send; that
+/// removed a different dependency and moved the two writes CLOSER together,
+/// which can only have raised the collision odds.
 fn append_json_line(path: &Path, event: Value) -> Result<(), StubError> {
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(StubError::Io)?;
-    writeln!(file, "{event}").map_err(StubError::Io)
+    // One buffer, one syscall: an O_APPEND write of a line-sized buffer lands
+    // whole, so a concurrent appender can interleave BETWEEN lines but never
+    // within one.
+    file.write_all(format!("{event}\n").as_bytes())
+        .map_err(StubError::Io)
 }
 
 fn manifest(
@@ -1369,6 +1567,7 @@ fn manifest(
     tools: &[String],
     capabilities: Option<CapabilityDeclarations>,
     busy_gauges: &[String],
+    ready: Option<bool>,
 ) -> subc_protocol::manifest::ModuleManifest {
     let self_signals = (!busy_gauges.is_empty()).then(|| {
         vec![SelfSignalDeclaration {
@@ -1383,12 +1582,15 @@ fn manifest(
             note: None,
         }]
     });
-    subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
+    let mut builder = subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
         .provides(vec![provider_role(role, concurrency, tools)])
         .capabilities(capabilities)
         .self_signals(self_signals)
-        .provenance(manifest_provenance())
-        .build()
+        .provenance(manifest_provenance());
+    if let Some(ready) = ready {
+        builder = builder.ready(ready);
+    }
+    builder.build()
 }
 
 fn manifest_provenance() -> Option<ManifestProvenance> {
@@ -1516,9 +1718,12 @@ struct StubConfig {
     reject_attach: bool,
     bind_never_reply: bool,
     bind_never_reply_after: Option<usize>,
+    bind_never_reply_first: Option<usize>,
     malformed_bind_reply: Option<MalformedBindReply>,
     fail_registration: bool,
     events_path: Option<PathBuf>,
+    ready: Option<bool>,
+    ready_update_path: Option<PathBuf>,
     emit_after_detach: bool,
     push_on_request: bool,
     fanout_on_request: bool,
@@ -1595,6 +1800,13 @@ impl StubConfig {
                     .map_err(|source| StubError::InvalidBindNeverReplyAfter { raw, source })
             })
             .transpose()?;
+        let bind_never_reply_first = env::var(FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .map_err(|source| StubError::InvalidBindNeverReplyFirst { raw, source })
+            })
+            .transpose()?;
         let concurrency = concurrency_from_env()?;
         let role = role_from_env()?;
         let status = env::var(FAKE_AFT_STATUS_ENV).ok().map(|raw| {
@@ -1635,9 +1847,12 @@ impl StubConfig {
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
             bind_never_reply: env_flag(FAKE_AFT_BIND_NEVER_REPLY_ENV),
             bind_never_reply_after,
+            bind_never_reply_first,
             malformed_bind_reply: malformed_bind_reply_from_env()?,
             fail_registration,
             events_path,
+            ready: env_flag(FAKE_AFT_READY_FALSE_ENV).then_some(false),
+            ready_update_path: env::var_os(FAKE_AFT_READY_UPDATE_PATH_ENV).map(PathBuf::from),
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
             push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
             fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),
@@ -1839,6 +2054,10 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidBindNeverReplyFirst {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
     InvalidToolcallDelay {
         raw: String,
         source: std::num::ParseIntError,
@@ -1911,6 +2130,10 @@ impl fmt::Display for StubError {
             Self::InvalidBindNeverReplyAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidBindNeverReplyFirst { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV} value '{raw}': {source}"
             ),
             Self::InvalidToolcallDelay { raw, source } => write!(
                 f,
@@ -1990,6 +2213,7 @@ impl Error for StubError {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
             Self::InvalidBindNeverReplyAfter { source, .. } => Some(source),
+            Self::InvalidBindNeverReplyFirst { source, .. } => Some(source),
             Self::InvalidToolcallDelay { source, .. } => Some(source),
             Self::InvalidExitCode { source, .. } => Some(source),
             Self::InvalidOrphanWriterDelay { source, .. } => Some(source),

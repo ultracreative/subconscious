@@ -15,6 +15,32 @@
 # a position-based view (`tail`) over a pattern-based one for verdicts, since a
 # verdict you failed to predict still occupies the last line.
 
+# THE INVARIANT THIS SCRIPT DEFENDS, STATED ONCE, EXECUTABLY NOWHERE YET:
+#
+#     THE THING BEING VERIFIED IS THE THING THAT WILL RUN.
+#
+# Every arm below is an INSTANCE of a way that sentence can be false: PATH
+# resolving to a different file than the one placed; a sidecar describing
+# another file; a rollback verified against itself; a marker counted in the
+# wrong table; a text file that is not an executable at all. Not one of the arms
+# says the sentence.
+#
+# BROCA's diagnostic (2026-09-19) is why that matters and it is uncomfortable:
+# A GUARD THAT CATCHES STRANGERS IS DEFENDING AN INVARIANT; A GUARD THAT KEEPS
+# CATCHING THE PERSON WHO WROTE IT IS COMPENSATING FOR ONE NOBODY HAS WRITTEN
+# DOWN. At least three of these arms have refused MY OWN cards. I had read that
+# as the gate working -- and it is, which is exactly what keeps the tell quiet:
+# a gate that never fires is obviously untested and gets examined, while a gate
+# that keeps catching its author reads as vigilance and gets praised.
+#
+# So this header is a statement of intent and a standing TODO, not a claim of
+# coverage. The arms are load-bearing and each one is here because it caught a
+# real defect; what is missing is a check of the sentence itself, which would
+# make the next novel falsification route fail by name instead of sailing past
+# five arms that were each written for a different one. If you add an arm here,
+# ask BROCA's question first: what else is the same shape and would NOT be
+# caught by the arm I am about to write?
+#
 # Place a staged module binary with every gate arm that has caught a real defect.
 #
 # Each arm exists because it failed once, and each failure was a TRUE statement about
@@ -32,9 +58,35 @@
 #   warm-exec      macOS first-exec assessment is per-inode and does not transfer from
 #                  the staging path, so it must run on the destination before the restart.
 #
+#
+# CUTTING THE DAEMON ON macOS: `bootout` IS A RESTART, NOT A STOP, AND IT REPORTS
+# TWO FAILURES WHILE SUCCEEDING (measured 2026-09-20 on this desk).
+#
+#   plist   KeepAlive = SuccessfulExit, RunAtLoad = true
+#   daemon  the SIGTERM handler exits 0 BY DESIGN, so supervised children observe
+#           EOF on their control socket and run their own teardown instead of
+#           being SIGKILLed by a dropped Tokio runtime
+#
+# So `launchctl bootout gui/<uid>/cortexkit.subc` sends SIGTERM, the daemon exits
+# SUCCESSFULLY, and KeepAlive relaunches it before bootout can finish removing the
+# job. bootout then reports `3: No such process` and a following `bootstrap`
+# reports `5: Input/output error` (already loaded). BOTH ERRORS ARE ARTIFACTS OF
+# RACING launchd'"'"'S OWN RELAUNCH; the cut worked, and the log shows the announced
+# drain followed ~1s later by `subc daemon starting`.
+#
+# WHY THIS IS WORTH WRITING DOWN RATHER THAN REMEMBERING: a command that reports
+# failure while succeeding trains the operator to ignore its output, and the next
+# time it reports failure while FAILING the message will read the same. Verify a
+# cut by the daemon'"'"'s own evidence -- a new pid, inode proc == disk, and the
+# `subc daemon starting` line after the drain -- never by launchctl'"'"'s exit code.
+#
+# To genuinely STOP the daemon (not restart it), the job must be disabled first,
+# because a clean exit is exactly what KeepAlive=SuccessfulExit revives.
+#
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
-#                   --marker <string> [--control <string>] [--no-restart]
+#                   --marker <string> [--control <string>] [--old-control <string>]
+#                   [--no-restart]
 #
 # Refuses (exit 2) before touching the destination if any pre-arm fails.
 #
@@ -46,7 +98,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
 
 while (($# > 0)); do
   case "$1" in
@@ -56,9 +108,11 @@ while (($# > 0)); do
     --path-face) PATH_FACE="$2"; shift 2 ;;
     --marker) MARKER="$2"; shift 2 ;;
     --control) CONTROL="$2"; shift 2 ;;
+    --old-control) OLD_CONTROL="$2"; shift 2 ;;
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
+    --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
     # correct fail-closed behaviour and also means the binary snapshot restores
@@ -106,6 +160,28 @@ DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+
+# BEFORE-READINGS: what exists only while the OUTGOING image runs.
+#
+# ENGRAM's rule (2026-09-19), from a quota incident where they killed a runaway
+# loop and lost the one reading that would have said whether it was about to
+# stop itself: BEFORE AN INTERVENTION THAT ENDS A LIVE PHENOMENON, ASK WHAT
+# READING ONLY EXISTS WHILE IT IS RUNNING, AND TAKE THAT READING FIRST.
+#
+# A placement IS such an intervention -- the outgoing process dies at the
+# restart, taking its gauges, counters and in-flight state with it. Every other
+# arm here reads the FILE, so none of them can supply this. It was being done ad
+# hoc when a card happened to ask, which is how I placed an aft card and only
+# afterwards wanted the outgoing image's steady-state write rate, by which point
+# the process carrying it was gone.
+#
+# Output is labelled and printed; it decides NOTHING, because a reading whose
+# meaning is known in advance belongs in --marker or --control instead.
+if [ -n "${BEFORE_CMD:-}" ]; then
+  say "=== before-readings (from the OUTGOING image; gone after restart)"
+  sh -c "$BEFORE_CMD" 2>&1 | sed 's/^/  /' \
+    || say "  (before-reading exited non-zero; recorded, not fatal)"
+fi
 
 say "=== gate"
 
@@ -329,6 +405,7 @@ count_in() {  # count_in <table> <file> <needle>
 # Collect every discriminating table, then prefer one whose control reads on both
 # images. Refusing only when NO such table exists keeps the arm as strict as it
 # was without failing valid cards (PLEX, 190406a, first card to hit it).
+marker_table=""
 if [ "$MARKER" = "none" ]; then
   # No literal to compare. Substitute the strongest available discriminator:
   # a rebuild always moves LC_UUID, and two files sharing one are the same build.
@@ -348,11 +425,47 @@ for t in strings nm; do
   ml=$(count_in "$t" "$DEST" "$MARKER")
   say "marker $t:\"$MARKER\" staged $ms / live $ml"
   if [ "$ms" -gt 0 ] && [ "$ml" -eq 0 ]; then marker_tables="$marker_tables $t"; fi
+  # N/N in ONE table is not a refusal on its own: a JSON key that is new as a
+  # string literal can share its spelling with a symbol both builds already
+  # carry (PLEX, 01c23c5: `annotations` strings 1/0, nm 3/3). The literal
+  # discriminates; the symbol is a different fact about a different table. What
+  # keeps this honest is the control read in the SAME table the marker
+  # discriminated in (below). Refusal is reserved for a marker that separates
+  # the builds in NO table, which the check after this loop enforces.
   if [ "$ms" -gt 0 ] && [ "$ml" -gt 0 ]; then
-    refuse "marker reads on BOTH images in the $t table: it does not separate the two builds"
+    say "  note: marker also reads on both images in the $t table; that table is not evidence either way"
   fi
 done
-[ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: absent from the staged artifact (dead-code-eliminated, or a phrase from a comment, or a string belonging to a different binary)"
+# SECOND CONTROL, PRESENT ONLY ON THE LIVE IMAGE (CEREB's design, adopted 2026-09-20
+# from their cerebellum b68b31e0 card, which carried two where this gate asked for one).
+#
+# WHY ONE CONTROL IS NOT ENOUGH. The control above proves the counting tool can read
+# both files. It does NOT prove the two reads are aimed at DIFFERENT files. Aim both
+# at the staged artifact and a present-on-both control still passes -- every row then
+# reads "staged N / live N" and the gate refuses the MARKER, naming the build when the
+# fault is the reader. That refusal is indistinguishable from a genuinely stale stage.
+#
+# A needle present only on the live side cannot pass unless the live read genuinely
+# reached the OLD file, so marker (staged-only) plus this (live-only) is a two-way
+# proof through one instrument. The natural pick is the marker's own SUPERSEDED
+# predecessor -- v10 against v12 -- which settles supersession in a single row instead
+# of asserting arrival and departure separately.
+if [ -n "$OLD_CONTROL" ]; then
+  oc_seen=0
+  for t in strings nm; do
+    oc_staged=$(count_in "$t" "$STAGED" "$OLD_CONTROL")
+    oc_live=$(count_in "$t" "$DEST" "$OLD_CONTROL")
+    [ "$oc_live" -gt 0 ] || continue
+    say "old-control $t:\"$OLD_CONTROL\" staged $oc_staged / live $oc_live"
+    [ "$oc_staged" -eq 0 ] \
+      || refuse "--old-control \"$OLD_CONTROL\" still reads $oc_staged in the staged artifact ($t): it is not superseded, so it cannot prove the two reads are aimed at different files"
+    oc_seen=1
+  done
+  [ "$oc_seen" = "1" ] \
+    || refuse "--old-control \"$OLD_CONTROL\" is ABSENT from the running image in both tables; 0 there means the needle is wrong or the live read is not reaching the running file, and separating those is exactly what this arm is for"
+fi
+
+[ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: either absent from the staged artifact (dead-code-eliminated, a phrase from a comment, a string from a different binary) or present on BOTH images everywhere (a control, not a marker)"
 marker_table=""
 if [ -n "$CONTROL" ]; then
   for t in $marker_tables; do
@@ -387,12 +500,18 @@ else
 fi
 say "marker discriminates in the $marker_table table"
 fi
+# Under --marker none there is no marker table to bind the control to, so the
+# control's job changes: it proves the COUNTING INSTRUMENT works on both images
+# (a needle known present reading >0 in strings on each), not that a marker's
+# table is readable. Without this arm `--marker none --control X` accepted X
+# unread, which is a control that proves nothing (found on ENGRAM c5a4c94).
 if [ -n "$CONTROL" ]; then
-  c_staged=$(count_in "$marker_table" "$STAGED" "$CONTROL")
-  c_live=$(count_in "$marker_table" "$DEST" "$CONTROL")
-  say "control $marker_table:\"$CONTROL\" staged $c_staged / live $c_live"
+  control_table="${marker_table:-strings}"
+  c_staged=$(count_in "$control_table" "$STAGED" "$CONTROL")
+  c_live=$(count_in "$control_table" "$DEST" "$CONTROL")
+  say "control $control_table:\"$CONTROL\" staged $c_staged / live $c_live"
   { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } \
-    || refuse "control must read on BOTH images in the SAME table the marker used, else the marker's count is uninformative"
+    || refuse "control must read on BOTH images in the $control_table table, else the instrument itself is unproven on one of them"
 fi
 
 # --gone asserts a REMOVAL, which is the inverse of a marker: a marker asks "did the
@@ -559,4 +678,14 @@ if [ "$RESTART" -eq 1 ]; then
     # like findings about the module.
     say "  ck --json provenance $MODULE | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"modules\"][0][\"daemon_observed\"][\"pid\"])'"
     say "  then inode proc-vs-disk on that pid, which is the only proof it runs these bytes"
+    # LOGS: TWO FILES, TWO QUESTIONS. The module's own r2 sink is where a
+    # current line lands; the daemon's stderr capture is a frozen archive
+    # once a module adopts fleet logging, and it can only hold or grow --
+    # nothing removes lines from it. A grep there returns a true count of
+    # HISTORICAL lines that reads exactly like a fresh one (broca's five
+    # un-timestamped seal lines, all pre-adoption, read as "newest" on the
+    # 0.3.106 card). So: read the event from the r2 sink, and read only the
+    # SIZE of the archive, which must not move.
+    say "  logs: event in the module's r2 sink ~/.local/share/cortexkit/$MODULE/logs/$MODULE.<YYYY-MM-DD>.log (timestamped)"
+    say "        archive ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log must not GROW ($(wc -c < ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log 2>/dev/null || echo 0) bytes now); a line found there is historical"
 fi

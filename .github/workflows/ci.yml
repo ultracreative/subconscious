@@ -14,7 +14,95 @@ on:
   # registry. A red here with no commit of ours is that class, not a
   # regression, and it must not wait for the next unrelated push to surface.
   schedule:
-    - cron: '0 6 * * *'
+    # *** DO NOT CHANGE THIS CRON BEFORE 2026-11-02. *** It is a load-bearing
+    # arm of a three-repo measurement and changing it would not FAIL -- the
+    # numbers would keep arriving and would simply mean something else.
+    #
+    # Deliberately NOT on the hour. Measured 2026-09-20 across two repos with
+    # identical `0 6 * * *` declarations: subconscious n=14 mean +4h19m (range
+    # +3h40m..+5h02m), fusiform n=13 mean +4h31m (+3h50m..+5h19m). A stable
+    # ~4.5h SHIFT with ~40m of jitter on top, not the load jitter GitHub
+    # documents.
+    #
+    # THE MINUTE QUESTION IS CLOSED and this line no longer tests it. CEREB's
+    # `17 4` (n=14, mean +4h54m, +4h22m..+5h36m) lands between the two `0 6`
+    # series, and their 04:17 declaration delivers ~1h20m EARLIER than the
+    # 06:00 ones -- so delivery tracks the declared time and the delay does not
+    # key on the popular `0` minute.
+    #
+    # Two models now fit every series and predict this line's delivery to
+    # within two minutes of each other:
+    #     constant offset   declared + ~4.5h
+    #     timezone          declared read as US Eastern (UTC-4) + 20-55m jitter
+    # Agreement is evidence only if the instruments could have disagreed, and
+    # these cannot -- so this declaration is kept as a fourth data point, not as
+    # a test. The discriminator is the 2026-11-01 US Eastern DST boundary
+    # (UTC-4 -> UTC-5, checked against the tz database): under the timezone
+    # model the UTC delivery shifts an hour, under a true offset it does not.
+    # fusiform is held at `0 6` through that boundary as the control, so a repo
+    # that changed NOTHING separates a scheduler change from a timezone change.
+    #
+    # The immediate reading is a PAIR, not an absolute (CEREB's instrument):
+    # this repo's `17 3` sits exactly one hour before cerebellum's `17 4`, so
+    # on any given morning the GAP between the two deliveries measures the
+    # slope with the day's congestion cancelled as common-mode. A stable 60m
+    # gap means delivery tracks declaration 1:1 and kills every "partly tracks"
+    # story; FUSI's three-point estimate could only bound the slope at ~0.78
+    # with a spread that also admits 1.0. The gap is degenerate across the two
+    # live models above -- both predict 60m -- so it sharpens, it does not
+    # discriminate.
+    #
+    # WHY THIS LINE IS ALSO A WITHIN-REPO CONTROL, which was not the reason it
+    # was moved. CEREB's one-sided test (delivery cannot precede the declared
+    # time, so each repo's EARLIEST observation bounds any timezone reading)
+    # falsifies UTC-5 on all three repos and UTC-4 on two: subconscious's
+    # `0 6` would have to land no earlier than 10:00Z and its minimum is
+    # 09:40Z, fusiform's 09:50Z. The test is conservative in the safe
+    # direction -- a sample minimum can only FALL with more data -- so those
+    # margins are floors on the violation. What survives (UTC-3 and east) does
+    # so only by inflating the implied jitter until "timezone" and "constant
+    # offset" are the same functional form: declared + constant + non-negative
+    # jitter, separable ONLY by whether the constant moves on a DST boundary.
+    #
+    # That left one unexplained term: the three minima are +3h40m, +3h50m,
+    # +4h22m, and cerebellum sits 42m above this repo at comparable n. A
+    # cross-repo pair cannot resolve it, because a shared constant is exactly
+    # the common-mode noise same-morning pairing cancels. THIS repo at `17 3`
+    # against THIS repo's own `0 6` history (n=14, mean +4h19m, min +3h40m)
+    # is the comparison that can: same repo, org, workflow and runners, only
+    # the declared time changed, so every per-repo term cancels. Constant
+    # offset predicts the new series reproduces ~+4h19m.
+    #
+    # READING THE BOUNDARY. Transition instant is 2026-11-01T06:00:00Z, located
+    # by binary search against the tz database rather than by the
+    # first-Sunday rule (a daily 00:00Z sample cannot locate an instant inside
+    # a day, and that artefact gave a wrong date by one on two seats' first
+    # attempt). This repo's 03:17 and cerebellum's 04:17 are both clean on
+    # 11-01 -- each is well clear of 06:00Z and after the 02:00 local fallback.
+    #
+    # *** THE OBSERVABLE SEPARATION IS ONE HOUR, NOT FIVE. *** An earlier
+    # version of this comment said the fire time moves five hours, which is
+    # true and unmeasurable: we observe `createdAt`, never the fire. The two
+    # models differ only in what they put BETWEEN fire and createdAt --
+    # eastern puts 20-55m of ordinary queue delay there, utc puts ~4.5h of
+    # backlog -- and the 5h fire-time gap is almost exactly cancelled by it.
+    # Each repo carries its OWN measured residual across the boundary, so the
+    # per-repo term cancels and every arm separates by the same hour:
+    #     this repo   utc 07:36Z   eastern 08:36Z
+    #     cerebellum  utc 09:11Z   eastern 10:11Z
+    #     fusiform    utc 10:31Z   eastern 11:31Z
+    # Expecting five would make a clean positive unreadable: seeing ~08:36Z
+    # against a 5h prediction reads as "neither model fits" when it is the
+    # eastern model landing within twenty minutes.
+    # fusiform's `0 6` is NOT readable on 11-01: 06:00Z is the transition
+    # instant to the second, so which side it resolves on is an implementation
+    # detail no model predicts. Its clean row is 11-02.
+    # Re-measure with:
+    #   gh run list --workflow CI --event schedule --limit 20 \
+    #     --json createdAt --jq '.[].createdAt'
+    # Until that resolves: anything asking "did the nightly fire?" must size its
+    # window from the OBSERVED delivery distribution, never from this line.
+    - cron: '17 3 * * *'
 
 concurrency:
   # Deliberate: rapid pushes to the same ref cancel the earlier runs, so only the

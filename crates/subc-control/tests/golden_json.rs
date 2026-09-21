@@ -4,8 +4,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
-    DaemonBuildProvenance, DaemonObservedProcess, ModuleDeclaredProvenance, PollKind,
-    RouteCloseReason, RunningImageAgreement, RunningImageEvidence, StderrCaptureState, StderrTail,
+    DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn, ModuleDeclaredProvenance,
+    ModuleProtocol, PollKind, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
+    SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot, StderrCaptureState, StderrTail,
     StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
     SupervisorHealthStatus, SupervisorModuleProvenance, SupervisorObservedProcess,
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
@@ -61,6 +62,18 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("supervisor_entry", &supervisor_entry());
+    assert_golden(
+        "supervisor_spawn_event",
+        &SpawnEvent {
+            cursor: spawn_cursor(12),
+            kind: SpawnEventKind::Exited,
+            module_id: "nats".to_string(),
+            spawn_generation: 3,
+            pid: 4242,
+            exit_code: None,
+            exit_signal: Some(9),
+        },
+    );
     assert_golden(
         "supervisor_entry_with_restart_window",
         &supervisor_entry_with_restart_window(),
@@ -159,6 +172,20 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
         (
             "client_control_request_supervisor_list",
             ClientControlRequest::SupervisorList {},
+        ),
+        (
+            "client_control_request_supervisor_spawn_snapshot",
+            ClientControlRequest::SupervisorSpawnSnapshot {},
+        ),
+        (
+            "client_control_request_supervisor_spawn_subscribe",
+            ClientControlRequest::SupervisorSpawnSubscribe {
+                since: Some(spawn_cursor(11)),
+            },
+        ),
+        (
+            "client_control_request_supervisor_spawn_subscribe_from_now",
+            ClientControlRequest::SupervisorSpawnSubscribe { since: None },
         ),
         (
             // drain_timeout_ms: None is skipped on the wire, so this vector's
@@ -305,6 +332,21 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorList {
                 generation: 7,
                 modules: vec![supervisor_entry()],
+            },
+        ),
+        (
+            "client_control_response_supervisor_spawn_snapshot",
+            ClientControlResponse::SupervisorSpawnSnapshot {
+                snapshot: SpawnSnapshot {
+                    cursor: spawn_cursor(11),
+                    ring_bound: 4096,
+                    live: vec![LiveSpawn {
+                        module_id: "nats".to_string(),
+                        spawn_generation: 3,
+                        pid: 4242,
+                        spawned_at_ms: 1_700_000_000_000,
+                    }],
+                },
             },
         ),
         (
@@ -713,6 +755,7 @@ fn bind_identity() -> BindIdentity {
 fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
         module_id: "aft-tools".to_string(),
+        ready: true,
         module_version: Some("0.9.3".to_string()),
         roles: provider_roles(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -731,6 +774,7 @@ fn catalog_entry() -> CatalogEntry {
 fn catalog_entry_with_self_signals() -> CatalogEntry {
     CatalogEntry {
         module_id: "signal-tools".to_string(),
+        ready: true,
         module_version: Some("0.10.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -767,6 +811,7 @@ fn catalog_entry_with_self_signals() -> CatalogEntry {
 fn catalog_entry_without_capabilities() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-tools".to_string(),
+        ready: true,
         module_version: Some("0.8.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -778,6 +823,7 @@ fn catalog_entry_without_capabilities() -> CatalogEntry {
 fn catalog_entry_without_operation_description() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-management".to_string(),
+        ready: true,
         module_version: Some("0.7.0".to_string()),
         roles: vec![ProviderRole::ManagementSurface {
             operations: vec![ManagementOperation {
@@ -796,12 +842,20 @@ fn catalog_entry_without_operation_description() -> CatalogEntry {
     }
 }
 
+fn spawn_cursor(seq: u64) -> SpawnCursor {
+    SpawnCursor {
+        daemon_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+        seq,
+    }
+}
+
 fn supervisor_entry() -> SupervisorEntry {
     SupervisorEntry {
         module_id: "aft-tools".to_string(),
         state: "running".to_string(),
         enabled: true,
         live: true,
+        protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Degraded,
         last_probe_ms: Some(1_700_000_000_000),
         last_exit_code: None,
@@ -813,6 +867,7 @@ fn supervisor_entry() -> SupervisorEntry {
         restart_count: Some(2),
         max_restarts: Some(3),
         lifetime_restarts: None,
+        spawn_generation: None,
         // The pre-window shape: a daemon that never had a window omits the key,
         // and this golden is what pins that omission.
         restart_window_secs: None,
@@ -895,6 +950,46 @@ fn supervisor_entry_policy_fields_round_trip_and_old_wire_stays_unknown() {
     assert_eq!(decoded.drain_timeout_ms, None);
     assert_eq!(decoded.restart_backoff_ms, None);
     assert_eq!(decoded.restart_max_backoff_ms, None);
+}
+
+/// A payload with no `protocol` key comes from a daemon that had only one kind
+/// of module, and `subc` is exactly what it meant. The default is what keeps
+/// every already-deployed reader and every already-written payload valid; without
+/// it, the first daemon to grow this field would make every older `supervisor.list`
+/// response undecodable.
+#[test]
+fn supervisor_entry_without_a_protocol_key_decodes_as_a_subc_module() {
+    let without_protocol = r#"{
+        "module_id":"aft-tools",
+        "state":"running",
+        "enabled":true,
+        "live":true,
+        "health":"degraded"
+    }"#;
+
+    let decoded: SupervisorEntry =
+        serde_json::from_str(without_protocol).expect("a payload with no protocol key decodes");
+
+    assert_eq!(decoded.protocol, ModuleProtocol::Subc);
+}
+
+/// The two protocols must be distinguishable ON THE WIRE, not just in Rust: a
+/// reader deciding whether `live: true` means "serving requests" or only "the
+/// process is up" has nothing else to read.
+#[test]
+fn supervisor_entry_carries_the_declared_protocol_verbatim() {
+    let subc = serde_json::to_value(supervisor_entry()).expect("entry serializes");
+    assert_eq!(subc["protocol"], "subc");
+
+    let none_entry = SupervisorEntry {
+        protocol: ModuleProtocol::None,
+        ..supervisor_entry()
+    };
+    let encoded = serde_json::to_value(&none_entry).expect("entry serializes");
+    assert_eq!(encoded["protocol"], "none");
+
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("round trip decodes");
+    assert_eq!(decoded.protocol, ModuleProtocol::None);
 }
 
 /// A daemon that predates the windowed budget must stay decodable, and its
@@ -1003,4 +1098,26 @@ fn a_census_route_without_a_drain_reason_still_decodes() {
         !reserialized.contains("drain_reason"),
         "absent reason must stay absent: {reserialized}"
     );
+}
+
+#[test]
+fn supervisor_spawn_event_forward_skew_ignores_unknown_fields() {
+    let event: SpawnEvent = serde_json::from_value(serde_json::json!({
+        "cursor": {
+            "daemon_incarnation": "0123456789abcdef0123456789abcdef",
+            "seq": 12
+        },
+        "kind": "exited",
+        "module_id": "nats",
+        "spawn_generation": 3,
+        "pid": 4242,
+        "exit_signal": 9,
+        "future_fact": { "schema": 2 }
+    }))
+    .expect("unknown event fields are forward compatible");
+
+    assert_eq!(event.cursor, spawn_cursor(12));
+    assert_eq!(event.kind, SpawnEventKind::Exited);
+    assert_eq!(event.exit_code, None);
+    assert_eq!(event.exit_signal, Some(9));
 }

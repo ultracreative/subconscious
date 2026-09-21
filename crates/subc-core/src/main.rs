@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, process};
 
-use cortexkit_log::{Config, Lane, Retention};
+use cortexkit_log::{Config, SegmentRetention};
 
 #[tokio::main]
 async fn main() {
@@ -68,7 +68,12 @@ async fn main() {
         process::exit(1);
     }
 
-    if let Err(err) = subc_daemon::bootstrap::run().await {
+    let daemon = async {
+        let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
+            .with_cgroup_placement(subc_daemon::bootstrap::CgroupPlacementConfig::Current);
+        subc_daemon::bootstrap::run_with_config(config).await
+    };
+    if let Err(err) = daemon.await {
         tracing::error!(error = %err, "subc-core failed");
         eprintln!("subc-core: {err}");
         process::exit(1);
@@ -99,21 +104,42 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
         })
         .ok()
         .flatten();
+    // Secure the run directory BEFORE anything opens a sink inside it. The log
+    // sink creates its parents with create_dir_all, which lands 0755 on a default
+    // desk, and whichever creator runs first fixes the mode for every later one --
+    // the connection-file writer builds parents at 0700 but returns early when the
+    // directory exists. Doing it here makes the daemon the first creator on a
+    // clean box and the tightener on an existing one.
+    match subc_daemon::daemon_config::ensure_daemon_run_dir_private() {
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "ck-subc: could not secure the run directory at {}: {error}; continuing, \
+             but another account on this host may be able to list it",
+            subc_daemon::daemon_config::daemon_run_dir().display()
+        ),
+    }
     let logs_dir = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
 }
 
+// The daemon logs as module `subc` into `run/logs/subc.<YYYY-MM-DD>.log`, the
+// same r2 segment shape every module writes, so `ck module logs` and any
+// tail-by-date reader treat it like the rest of the fleet. `run/logs/` is not
+// a module data directory, which is why the path is assembled here rather than
+// through `Config::for_module`.
 fn daemon_logger_config(
     logs_dir: PathBuf,
     logging: Option<&subc_daemon::daemon_config::LoggingConfig>,
 ) -> Config {
-    let path = logs_dir.join("subc.log");
     Config {
         module_id: "subc".to_string(),
         logs_dir,
-        lane: Lane::Custom(path),
-        spec: logging.map(subc_daemon::daemon_config::LoggingConfig::filter_spec),
-        retention: logging.map_or_else(Retention::default, |config| config.retention),
+        bound: Vec::new(),
+        spec: logging.map(|config| config.filter_spec("subc")),
+        retention: logging.map_or_else(
+            SegmentRetention::default,
+            subc_daemon::daemon_config::LoggingConfig::segment_retention,
+        ),
         redactor: None,
         clock: None,
     }
@@ -121,8 +147,8 @@ fn daemon_logger_config(
 
 fn install_tracing(config: Config) -> Result<(), cortexkit_log::InitError> {
     // cortexkit-log owns one process-global file sink and does not expose a
-    // cheap tee layer. The daemon therefore writes directly to subc.log only;
-    // stdout is intentionally not a second logging destination.
+    // cheap tee layer. The daemon therefore writes directly to its dated
+    // segment only; stdout is intentionally not a second logging destination.
     cortexkit_log::init(config).map(|_| ())
 }
 
@@ -158,18 +184,43 @@ mod tests {
             arrived = 2_u64,
             "poll changed"
         );
-        let line = fs::read_to_string(logs_dir.join("subc.log")).unwrap();
+        // The clock is pinned to 2026-09-05, so the segment is that day's.
+        let line = fs::read_to_string(logs_dir.join("fusiform.2026-09-05.log")).unwrap();
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/log_format_golden.json")).unwrap();
         let expected = fixture["cases"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|case| case["name"] == "plain-info-no-session")
+            .find(|case| case["name"] == "plain-info-no-bound")
             .unwrap()["line"]
             .as_str()
             .unwrap();
         assert_eq!(line, format!("{expected}\n"));
         assert!(!line.contains('\u{1b}'));
+
+        // THE DAEMON'S OWN LOGGER NAMES, READ BACK FROM THE FILE. A `target:`
+        // string is opaque to the compiler and checked by nothing until an
+        // operator filters on it, and by then the symptom is silence: under
+        // r2 a `::` path target maps to the BARE module id, so the four
+        // `target: "subc_daemon::control"` sites in control.rs rendered as
+        // root `subc:` for a week while looking like they named a component.
+        // The subscriber is process-global, which is why this lives in the
+        // same test as the install above rather than beside it.
+        tracing::info!(target: "control", "component line");
+        tracing::info!(target: "subc_daemon::control", "path-shaped target");
+        let lines = fs::read_to_string(logs_dir.join("fusiform.2026-09-05.log")).unwrap();
+        let rendered: Vec<&str> = lines.lines().collect();
+        assert_eq!(rendered.len(), 3, "{lines}");
+        assert!(
+            rendered[1].contains(" fusiform.control: component line"),
+            "a segment-grammar target must render as <module>.<component>: {}",
+            rendered[1]
+        );
+        assert!(
+            rendered[2].contains(" fusiform: path-shaped target"),
+            "a `::` target must map to the bare module id, never a component: {}",
+            rendered[2]
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::{
 
 use cortexkit_log::Retention;
 use serde::Deserialize;
+use subc_control::ModuleProtocol;
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
 
@@ -21,6 +22,11 @@ pub(crate) const CK_LOG_ENV: &str = "CK_LOG";
 pub(crate) const CAPTURE_MAX_FILE_MB_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_FILE_MB";
 pub(crate) const CAPTURE_KEEP_ENV: &str = "__SUBC_CAPTURE_LOG_KEEP";
 pub(crate) const CAPTURE_MAX_AGE_DAYS_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_AGE_DAYS";
+/// The child's own segment retention, read by `cortexkit_log::Config::from_env`.
+/// Unlike the `__SUBC_CAPTURE_*` names above these are a real child-process
+/// contract and are spawned into the environment.
+pub(crate) const CHILD_LOG_MAX_AGE_DAYS_ENV: &str = "CK_LOG_MAX_AGE_DAYS";
+pub(crate) const CHILD_LOG_ALARM_SEGMENT_MB_ENV: &str = "CK_LOG_ALARM_SEGMENT_MB";
 
 /// Top-level daemon config sections that rescan cannot apply. The daemon
 /// snapshots these sections at start and reports later rescan changes as
@@ -76,24 +82,49 @@ const RESTART_WINDOW_ZERO_MESSAGE: &str = "restart.window_secs must be greater t
 
 /// Logging policy parsed from `subc.jsonc`.
 ///
-/// Retention is kept as the shared crate's type so the daemon's own file and
-/// captured child files cannot drift from the fleet policy.
+/// `retention` is the rename-rotating policy for the daemon's per-child
+/// stderr CAPTURE file (single writer). The daemon's own log and every module's
+/// log are date segments under fleet-logging r2, which never rotate; for those
+/// only `retention.max_age_days` applies, plus `alarm_segment_mb`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingConfig {
     pub level: String,
+    /// Per-logger levels. Keys are logger names; a key with no dot is taken
+    /// as a COMPONENT of the module it is configured on (`perf` on synapse is
+    /// `synapse.perf`), so an operator's `subc.jsonc` reads naturally. See
+    /// [`LoggingConfig::filter_spec`].
     pub tags: BTreeMap<String, String>,
     pub retention: Retention,
+    /// Segment size at which the writer alarms (never truncates).
+    pub alarm_segment_mb: u32,
 }
 
 impl LoggingConfig {
-    pub fn filter_spec(&self) -> String {
+    /// The `CK_LOG` value for `module_id`. Logger names in `CK_LOG` are
+    /// absolute (`synapse.perf=info`), while the config block is written per
+    /// module, so a dotless key is prefixed with the module id here. A key
+    /// that already starts with `<module_id>.` or contains a dot is passed
+    /// verbatim; a key equal to the module id is the root and is also
+    /// verbatim. Without this a config `tags: { perf: debug }` would emit
+    /// `perf=debug`, which matches no logger on the r2 hierarchy and silently
+    /// does nothing.
+    pub fn filter_spec(&self, module_id: &str) -> String {
         let mut directives = vec![self.level.clone()];
-        directives.extend(
-            self.tags
-                .iter()
-                .map(|(tag, level)| format!("{tag}={level}")),
-        );
+        directives.extend(self.tags.iter().map(|(logger, level)| {
+            if logger == module_id || logger.contains('.') {
+                format!("{logger}={level}")
+            } else {
+                format!("{module_id}.{logger}={level}")
+            }
+        }));
         directives.join(",")
+    }
+
+    pub fn segment_retention(&self) -> cortexkit_log::SegmentRetention {
+        cortexkit_log::SegmentRetention {
+            max_age_days: self.retention.max_age_days,
+            alarm_segment_mb: self.alarm_segment_mb,
+        }
     }
 }
 
@@ -211,6 +242,9 @@ pub struct ConfiguredModule {
     /// module id under one of these prefixes must echo this owner module's current
     /// spawn nonce.
     pub reserved_prefixes: Vec<String>,
+    /// Which wire protocol this module speaks, as declared. Absent in config
+    /// means `Subc`, which is what every module written before this key meant.
+    pub protocol: ModuleProtocol,
     pub health: HealthConfig,
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
@@ -243,11 +277,21 @@ impl ConfiguredModule {
                     && key != CAPTURE_KEEP_ENV
                     && key != CAPTURE_MAX_AGE_DAYS_ENV
             });
-            env.push((CK_LOG_ENV.to_string(), log.filter_spec()));
-            // cortexkit-log does not yet define retention environment names.
-            // These private entries are supervisor metadata and are removed
-            // before spawn; they let capture retention follow config changes at
-            // the next spawn without inventing a child-process env contract.
+            env.retain(|(key, _)| {
+                key != CHILD_LOG_MAX_AGE_DAYS_ENV && key != CHILD_LOG_ALARM_SEGMENT_MB_ENV
+            });
+            env.push((CK_LOG_ENV.to_string(), log.filter_spec(&self.module_id)));
+            env.push((
+                CHILD_LOG_MAX_AGE_DAYS_ENV.to_string(),
+                log.retention.max_age_days.to_string(),
+            ));
+            env.push((
+                CHILD_LOG_ALARM_SEGMENT_MB_ENV.to_string(),
+                log.alarm_segment_mb.to_string(),
+            ));
+            // The capture file's own rotation policy. These private entries are
+            // supervisor metadata and are removed before spawn: the child never
+            // sees them, and the capture sink reads them back at spawn time.
             env.push((
                 CAPTURE_MAX_FILE_MB_ENV.to_string(),
                 log.retention.max_file_mb.to_string(),
@@ -265,6 +309,7 @@ impl ConfiguredModule {
             env,
             reserved: self.reserved,
             reserved_prefixes: self.reserved_prefixes.clone(),
+            protocol: self.protocol,
         }
     }
 }
@@ -342,6 +387,11 @@ struct RawModuleConfig {
     reserved: bool,
     #[serde(default)]
     reserved_prefixes: Vec<String>,
+    /// Read as a raw string rather than a serde enum so an unusable value is
+    /// refused as an `InvalidValue` naming the module and the value the operator
+    /// typed, instead of a serde variant error that names neither.
+    #[serde(default)]
+    protocol: Option<String>,
     #[serde(default)]
     health: Option<RawHealthConfig>,
     #[serde(default)]
@@ -358,6 +408,8 @@ struct RawLoggingConfig {
     level: Option<String>,
     #[serde(default)]
     tags: BTreeMap<String, String>,
+    #[serde(default)]
+    alarm_segment_mb: Option<u32>,
     #[serde(default)]
     max_file_mb: Option<u32>,
     #[serde(default)]
@@ -487,6 +539,64 @@ pub fn load_logging(path: impl AsRef<Path>) -> Result<Option<LoggingConfig>, Dae
         .transpose()
 }
 
+/// Create the daemon run directory at 0700 if absent, and tighten it if wider.
+///
+/// WHY A SEPARATE STEP RATHER THAN A MODE ON THE CREATOR. Several things create
+/// this directory and none of them owns it: the log sink's `create_dir_all`
+/// (0777 & ~umask, so 0755 on a default desk), the terminal journal, and the
+/// connection-file writer -- which DOES build its parents at 0700, but returns
+/// early when the directory already exists, because an existing directory keeps
+/// its mode. So the first creator to run decides the mode for every later one,
+/// and on this fleet that was the log sink.
+///
+/// WHAT THE BIT COSTS, stated so nobody over- or under-reads it: the connection
+/// secret inside is written 0600 and was never readable by another account. A
+/// world-listable run directory leaks the MAP -- which modules are live and what
+/// their connection files are named -- not the key. It is worth closing anyway
+/// because the map is reconnaissance and costs nothing to withhold. (Found by
+/// prefrontal's campaign-rig isolation probe, 2026-09-20, on a real desk.)
+///
+/// TIGHTENING IS BEST-EFFORT AND NEVER FATAL. The daemon does not own every
+/// deployment: a directory it cannot chmod belongs to someone else, and refusing
+/// to boot over a permission bit would trade a reconnaissance leak for an
+/// outage. The caller logs what it could not do.
+pub fn ensure_daemon_run_dir_private() -> Result<PathBuf, io::Error> {
+    let path = daemon_run_dir();
+    ensure_directory_private(&path)?;
+    Ok(path)
+}
+
+/// The policy half, taking the directory so a test drives a real one without
+/// touching the process environment (this crate forbids unsafe, and `set_var` is
+/// unsafe in this edition -- which is the better outcome: the seam is a parameter
+/// rather than a global the test has to fight).
+#[cfg(unix)]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        return Ok(());
+    }
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits to tighten; the directory is created on first use.
+#[cfg(not(unix))]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
 /// Existing per-user daemon run directory (`<data-home>/cortexkit/run`).
 pub fn daemon_run_dir() -> PathBuf {
     let path = default_data_home().join("cortexkit").join("run");
@@ -584,6 +694,24 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 Some(value) => Some(value),
                 None => default_route_bind_relay_timeout_ms,
             };
+            let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
+            // A reserved module is one only the daemon-spawned process may
+            // REGISTER as, enforced by matching a launch nonce in its HELLO. A
+            // module that speaks no subc wire sends no HELLO, so the gate has
+            // nothing to check and the pairing states an intent the daemon
+            // cannot carry out. Refusing at parse is better than accepting a
+            // security-looking declaration that protects nothing.
+            if protocol == ModuleProtocol::None && module.reserved {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{module_id}' sets reserved: true with protocol: \"none\"; \
+                         reserved is enforced on the module's HELLO and a protocol: \"none\" \
+                         module never registers, so the reservation could never be checked",
+                        module_id = module_id.escape_debug()
+                    ),
+                });
+            }
             let restart = parse_restart_config(module.restart, path, &module_id)?;
             let log = module
                 .log
@@ -599,6 +727,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 enabled: module.enabled,
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
+                protocol,
                 health,
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
@@ -686,14 +815,22 @@ fn parse_logging_config(
         });
     }
     for (tag, tag_level) in &raw.tags {
-        if tag.is_empty()
-            || tag
-                .chars()
-                .any(|character| character.is_whitespace() || character == ',' || character == '=')
-        {
+        // A logger name is dotted segments of [a-z][a-z0-9-]*: the same
+        // grammar cortexkit-log renders and filters on. Anything else would
+        // pass through CK_LOG and be refused there, one process away from the
+        // config that caused it.
+        let well_formed = !tag.is_empty()
+            && tag.split('.').all(|segment| {
+                let mut chars = segment.chars();
+                matches!(chars.next(), Some('a'..='z'))
+                    && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+            });
+        if !well_formed {
             return Err(DaemonConfigError::InvalidValue {
                 path: path.to_path_buf(),
-                message: format!("{owner}.tags contains an invalid tag name {tag:?}"),
+                message: format!(
+                    "{owner}.tags key {tag:?} is not a logger name (dotted segments of [a-z][a-z0-9-]*)"
+                ),
             });
         }
         if !valid_level(tag_level) {
@@ -719,11 +856,52 @@ fn parse_logging_config(
         });
     }
 
+    let alarm_segment_mb = raw
+        .alarm_segment_mb
+        .unwrap_or(cortexkit_log::SegmentRetention::default().alarm_segment_mb);
+    if alarm_segment_mb == 0 {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!("{owner}.alarm_segment_mb must be greater than 0"),
+        });
+    }
+
     Ok(LoggingConfig {
         level,
         tags: raw.tags,
         retention,
+        alarm_segment_mb,
     })
+}
+
+/// Resolve a module's declared `protocol` key.
+///
+/// Absent and `"subc"` are the SAME answer on purpose: a config written before
+/// this key existed meant "a subc module", so there is no third state for
+/// "unspecified" to drift into. Anything else is refused with the value quoted,
+/// because the alternative -- falling back to `subc` for a typo like `"non"` --
+/// silently restores the exact supervision behaviour the operator was trying to
+/// turn off.
+fn parse_module_protocol(
+    raw: Option<&str>,
+    path: &Path,
+    module_id: &str,
+) -> Result<ModuleProtocol, DaemonConfigError> {
+    match raw {
+        None | Some("subc") => Ok(ModuleProtocol::Subc),
+        Some("none") => Ok(ModuleProtocol::None),
+        // `{other:?}` quotes and escapes the operator's own bytes, so a value
+        // carrying control characters cannot rewrite the terminal of whoever
+        // reads the refusal.
+        Some(other) => Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "module '{module_id}' declares protocol {other:?}; supported values are \
+                 \"subc\" (the default when the key is absent) and \"none\"",
+                module_id = module_id.escape_debug(),
+            ),
+        }),
+    }
 }
 
 fn validate_reserved_capabilities(
@@ -1090,6 +1268,58 @@ impl Error for DaemonConfigError {
             | Self::UnsupportedVersion { .. }
             | Self::InvalidValue { .. } => None,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod run_dir_privacy_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::test_support::TestTempDir;
+
+    /// Both arms of the thing that actually bit: a directory this code CREATES,
+    /// and one it INHERITS from another creator. The second is the real case --
+    /// every desk in the fleet already had a 0755 run directory made by the log
+    /// sink, so a fix that only sets the mode at creation would have changed
+    /// nothing anywhere it mattered.
+    #[test]
+    fn run_dir_is_created_private_and_an_inherited_wide_one_is_tightened() {
+        let temp = TestTempDir::new("subc-run-dir-privacy");
+        let created = temp.path().join("cortexkit").join("run");
+        super::ensure_directory_private(&created).expect("create run dir");
+        let mode = fs::metadata(&created)
+            .expect("stat created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "observable a run directory this code creates must be 0700, got {mode:o}"
+        );
+
+        // Now the inherited case: widen it the way create_dir_all would have.
+        fs::set_permissions(&created, fs::Permissions::from_mode(0o755)).expect("widen");
+        let widened = fs::metadata(&created)
+            .expect("stat widened")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            widened, 0o755,
+            "observable the fixture must actually be wide before the tighten"
+        );
+
+        super::ensure_directory_private(&created).expect("tighten run dir");
+        let mode = fs::metadata(&created)
+            .expect("stat tightened")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "observable an inherited group- or world-readable run directory must be tightened to 0700, got {mode:o}"
+        );
     }
 }
 
@@ -1465,6 +1695,68 @@ mod tests {
     }
 
     #[test]
+    fn log_tag_keys_must_be_logger_names_and_the_error_names_the_key() {
+        let path = Path::new("/tmp/subc.jsonc");
+        for bad in ["Perf", "a b", "perf.", ".perf", "gc..walk", "a=b"] {
+            let doc = format!(
+                r#"{{ "version": 1, "modules": {{ "m": {{ "program": "m", "log": {{ "tags": {{ "{bad}": "debug" }} }} }} }} }}"#
+            );
+            let err = parse_doc(&doc, path).expect_err(bad);
+            let text = format!("{err}");
+            assert!(
+                text.contains(&format!("{bad:?}")),
+                "must name the key: {text}"
+            );
+            assert!(
+                text.contains("logger name"),
+                "must say what a key is: {text}"
+            );
+        }
+        // Control: dotted, hyphenated, root-equal keys are all fine.
+        let ok = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "tags": { "perf": "debug", "gc.walk": "trace", "m": "error", "a-b": "info" } } } } }"#,
+            path,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[test]
+    fn log_filter_spec_prefixes_bare_keys_with_the_module_and_passes_absolute_ones() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "synapse": { "program": "s", "log": { "level": "warn", "tags": { "perf": "debug", "gc.walk": "trace", "synapse": "error", "other.x": "info" } } } } }"#,
+            path,
+        )
+        .unwrap();
+        let log = config.modules[0].log.as_ref().unwrap();
+        // BTreeMap order: gc.walk, other.x, perf, synapse.
+        assert_eq!(
+            log.filter_spec("synapse"),
+            "warn,gc.walk=trace,other.x=info,synapse.perf=debug,synapse=error"
+        );
+    }
+
+    #[test]
+    fn log_alarm_segment_mb_defaults_to_the_crate_default_and_refuses_zero() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "level": "info" } } } }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            config.modules[0].log.as_ref().unwrap().alarm_segment_mb,
+            cortexkit_log::SegmentRetention::default().alarm_segment_mb
+        );
+        let err = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "alarm_segment_mb": 0 } } } }"#,
+            path,
+        )
+        .expect_err("zero alarm must refuse");
+        assert!(format!("{err}").contains("alarm_segment_mb"));
+    }
+
+    #[test]
     fn route_bind_relay_timeout_zero_at_daemon_layer_is_refused() {
         let path = Path::new("/tmp/subc.jsonc");
         let err = parse_doc(
@@ -1788,6 +2080,107 @@ mod tests {
         )
         .expect_err("reserved capabilities use the capability identifier grammar");
         assert!(error.to_string().contains("reserved_capabilities key"));
+    }
+
+    /// The three accepted shapes, and the one that matters is that two of them
+    /// are THE SAME ANSWER. A config written before this key existed and a
+    /// config that spells out `"subc"` must produce an identical module, or the
+    /// key would have quietly introduced a third state for every module in every
+    /// deployed config file.
+    #[test]
+    fn an_absent_protocol_key_and_an_explicit_subc_are_the_same_module() {
+        let parse = |module_body: &str| {
+            parse_doc(
+                &format!(
+                    r#"{{
+                      "version": 1,
+                      "modules": {{ "aft": {{ "program": "aft"{module_body} }} }}
+                    }}"#
+                ),
+                Path::new("subc.jsonc"),
+            )
+            .expect("module parses")
+            .modules
+            .remove(0)
+        };
+
+        let absent = parse("");
+        let explicit = parse(r#", "protocol": "subc""#);
+        let none = parse(r#", "protocol": "none""#);
+
+        assert_eq!(absent.protocol, ModuleProtocol::Subc);
+        assert_eq!(explicit.protocol, ModuleProtocol::Subc);
+        assert_eq!(
+            absent, explicit,
+            "an absent protocol key must produce exactly the module an explicit subc does"
+        );
+        assert_eq!(none.protocol, ModuleProtocol::None);
+        // The declaration has to survive into what the supervisor is handed;
+        // parsing it into a field nothing reads would leave every behaviour
+        // gated on it unreachable.
+        assert_eq!(none.module_spec().protocol, ModuleProtocol::None);
+    }
+
+    /// An unusable value is refused WITH THE VALUE IN THE MESSAGE. Falling back
+    /// to `subc` on a typo would restore the exact supervision the operator was
+    /// trying to turn off -- health probing, restart-on-silence, SIGKILL
+    /// teardown -- and the config file would still read as if it had been
+    /// applied.
+    #[test]
+    fn an_unsupported_protocol_value_is_refused_by_name() {
+        let error = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": { "nats": { "program": "nats-server", "protocol": "grpc" } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .expect_err("an unknown protocol must not fall back to a default");
+
+        assert!(
+            matches!(error, DaemonConfigError::InvalidValue { .. }),
+            "expected InvalidValue, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("grpc"),
+            "the refusal must name the offending value: {message}"
+        );
+        assert!(
+            message.contains("nats"),
+            "the refusal must name the module so it can be found in the file: {message}"
+        );
+    }
+
+    /// `reserved` is enforced on a module's HELLO. A module that speaks no subc
+    /// wire never sends one, so the pair declares a protection that could never
+    /// be applied -- worse than no protection, because the config file states it.
+    #[test]
+    fn reserved_true_with_protocol_none_is_refused_with_the_reason() {
+        let error = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "nats": { "program": "nats-server", "protocol": "none", "reserved": true }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .expect_err("a reservation that can never be checked must not parse");
+
+        assert!(
+            matches!(error, DaemonConfigError::InvalidValue { .. }),
+            "expected InvalidValue, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("nats") && message.contains("reserved"),
+            "the refusal must name the module and the offending key: {message}"
+        );
+        assert!(
+            message.contains("HELLO") || message.contains("never registers"),
+            "the refusal must say WHY the pair cannot work: {message}"
+        );
     }
 
     #[test]

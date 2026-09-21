@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use subc_control::{ops, ClientControlRequest, ClientControlResponse, PollKind};
+use subc_control::{ops, ClientControlRequest, ClientControlResponse, ModuleProtocol, PollKind};
 use subc_daemon::{
     read_frame, test_support::TestTempDir, write_frame, Frame, ModuleSpec, RestartPolicy,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
@@ -728,6 +728,7 @@ fn stub_spec_with_env(module_id: &str, extra_env: Vec<(&str, String)>) -> Module
         env,
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 
@@ -764,6 +765,8 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_TERMINALS,
         ops::SUPERVISOR_ROUTES,
         ops::SUPERVISOR_PROVENANCE,
+        ops::SUPERVISOR_SPAWN_SNAPSHOT,
+        ops::SUPERVISOR_SPAWN_SUBSCRIBE,
     ])
 }
 

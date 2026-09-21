@@ -66,13 +66,20 @@ fi
 # The notice carries the pushed sha because consumers' first check is
 # "was the bump real and the tree clean" (FUSI's property) -- a sha they
 # can cite answers it without re-derivation.
-range_bumps=$(git diff "@{push}...HEAD" -- 'crates/*/Cargo.toml' 2>/dev/null \
-  | grep -E '^\+version = ' | wc -l | tr -d ' ')
+  # BLIND SPOT FOUND BY BROCA (2026-09-19): deriving targets from a
+  # `crates/<name>/` shape makes every version-carrying file OUTSIDE that
+  # prefix gate nothing when edited alone. Measured here: cortexkit-release is
+  # a workspace member at the repo root, and three npm packages under clients/
+  # carry versions consumers pin. A path-glob derivation is a CLAIM ABOUT
+  # LAYOUT, and the layout it describes is never the whole repo.
+  bump_globs='crates/*/Cargo.toml cortexkit-release/Cargo.toml clients/*/package.json'
+range_bumps=$(git diff "@{push}...HEAD" -- $bump_globs 2>/dev/null \
+  | grep -cE '^\+ *"?version"? *[=:]' | tr -d ' ')
 if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "" >&2
   echo "pre-push NOTICE: pushing $(git rev-parse --short HEAD) with $range_bumps workspace crate version bump(s):" >&2
-  git diff "@{push}...HEAD" -- 'crates/*/Cargo.toml' 2>/dev/null \
-    | grep -E '^(diff --git|\+version = )' | sed 's|diff --git a/|  |;s| b/.*||' >&2
+  git diff "@{push}...HEAD" -- $bump_globs 2>/dev/null \
+    | grep -E '^(diff --git|\+ *"?version"? *[=:])' | sed 's|diff --git a/|  |;s| b/.*||' >&2
   echo "  EVERY path-dep sibling's committed lock is stale from this moment." >&2
   echo "  Fan out now: bash scripts/fleet/check-sibling-locks.sh for the list," >&2
   echo "  then peer-notify owners. Fix recipe to send: cargo update -w against" >&2
@@ -216,10 +223,38 @@ if command -v gh >/dev/null 2>&1; then
   # (workflow renamed, default branch moved, repo activity-disabled after 60
   # days) reports exactly what a healthy one reports. Age is the discriminator.
   #
-  # 48h rather than 24h because GitHub's scheduler is LATE AND VARIABLE: CEREB
-  # measured a `17 4 * * *` cron landing at ~09:00Z, five hours behind, on all
-  # twelve of their runs. A 24h bound would fire on a healthy queue delay, and
-  # an alarm that fires on healthy work gets muted.
+  # 48h rather than 24h because GitHub's scheduler is LATE AND VARIABLE. The
+  # bound is now DERIVED rather than guessed, which it was when first written:
+  #
+  #   floor = one cron period (24h) + the observed maximum delay
+  #         = 24h + 5h36m ~= 29.6h      ->  48h clears it with margin
+  #
+  # Measured 2026-09-20, three repos, raw distributions not summaries:
+  #   subconscious  `0 6`   n=14  mean +4h19m  range +3h40m..+5h02m
+  #   fusiform      `0 6`   n=13  mean +4h31m  range +3h50m..+5h19m
+  #   cerebellum    `17 4`  n=14  mean +4h54m  range +4h22m..+5h36m
+  #
+  # An earlier version of this comment said CEREB measured "~09:00Z on all
+  # twelve". That was wrong twice -- n was 14, and the deliveries run 08:38Z to
+  # 09:53Z with a 74-minute spread. I had rounded their spread to a point and
+  # then carried the point into this bound, so a reader checking 48 against
+  # "~09:00" could not see why 48 beat 24. A SUMMARY IS NOT A DISTRIBUTION.
+  #
+  # The three means sit 35 minutes apart, which is INSIDE one repo's own daily
+  # spread, so the delay does not key on the popular `0` minute. It is a roughly
+  # constant SHIFT rather than a fixed hour: cerebellum declares 04:17 and lands
+  # 08:38-09:53Z while the other two declare 06:00 and land ~10:20-10:30Z --
+  # different absolute bands, which rules out "everything runs at 09:00Z".
+  # NOT ruled out: an org- or plan-level queue. All three repos share both, and
+  # that would produce exactly this agreement.
+  #
+  # A 24h bound would fire on a healthy queue delay, and an alarm that fires on
+  # healthy work gets muted. THE NUMBER TO RE-DERIVE IF ANYTHING MOVES IS THE
+  # OBSERVED MAXIMUM, not the declared cron: this arm's subject is a WINDOW, so
+  # sizing it from the schedule rather than the delivery distribution is the
+  # defect (FUSI's discriminator: a check whose subject is "the newest thing,
+  # whenever it was" is immune; one whose subject is a window is not, and they
+  # look identical from outside).
   # Age uses the newest run of ANY conclusion, deliberately: a cancelled run is
   # still evidence the scheduler FIRED, which is what this arm measures. Grading
   # and liveness are different questions and want different populations.

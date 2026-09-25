@@ -72,7 +72,7 @@ SEQUENCE="${SEQUENCE:-1}"
 RELEASE_ID="${PACKAGE_ID}-${VERSION}-${SEQUENCE}"
 
 if [ -z "$OUTPUT_DIR" ]; then
-  OUTPUT_DIR="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}/${PACKAGE_ID}"
+  OUTPUT_DIR="${REPO_ROOT}/dist/${SEQUENCE}/${PACKAGE_ID}/${VERSION}"
 fi
 
 printf 'pack-%s-arcus: packaging %s %s (seq: %s)\n' "$PACKAGE_ID" "$PACKAGE_ID" "$VERSION" "$SEQUENCE"

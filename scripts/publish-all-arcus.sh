@@ -21,32 +21,48 @@ if [ -z "$VERSION" ]; then
 fi
 VERSION="${VERSION#v}"
 
-DIST_VERSION_DIR="${REPO_ROOT}/dist/${VERSION}"
-
-if [ ! -d "$DIST_VERSION_DIR" ]; then
-  printf "error: no packaged components found under %s\n" "$DIST_VERSION_DIR" >&2
+DIST_ROOT="${REPO_ROOT}/dist"
+if [ ! -d "$DIST_ROOT" ]; then
+  printf "error: dist directory not found: %s\n" "$DIST_ROOT" >&2
   printf "hint: run \"sh scripts/pack-all-arcus.sh\" first.\n" >&2
   exit 1
 fi
 
+# Locate latest sequence directory under dist/<sequence>/
+LATEST_SEQ=""
+if [ -n "${SEQUENCE:-}" ]; then
+  LATEST_SEQ="$SEQUENCE"
+else
+  LATEST_SEQ=$(ls -1 "$DIST_ROOT" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+fi
+
+[ -n "$LATEST_SEQ" ] || { printf "error: no numerical sequence folders found in %s\n" "$DIST_ROOT" >&2; exit 1; }
+
+SEQUENCE_DIR="${DIST_ROOT}/${LATEST_SEQ}"
+
 printf "=====================================================================\n"
-printf "publish-all-arcus: Submitting subconscious components (%s) to Arcus\n" "$VERSION"
-printf "Reading packages from: %s\n" "$DIST_VERSION_DIR"
+printf "publish-all-arcus: Submitting subconscious components to Arcus\n"
+printf "Release sequence: %s\n" "$LATEST_SEQ"
+printf "Reading packages from: %s\n" "$SEQUENCE_DIR"
 printf "Gateway: %s\n" "$GATEWAY"
 printf "=====================================================================\n"
 
-# Locate latest sequence directory under dist/<version>/
-LATEST_SEQ=$(ls -1 "$DIST_VERSION_DIR" | sort -n | tail -n 1)
-[ -n "$LATEST_SEQ" ] || { printf "error: no sequence folders found in %s\n" "$DIST_VERSION_DIR" >&2; exit 1; }
-
-SEQUENCE_DIR="${DIST_VERSION_DIR}/${LATEST_SEQ}"
-printf "Target release sequence: %s\n" "$LATEST_SEQ"
-
 for comp in ck-subc ck ck-subc-mcp ck-uc-discussions; do
-  bundle_dir="${SEQUENCE_DIR}/${comp}"
-  if [ ! -d "$bundle_dir" ]; then
-    printf "warn: component directory not found: %s, skipping...\n" "$bundle_dir"
+  comp_dir="${SEQUENCE_DIR}/${comp}"
+  if [ ! -d "$comp_dir" ]; then
+    printf "warn: component directory not found: %s, skipping...\n" "$comp_dir"
     continue
+  fi
+
+  # Find version bundle directory under component directory (dist/<sequence>/<component>/<version>/)
+  bundle_dir=$(find "$comp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+  if [ -z "$bundle_dir" ] || [ ! -d "$bundle_dir" ]; then
+    bundle_dir="$comp_dir"
+  fi
+
+  comp_version=$(basename "$bundle_dir")
+  if [ "$bundle_dir" = "$comp_dir" ]; then
+    comp_version="$VERSION"
   fi
 
   printf "\n>>> Submitting component: %s (bundle: %s)...\n" "$comp" "$bundle_dir"
@@ -54,6 +70,9 @@ for comp in ck-subc ck ck-subc-mcp ck-uc-discussions; do
   # Ensure bundle has submission.json descriptor; generate if missing
   if [ ! -f "${bundle_dir}/submission.json" ]; then
     envelope_file=$(find "${bundle_dir}/releases" -name "*.json" 2>/dev/null | grep -v "index-policy" | head -n 1 || true)
+    if [ -z "$envelope_file" ] && [ -f "${bundle_dir}/release.json" ]; then
+      envelope_file="${bundle_dir}/release.json"
+    fi
     if [ -n "$envelope_file" ] && [ -f "$envelope_file" ]; then
       printf "  -> generating submission.json descriptor...\n"
       release_id=$(basename "$envelope_file" .json)
@@ -63,12 +82,12 @@ for comp in ck-subc ck ck-subc-mcp ck-uc-discussions; do
   "schema_version": 1,
   "package_id": "${comp}",
   "release_id": "${release_id}",
-  "version": "${VERSION}",
+  "version": "${comp_version}",
   "sequence": ${LATEST_SEQ},
   "sequence_source": "explicit",
   "observed_max_sequence": $((LATEST_SEQ - 1)),
   "index_sha256_observed": "local",
-  "artifact_tag": "v${VERSION}",
+  "artifact_tag": "v${comp_version}",
   "github_repo": "ultracreative/subconscious",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "toolchain_version": "0.4.0",

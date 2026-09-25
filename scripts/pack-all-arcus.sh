@@ -56,38 +56,46 @@ fi
 VERSION="${VERSION#v}"
 
 # Determine shared sequence
+# Critically, sequence must be strictly monotonic across the suite:
+# suite_seq = MAX(all observed suite sequences on gateway/catalog) + 1, never resetting to 1.
 if [ -z "$SEQUENCE" ]; then
   MAX_SEQ=0
-  for comp in ck-subc ck ck-subc-mcp ck-uc-discussions; do
-    s=1
+  for comp in ck-subc ck ck-subc-mcp ck-uc-discussions uc-discussions; do
+    s=0
     if command -v arcus >/dev/null 2>&1; then
-      s=$(arcus manifest allocate-sequence --package-id "$comp" 2>/dev/null || echo 1)
+      observed=$(arcus show "$comp" 2>/dev/null | grep -i "Latest Version:" | sed -E 's/.*\(seq ([0-9]+)\).*/\1/' || true)
+      if [ -n "$observed" ]; then
+        s="$observed"
+      fi
     fi
     case "$s" in
-      ''|*[!0-9]*) s=1 ;;
+      ''|*[!0-9]*) s=0 ;;
     esac
     if [ "$s" -gt "$MAX_SEQ" ]; then
       MAX_SEQ="$s"
     fi
   done
-  SEQUENCE="$MAX_SEQ"
-  if [ "$SEQUENCE" -lt 1 ]; then
-    SEQUENCE=1
+  SEQUENCE=$((MAX_SEQ + 1))
+  # Enforce minimum sequence of 3 to guarantee monotonicity over past releases
+  if [ "$SEQUENCE" -lt 3 ]; then
+    SEQUENCE=3
   fi
 fi
 
-RELEASE_ROOT="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}"
+# Canonical Arcus dist organization:
+#   dist/<sequence>/<package>/<version>/
+RELEASE_ROOT="${REPO_ROOT}/dist/${SEQUENCE}"
 
 printf "=====================================================================\n"
 printf "pack-all-arcus: subconscious Suite Arcus Packaging\n"
 printf "  version:  %s\n" "$VERSION"
 printf "  sequence: %s (shared)\n" "$SEQUENCE"
-printf "  output:   dist/%s/%s/<component>/\n" "$VERSION" "$SEQUENCE"
+printf "  output:   dist/%s/<component>/%s/\n" "$SEQUENCE" "$VERSION"
 printf "=====================================================================\n"
 
 # --- 0. Clean target directory ----------------------------------------------
 if [ "$NO_CLEAN" -eq 0 ] && [ -z "$ONLY_COMPONENT" ] && [ -d "$RELEASE_ROOT" ]; then
-  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s/%s\n" "$VERSION" "$SEQUENCE"
+  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s\n" "$SEQUENCE"
   rm -rf "$RELEASE_ROOT"
 fi
 

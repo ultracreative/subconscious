@@ -66,63 +66,77 @@ const swept = [];
 for (const [component, policy] of Object.entries(COMPONENTS)) {
     if (only && only !== component) continue;
 
-    const dir = join(root, component);
-    if (!existsSync(dir)) {
+    const componentRoot = join(root, component);
+    if (!existsSync(componentRoot)) {
         failures.push(`${component}: component directory missing`);
         continue;
     }
 
-    checked.push(component);
-    const entries = readdirSync(dir);
+    // Support canonical dist/<sequence>/<component>/<version>/ and flat bundle
+    const subdirs = readdirSync(componentRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && d.name !== "releases")
+        .map((d) => d.name);
 
-    // --- envelope -----------------------------------------------------------
-    const releasesDir = join(dir, "releases");
-    const envelopes = existsSync(releasesDir)
-        ? readdirSync(releasesDir).filter(
-              (f) => f.endsWith(".json") && !f.includes("index-policy"),
-          )
-        : [];
-    if (envelopes.length === 0) {
-        failures.push(`${component}: no release envelope under releases/`);
-    }
+    const bundleDirs = subdirs.length > 0
+        ? subdirs.map((v) => ({ version: v, path: join(componentRoot, v) }))
+        : [{ version: "", path: componentRoot }];
 
-    // --- pack report --------------------------------------------------------
-    if (!entries.includes("pack-report.json")) {
-        failures.push(`${component}: pack-report.json missing`);
-    }
+    for (const { version, path: dir } of bundleDirs) {
+        const label = version ? `${component}/${version}` : component;
+        checked.push(label);
+        const entries = readdirSync(dir);
 
-    // --- target coverage ----------------------------------------------------
-    const archives = entries.filter((f) => f.endsWith(".tar.zst") || f.endsWith(".tar.gz"));
-    if (archives.length === 0) {
-        failures.push(`${component}: no payload archives`);
-    }
+        // --- envelope -----------------------------------------------------------
+        const releasesDir = join(dir, "releases");
+        const envelopes = existsSync(releasesDir)
+            ? readdirSync(releasesDir).filter(
+                  (f) => f.endsWith(".json") && !f.includes("index-policy"),
+              )
+            : existsSync(join(dir, "release.json"))
+              ? ["release.json"]
+              : [];
+        if (envelopes.length === 0) {
+            failures.push(`${label}: no release envelope under releases/ or release.json`);
+        }
 
-    // --- per-archive companion artifacts ------------------------------------
-    for (const archive of archives) {
-        const stem = archive.replace(/\.tar\.(zst|gz)$/, "");
-        for (const [suffix, label] of [
-            [`${stem}-content.zip`, "content zip"],
-            [`${stem}.pwr`, "tree signature"],
-        ]) {
-            if (!entries.includes(suffix)) {
-                failures.push(`${component}: ${label} missing for ${archive}`);
+        // --- pack report --------------------------------------------------------
+        if (!entries.includes("pack-report.json")) {
+            failures.push(`${label}: pack-report.json missing`);
+        }
+
+        // --- target coverage ----------------------------------------------------
+        const archives = entries.filter((f) => f.endsWith(".tar.zst") || f.endsWith(".tar.gz"));
+        if (archives.length === 0) {
+            failures.push(`${label}: no payload archives`);
+        }
+
+        // --- per-archive companion artifacts ------------------------------------
+        for (const archive of archives) {
+            const stem = archive.replace(/\.tar\.(zst|gz)$/, "");
+            for (const [suffix, artifactLabel] of [
+                [`${stem}-content.zip`, "content zip"],
+                [`${stem}.pwr`, "tree signature"],
+            ]) {
+                if (!entries.includes(suffix)) {
+                    failures.push(`${label}: ${artifactLabel} missing for ${archive}`);
+                }
             }
         }
-    }
 
-    // --- staging litter (hard failure) --------------------------------------
-    for (const forbidden of FORBIDDEN_ENTRIES) {
-        if (entries.includes(forbidden)) {
-            failures.push(`${component}: forbidden staging entry present: ${forbidden}`);
+        // --- staging litter (hard failure) --------------------------------------
+        for (const forbidden of FORBIDDEN_ENTRIES) {
+            if (entries.includes(forbidden)) {
+                failures.push(`${label}: forbidden staging entry present: ${forbidden}`);
+            }
         }
-    }
 
-    // --- OS litter (swept) --------------------------------------------------
-    for (const litter of SWEEPABLE_ENTRIES) {
-        const p = join(dir, litter);
-        if (existsSync(p)) {
-            rmSync(p, { recursive: true, force: true });
-            swept.push(`${component}/${litter}`);
+        // --- OS litter (swept) --------------------------------------------------
+        for (const litter of SWEEPABLE_ENTRIES) {
+            const p = join(dir, litter);
+            if (existsSync(p)) {
+                rmSync(p, { recursive: true, force: true });
+                swept.push(`${label}/${litter}`);
+            }
         }
     }
 }

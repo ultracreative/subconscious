@@ -20,26 +20,37 @@ This document defines the canonical Arcus v0.4.0 packaging, dist directory hiera
 
 ## 2. Repository Layout & Dist Organization Standard
 
-Following the standard established in `magic-context`, all build and packaging artifacts are organized in a clean, predictable hierarchy under `dist/`:
+Following the updated standard established across Arcus and `magic-context`, all build and packaging artifacts are organized in a clean, sequence-first hierarchy under `dist/`:
 
 ```
 dist/
-└── <version>/
-    └── <sequence>/
-        ├── ck-subc/
-        │   ├── release.json               # Signed schema-3 release envelope
-        │   ├── release.index-policy.json  # Channel routing sidecar (e.g. {"channel": "stable"})
-        │   ├── assets.sha256              # Sorted SHA-256 digest ledger
-        │   ├── toolchain.json             # Toolchain version and provenance
-        │   ├── submission.json            # Intake descriptor (conforms to submission.schema.json)
-        │   ├── pack-report.json           # Machine-readable packaging record
-        │   ├── ck-subc-<version>-<target>.tar.zst
-        │   ├── ck-subc-<version>-<target>-content.zip
-        │   └── ck-subc-<version>-<target>.pwr
-        ├── ck/
-        ├── ck-subc-mcp/
-        └── ck-uc-discussions/
+└── <sequence>/
+    ├── ck-subc/
+    │   └── <version>/
+    │       ├── release.json               # Signed schema-3 release envelope
+    │       ├── release.index-policy.json  # Channel routing sidecar (e.g. {"channel": "stable"})
+    │       ├── assets.sha256              # Sorted SHA-256 digest ledger
+    │       ├── toolchain.json             # Toolchain version and provenance
+    │       ├── submission.json            # Intake descriptor (conforms to submission.schema.json)
+    │       ├── pack-report.json           # Machine-readable packaging record
+    │       ├── ck-subc-<version>-<target>.tar.zst
+    │       ├── ck-subc-<version>-<target>-content.zip
+    │       └── ck-subc-<version>-<target>.pwr
+    ├── ck/
+    │   └── <version>/
+    │       └── ...
+    ├── ck-subc-mcp/
+    │   └── <version>/
+    │       └── ...
+    └── ck-uc-discussions/
+        └── <version>/
+            └── ...
 ```
+
+### Why Sequence-First Organization is Critical:
+- **Sequence is the true immutable timeline**: Filesystem sorting by `<sequence>` directly reflects the release timeline and catalog promotion order, whereas sorting by SemVer breaks when components have different version cadences (e.g., `0.20.35` vs `0.1.10`).
+- **Whole-submission atomic staging**: A single folder (`dist/<sequence>/`) contains the complete immutable set of packages and descriptors that ship together in that suite release.
+- **No ambiguity**: When Arcus intake tools ingest or audit submission bundles, there is zero confusion about which version belongs to which sequence.
 
 ### Distributed Artifact Inventory
 
@@ -56,11 +67,12 @@ dist/
 
 For coordinated multi-artifact releases across `subconscious`, the release orchestrator assigns a **single shared sequence** for the entire run:
 
-$$\text{SEQUENCE} = \max_{c \in \text{components}}(\text{gateway\_seq}(c)) + 1$$
+$$\text{suite\_seq} = \max_{c \in \text{suite}}(\text{catalog\_seq}(c)) + 1$$
 
-- Prevents sequence drift across interdependent binaries.
-- Ensures that any `dist/<version>/<sequence>/` directory represents a complete, self-consistent release set.
-- Individual component sequence overrides are reserved strictly for emergency point-fixes.
+- **Strict Monotonicity**: Sequence must ALWAYS increment up and **never reset to 1**.
+- **Anti-Rollback Guarantee**: Arcus client anti-rollback rules enforce $\text{requested.sequence} > \text{installed.sequence}$.
+- **Compatibility Lock**: Immediate proof that all binaries in `dist/<sequence>/` came from the exact same unified suite build.
+- **Eliminates Drift**: Addons and daemons do not develop mismatched per-component sequence skew.
 
 ---
 

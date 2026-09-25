@@ -30,9 +30,30 @@ pub struct JoinRoomResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BindRoomMemberRequest {
+    pub room_id: String,
+    pub member_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub agent: String,
+    pub model: String,
+    pub delivery_mode: String,
+    pub incarnation: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BindRoomMemberResponse {
+    pub ok: bool,
+    pub room_id: String,
+    pub member: RoomMemberDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostRoomRequest {
     pub room_id: String,
     pub author: String,
+    #[serde(default)]
+    pub incarnation: Option<i64>,
     pub post_type: String,
     pub content: String,
     #[serde(default, alias = "replyToPostId")]
@@ -61,6 +82,18 @@ pub struct RoomMemberDto {
     pub member_id: String,
     pub role: String,
     pub joined_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

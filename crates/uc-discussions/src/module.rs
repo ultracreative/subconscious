@@ -22,8 +22,8 @@ use crate::{
             ReleaseLeaseRequest, RenewLeaseRequest,
         },
         rooms::{
-            CloseRoomRequest, CreatePollRequest, CreateRoomRequest, GetRoomRequest,
-            GrantStageRequest, JoinRoomRequest, ObjectRoomRequest, PostRoomRequest,
+            BindRoomMemberRequest, CloseRoomRequest, CreatePollRequest, CreateRoomRequest,
+            GetRoomRequest, GrantStageRequest, JoinRoomRequest, ObjectRoomRequest, PostRoomRequest,
             ReviseRoomRequest, VotePollRequest,
         },
     },
@@ -45,6 +45,7 @@ pub fn manifest() -> ModuleManifest {
                 mutate("peer.release_lease"),
                 mutate("rooms.create"),
                 mutate("rooms.join"),
+                mutate("rooms.bind_member"),
                 mutate("rooms.post"),
                 mutate("rooms.object"),
                 mutate("rooms.revise"),
@@ -170,6 +171,9 @@ impl DiscussionsHandler {
             "rooms.join" => dispatch_typed(params, |request: JoinRoomRequest| {
                 state.rooms.join_room(request)
             }),
+            "rooms.bind_member" => dispatch_typed(params, |request: BindRoomMemberRequest| {
+                state.rooms.bind_member(request)
+            }),
             "rooms.post" => {
                 dispatch_typed(params, |request: PostRoomRequest| state.rooms.post(request))
             }
@@ -294,18 +298,18 @@ fn parse_request(body: &[u8]) -> Result<(String, Value), HandlerOutcome> {
             "request envelope must be a JSON object",
         ));
     };
-    let operation = match envelope.remove("op") {
+    let operation = match envelope.remove("op").or_else(|| envelope.remove("method")) {
         Some(Value::String(operation)) if !operation.trim().is_empty() => operation,
         Some(_) => {
             return Err(handler_error(
                 "invalid_request",
-                "request field 'op' must be a non-empty string",
+                "request field 'op' or 'method' must be a non-empty string",
             ))
         }
         None => {
             return Err(handler_error(
                 "invalid_request",
-                "request field 'op' is required",
+                "request field 'op' or 'method' is required",
             ))
         }
     };
@@ -346,6 +350,21 @@ fn service_error(error: ServiceError) -> HandlerOutcome {
         ServiceError::Storage(error) => handler_error("storage_error", error.to_string()),
         ServiceError::NotFound(message) => handler_error("not_found", message),
         ServiceError::InvalidRequest(message) => handler_error("invalid_request", message),
+        ServiceError::NotRoomMember { room_id, member_id } => handler_error(
+            "not_room_member",
+            format!("member {member_id} is not in room {room_id}"),
+        ),
+        ServiceError::StaleIncarnation {
+            room_id,
+            member_id,
+            expected,
+            received,
+        } => handler_error(
+            "stale_incarnation",
+            format!(
+                "member {member_id} in room {room_id} is bound to incarnation {expected}, received {received:?}"
+            ),
+        ),
     }
 }
 

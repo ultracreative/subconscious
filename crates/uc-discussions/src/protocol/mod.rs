@@ -134,6 +134,12 @@ mod tests {
             member_id: "member-1".into(),
             role: "participant".into(),
             joined_at: "2026-09-19T00:00:00Z".into(),
+            project_id: None,
+            session_id: None,
+            agent: None,
+            model: None,
+            delivery_mode: None,
+            incarnation: None,
         };
         let post = RoomPostDto {
             seq: 1,
@@ -197,6 +203,7 @@ mod tests {
         assert_round_trip(PostRoomRequest {
             room_id: "room-1".into(),
             author: "member-1".into(),
+            incarnation: None,
             post_type: "proposal".into(),
             content: "Ship it".into(),
             reply_to_post_id: None,

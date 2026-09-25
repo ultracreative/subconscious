@@ -24,3 +24,8 @@
 docs/private/
 .build/
 .wrangler/
+# Arcus release artifacts and toolchain
+/dist/
+packages/arcus/toolchain/
+/.omo/
+/.ucs/

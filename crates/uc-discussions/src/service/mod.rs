@@ -16,6 +16,17 @@ pub enum ServiceError {
     NotFound(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("member {member_id} is not in room {room_id}")]
+    NotRoomMember { room_id: String, member_id: String },
+    #[error(
+        "stale incarnation for member {member_id} in room {room_id}: expected {expected}, received {received:?}"
+    )]
+    StaleIncarnation {
+        room_id: String,
+        member_id: String,
+        expected: i64,
+        received: Option<i64>,
+    },
 }
 
 impl From<rusqlite::Error> for ServiceError {

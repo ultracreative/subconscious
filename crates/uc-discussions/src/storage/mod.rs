@@ -264,7 +264,7 @@ mod tests {
 
         assert_eq!(
             migrations::applied_version(&connection).expect("read migration version"),
-            Some(1)
+            Some(2)
         );
         let mut statement = connection
             .prepare(
@@ -294,7 +294,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations after rerun");
-        assert_eq!(before, 1);
+        assert_eq!(before, 2);
         assert_eq!(after, before);
     }
 

@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 
 use super::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE leases (
@@ -138,6 +138,15 @@ CREATE TABLE council_member_states (
 );
 "#;
 
+const MIGRATION_002: &str = r#"
+ALTER TABLE room_members ADD COLUMN project_id TEXT;
+ALTER TABLE room_members ADD COLUMN session_id TEXT;
+ALTER TABLE room_members ADD COLUMN agent TEXT;
+ALTER TABLE room_members ADD COLUMN model TEXT;
+ALTER TABLE room_members ADD COLUMN delivery_mode TEXT;
+ALTER TABLE room_members ADD COLUMN incarnation INTEGER;
+"#;
+
 pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -164,10 +173,15 @@ pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
         transaction.execute_batch(MIGRATION_001)?;
         transaction.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            params![
-                LATEST_SCHEMA_VERSION,
-                Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
-            ],
+            params![1, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
+        )?;
+    }
+
+    if current_version < 2 {
+        transaction.execute_batch(MIGRATION_002)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![2, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
         )?;
     }
 

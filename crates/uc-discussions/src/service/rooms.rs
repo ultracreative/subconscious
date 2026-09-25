@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     protocol::rooms::{
-        CloseRoomRequest, CloseRoomResponse, CreatePollRequest, CreatePollResponse,
-        CreateRoomRequest, CreateRoomResponse, GetRoomRequest, GetRoomResponse,
-        GrantStageRequest, GrantStageResponse, JoinRoomRequest, JoinRoomResponse,
-        ObjectRoomRequest, ObjectRoomResponse, PostRoomRequest, PostRoomResponse,
+        BindRoomMemberRequest, BindRoomMemberResponse, CloseRoomRequest, CloseRoomResponse,
+        CreatePollRequest, CreatePollResponse, CreateRoomRequest, CreateRoomResponse,
+        GetRoomRequest, GetRoomResponse, GrantStageRequest, GrantStageResponse, JoinRoomRequest,
+        JoinRoomResponse, ObjectRoomRequest, ObjectRoomResponse, PostRoomRequest, PostRoomResponse,
         ReviseRoomRequest, ReviseRoomResponse, RoomMemberDto, RoomObjectionDto, RoomPollDto,
         RoomPostDto, RoomRevisionDto, RoomVoteDto, VotePollRequest, VotePollResponse,
     },
@@ -31,10 +31,7 @@ impl RoomsService {
         Self { storage }
     }
 
-    pub fn create_room(
-        &self,
-        req: CreateRoomRequest,
-    ) -> Result<CreateRoomResponse, ServiceError> {
+    pub fn create_room(&self, req: CreateRoomRequest) -> Result<CreateRoomResponse, ServiceError> {
         require_non_empty("topic", &req.topic)?;
         require_non_empty("goal", &req.goal)?;
         require_non_empty("stage", &req.stage)?;
@@ -90,7 +87,81 @@ impl RoomsService {
                 member_id: req.member_id,
                 role,
                 joined_at,
+                project_id: None,
+                session_id: None,
+                agent: None,
+                model: None,
+                delivery_mode: None,
+                incarnation: None,
             },
+        })
+    }
+
+    pub fn bind_member(
+        &self,
+        req: BindRoomMemberRequest,
+    ) -> Result<BindRoomMemberResponse, ServiceError> {
+        require_non_empty("room_id", &req.room_id)?;
+        require_non_empty("member_id", &req.member_id)?;
+        require_non_empty("project_id", &req.project_id)?;
+        require_non_empty("session_id", &req.session_id)?;
+        require_non_empty("agent", &req.agent)?;
+        require_non_empty("model", &req.model)?;
+        require_non_empty("delivery_mode", &req.delivery_mode)?;
+        if req.incarnation < 1 {
+            return Err(ServiceError::InvalidRequest(
+                "incarnation must be at least 1".to_owned(),
+            ));
+        }
+
+        let mut connection = self.storage.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_room(&transaction, &req.room_id)?;
+        let current_incarnation = transaction
+            .query_row(
+                "SELECT incarnation FROM room_members WHERE room_id = ?1 AND member_id = ?2",
+                params![req.room_id, req.member_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| ServiceError::NotRoomMember {
+                room_id: req.room_id.clone(),
+                member_id: req.member_id.clone(),
+            })?;
+        if let Some(current) = current_incarnation {
+            if req.incarnation <= current {
+                return Err(ServiceError::StaleIncarnation {
+                    room_id: req.room_id,
+                    member_id: req.member_id,
+                    expected: current.saturating_add(1),
+                    received: Some(req.incarnation),
+                });
+            }
+        }
+
+        transaction.execute(
+            "UPDATE room_members
+             SET project_id = ?1, session_id = ?2, agent = ?3, model = ?4,
+                 delivery_mode = ?5, incarnation = ?6
+             WHERE room_id = ?7 AND member_id = ?8",
+            params![
+                req.project_id,
+                req.session_id,
+                req.agent,
+                req.model,
+                req.delivery_mode,
+                req.incarnation,
+                req.room_id,
+                req.member_id
+            ],
+        )?;
+        let member = query_member(&transaction, &req.room_id, &req.member_id)?;
+        transaction.commit()?;
+
+        Ok(BindRoomMemberResponse {
+            ok: true,
+            room_id: req.room_id,
+            member,
         })
     }
 
@@ -106,6 +177,23 @@ impl RoomsService {
         {
             let connection = self.storage.lock_connection()?;
             require_active_room(&connection, &req.room_id)?;
+            let bound_incarnation = connection
+                .query_row(
+                    "SELECT incarnation FROM room_members WHERE room_id = ?1 AND member_id = ?2",
+                    params![req.room_id, req.author],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?;
+            if let Some(Some(expected)) = bound_incarnation {
+                if req.incarnation != Some(expected) {
+                    return Err(ServiceError::StaleIncarnation {
+                        room_id: req.room_id.clone(),
+                        member_id: req.author.clone(),
+                        expected,
+                        received: req.incarnation,
+                    });
+                }
+            }
             if let Some(reply_to_post_id) = req.reply_to_post_id.as_deref() {
                 require_post_in_room(&connection, &req.room_id, reply_to_post_id)?;
             }
@@ -146,7 +234,13 @@ impl RoomsService {
             "INSERT INTO room_objections (
                 objection_id, room_id, post_id, author, reason, status
              ) VALUES (?1, ?2, ?3, ?4, ?5, 'open')",
-            params![objection_id, req.room_id, req.post_id, req.author, req.reason],
+            params![
+                objection_id,
+                req.room_id,
+                req.post_id,
+                req.author,
+                req.reason
+            ],
         )?;
         transaction.commit()?;
 
@@ -200,10 +294,7 @@ impl RoomsService {
         })
     }
 
-    pub fn create_poll(
-        &self,
-        req: CreatePollRequest,
-    ) -> Result<CreatePollResponse, ServiceError> {
+    pub fn create_poll(&self, req: CreatePollRequest) -> Result<CreatePollResponse, ServiceError> {
         require_non_empty("room_id", &req.room_id)?;
         require_non_empty("question", &req.question)?;
         require_non_empty("created_by", &req.created_by)?;
@@ -281,10 +372,7 @@ impl RoomsService {
         })
     }
 
-    pub fn grant_stage(
-        &self,
-        req: GrantStageRequest,
-    ) -> Result<GrantStageResponse, ServiceError> {
+    pub fn grant_stage(&self, req: GrantStageRequest) -> Result<GrantStageResponse, ServiceError> {
         require_non_empty("room_id", &req.room_id)?;
         require_non_empty("grantee", &req.grantee)?;
         require_non_empty("granted_by", &req.granted_by)?;
@@ -332,18 +420,15 @@ impl RoomsService {
         })
     }
 
-    pub fn close_room(
-        &self,
-        req: CloseRoomRequest,
-    ) -> Result<CloseRoomResponse, ServiceError> {
+    pub fn close_room(&self, req: CloseRoomRequest) -> Result<CloseRoomResponse, ServiceError> {
         require_non_empty("room_id", &req.room_id)?;
         let outcome = RoomOutcome {
             decisions: req.decisions,
             dissent: req.dissent,
             outstanding_actions: req.outstanding_actions,
         };
-        let outcome_json = serde_json::to_string(&outcome)
-            .map_err(|error| invalid_json("room outcome", error))?;
+        let outcome_json =
+            serde_json::to_string(&outcome).map_err(|error| invalid_json("room outcome", error))?;
         let closed_at = now_timestamp();
 
         let mut connection = self.storage.lock_connection()?;
@@ -491,26 +576,48 @@ fn query_members(
     room_id: &str,
 ) -> Result<Vec<RoomMemberDto>, ServiceError> {
     let mut statement = connection.prepare(
-        "SELECT member_id, role, joined_at FROM room_members
+        "SELECT member_id, role, joined_at, project_id, session_id, agent, model,
+                delivery_mode, incarnation FROM room_members
          WHERE room_id = ?1 ORDER BY joined_at ASC, member_id ASC",
     )?;
     let members = statement
-        .query_map(params![room_id], |row| {
-            Ok(RoomMemberDto {
-                member_id: row.get(0)?,
-                role: row.get(1)?,
-                joined_at: row.get(2)?,
-            })
-        })?
+        .query_map(params![room_id], room_member_from_row)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(ServiceError::from)?;
     Ok(members)
 }
 
-fn query_posts(
+fn query_member(
     connection: &Connection,
     room_id: &str,
-) -> Result<Vec<RoomPostDto>, ServiceError> {
+    member_id: &str,
+) -> Result<RoomMemberDto, ServiceError> {
+    connection
+        .query_row(
+            "SELECT member_id, role, joined_at, project_id, session_id, agent, model,
+                    delivery_mode, incarnation FROM room_members
+             WHERE room_id = ?1 AND member_id = ?2",
+            params![room_id, member_id],
+            room_member_from_row,
+        )
+        .map_err(ServiceError::from)
+}
+
+fn room_member_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoomMemberDto> {
+    Ok(RoomMemberDto {
+        member_id: row.get(0)?,
+        role: row.get(1)?,
+        joined_at: row.get(2)?,
+        project_id: row.get(3)?,
+        session_id: row.get(4)?,
+        agent: row.get(5)?,
+        model: row.get(6)?,
+        delivery_mode: row.get(7)?,
+        incarnation: row.get(8)?,
+    })
+}
+
+fn query_posts(connection: &Connection, room_id: &str) -> Result<Vec<RoomPostDto>, ServiceError> {
     let mut statement = connection.prepare(
         "SELECT seq, post_id, author, post_type, content, reply_to_post_id, created_at
          FROM room_posts WHERE room_id = ?1 ORDER BY seq ASC",
@@ -569,10 +676,7 @@ fn query_revisions(
     Ok(revisions)
 }
 
-fn query_polls(
-    connection: &Connection,
-    room_id: &str,
-) -> Result<Vec<RoomPollDto>, ServiceError> {
+fn query_polls(connection: &Connection, room_id: &str) -> Result<Vec<RoomPollDto>, ServiceError> {
     let mut statement = connection.prepare(
         "SELECT poll_id, question, options_json, status, created_at, closed_at
          FROM room_polls WHERE room_id = ?1 ORDER BY created_at ASC, poll_id ASC",
@@ -612,10 +716,7 @@ fn query_polls(
         .collect()
 }
 
-fn query_votes(
-    connection: &Connection,
-    poll_id: &str,
-) -> Result<Vec<RoomVoteDto>, ServiceError> {
+fn query_votes(connection: &Connection, poll_id: &str) -> Result<Vec<RoomVoteDto>, ServiceError> {
     let mut statement = connection.prepare(
         "SELECT voter, vote, voted_at FROM room_votes
          WHERE poll_id = ?1 ORDER BY voted_at ASC, voter ASC",
@@ -686,6 +787,7 @@ mod tests {
             .post(PostRoomRequest {
                 room_id: room_id.to_owned(),
                 author: author.to_owned(),
+                incarnation: None,
                 post_type: "argument".to_owned(),
                 content: content.to_owned(),
                 reply_to_post_id: None,
@@ -731,6 +833,53 @@ mod tests {
     }
 
     #[test]
+    fn bound_member_posts_require_current_incarnation() {
+        let service = service();
+        let created = create_room(&service);
+        service
+            .join_room(JoinRoomRequest {
+                room_id: created.room_id.clone(),
+                member_id: "bob".to_owned(),
+                role: "colleague".to_owned(),
+            })
+            .expect("join room");
+        service
+            .bind_member(BindRoomMemberRequest {
+                room_id: created.room_id.clone(),
+                member_id: "bob".to_owned(),
+                project_id: "project:bob".to_owned(),
+                session_id: "ses-bob-1".to_owned(),
+                agent: "atlas".to_owned(),
+                model: "openai/gpt-5".to_owned(),
+                delivery_mode: "background".to_owned(),
+                incarnation: 1,
+            })
+            .expect("bind member");
+
+        let stale = service.post(PostRoomRequest {
+            room_id: created.room_id.clone(),
+            author: "bob".to_owned(),
+            incarnation: Some(0),
+            post_type: "position".to_owned(),
+            content: "stale actor".to_owned(),
+            reply_to_post_id: None,
+        });
+        assert!(matches!(stale, Err(ServiceError::StaleIncarnation { .. })));
+
+        let posted = service
+            .post(PostRoomRequest {
+                room_id: created.room_id,
+                author: "bob".to_owned(),
+                incarnation: Some(1),
+                post_type: "position".to_owned(),
+                content: "current actor".to_owned(),
+                reply_to_post_id: None,
+            })
+            .expect("current incarnation posts");
+        assert_eq!(posted.seq, 1);
+    }
+
+    #[test]
     fn post_sequences_are_monotonic_across_authors() {
         let service = service();
         let room = create_room(&service);
@@ -746,7 +895,11 @@ mod tests {
             })
             .expect("get room");
         assert_eq!(
-            fetched.posts.iter().map(|post| post.seq).collect::<Vec<_>>(),
+            fetched
+                .posts
+                .iter()
+                .map(|post| post.seq)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(
@@ -933,7 +1086,10 @@ mod tests {
         assert_eq!(fetched.goal, "Reach an attributable decision");
         assert_eq!(fetched.stage, "deliberation");
         assert_eq!(fetched.status, "closed");
-        assert_eq!(fetched.closed_at.as_deref(), Some(closed.closed_at.as_str()));
+        assert_eq!(
+            fetched.closed_at.as_deref(),
+            Some(closed.closed_at.as_str())
+        );
         assert_eq!(fetched.decisions, decisions);
         assert_eq!(fetched.dissent, dissent);
         assert_eq!(fetched.outstanding_actions, actions);
@@ -973,6 +1129,7 @@ mod tests {
             service.post(PostRoomRequest {
                 room_id: room.room_id.clone(),
                 author: "alice".to_owned(),
+                incarnation: None,
                 post_type: "argument".to_owned(),
                 content: "too late".to_owned(),
                 reply_to_post_id: None,

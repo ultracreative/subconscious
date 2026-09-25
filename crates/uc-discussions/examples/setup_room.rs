@@ -11,8 +11,8 @@ use uc_discussions::service::rooms::RoomsService;
 use uc_discussions::Storage;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let home = env::var("HOME")
-        .map_err(|e| format!("failed to read HOME environment variable: {e}"))?;
+    let home =
+        env::var("HOME").map_err(|e| format!("failed to read HOME environment variable: {e}"))?;
     let db_path = PathBuf::from(home)
         .join(".local")
         .join("share")
@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let post_resp = rooms_service.post(PostRoomRequest {
         room_id: create_resp.room_id.clone(),
         author: "project:subconscious".to_string(),
+        incarnation: None,
         post_type: "proposal".to_string(),
         content: proposal.to_string(),
         reply_to_post_id: None,

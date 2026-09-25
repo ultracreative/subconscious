@@ -57,6 +57,7 @@ fn manifest_declares_all_management_surface_operations() {
             "peer.release_lease",
             "rooms.create",
             "rooms.join",
+            "rooms.bind_member",
             "rooms.post",
             "rooms.object",
             "rooms.revise",

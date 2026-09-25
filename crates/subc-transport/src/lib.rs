@@ -19,6 +19,6 @@ pub use connection_file::{
     discover, discovery_candidates, generate_daemon_id, generate_key, read, read_for_client,
     user_connection_token, write_atomic, ConnectionFileError, ConnectionInfo, Discovered,
     DiscoveryError, Endpoint, TriedCandidate, CONNECTION_FILE_NAME, DAEMON_ID_LEN, KEY_LEN,
-    MIN_KEY_LEN, SCHEMA_VERSION,
+    MIN_KEY_LEN, PROD_CONNECTION_RELATIVE_PATH, SCHEMA_VERSION,
 };
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};

@@ -22,7 +22,7 @@ pub const DAEMON_ID_LEN: usize = 16;
 /// every reader spell it once; three private copies of this literal used to
 /// exist and nothing asserted they agreed.
 pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
-const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
+pub const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

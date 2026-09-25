@@ -1,0 +1,11 @@
+{
+  "$schema": "https://arcus.rustybret.com/schemas/arcus-project.schema.json",
+  "package_id": "ck-subc-mcp",
+  "software_type": "cli",
+  "source_id": "arcus",
+  "gateway": "https://arcus-auth.rustybret.com",
+  "channel": "stable",
+  "format": "tar.zst",
+  "action_executable": "ck-subc-mcp",
+  "version": "0.1.0"
+}

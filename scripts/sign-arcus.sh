@@ -1,0 +1,1 @@
+../packages/arcus/toolchain/scripts/sign-arcus.sh

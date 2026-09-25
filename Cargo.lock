@@ -266,7 +266,7 @@ dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "data-encoding",
  "futures-util",
  "nkeys",
@@ -397,7 +397,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ceae091889f52b64ef218ca24346fd18ed14d24053396d7a8cad031a78c430e7"
 dependencies = [
  "chrono",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "regex",
  "tracing",
  "tracing-subscriber",

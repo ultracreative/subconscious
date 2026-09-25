@@ -7,5 +7,5 @@
   "channel": "stable",
   "format": "tar.zst",
   "action_executable": "ck-subc-mcp",
-  "version": "0.1.0"
+  "version": "0.1.10"
 }

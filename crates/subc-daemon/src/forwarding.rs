@@ -318,6 +318,17 @@ pub(crate) struct ModuleDrainTarget {
     pub excluded_subscriptions: u32,
 }
 
+/// One registered module connection, as [`ForwardingTable::module_connections`]
+/// reports it: enough to send it a frame and then close it.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleConnectionTarget {
+    pub module_id: String,
+    pub endpoint: ModuleEndpointId,
+    pub sink: FrameSink,
+    pub negotiated_ver: u8,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum RouteBindRelayOutcome {
     Accepted,
@@ -522,6 +533,10 @@ pub struct ForwardingTable {
     /// Current route.bind relays keyed by target module. Admission is shared
     /// across every client connection that points at the same endpoint.
     route_bind_concurrency: RouteBindConcurrency,
+    /// Start and end of each module's `route.open` outage. Held here for the
+    /// same reason as the breakers: every handler built over this table must
+    /// see one outage per module, or each would log its own opening line.
+    route_outages: Arc<crate::route_outage::RouteOutageTracker>,
 }
 
 impl ForwardingTable {
@@ -535,6 +550,10 @@ impl ForwardingTable {
 
     pub(crate) fn route_bind_concurrency(&self) -> RouteBindConcurrency {
         self.route_bind_concurrency.clone()
+    }
+
+    pub(crate) fn route_outages(&self) -> Arc<crate::route_outage::RouteOutageTracker> {
+        Arc::clone(&self.route_outages)
     }
 
     pub(crate) fn register_connection_close(
@@ -560,10 +579,13 @@ impl ForwardingTable {
     }
 
     /// Close every established connection, modules and clients alike, as the
-    /// last step of an announced daemon shutdown. A module learns the daemon is
-    /// gone by EOF on its control connection; delivering that EOF while the
-    /// daemon is still alive lets the daemon wait for the modules' own
-    /// teardowns before it ends whatever is left.
+    /// last step of an announced daemon shutdown. By the time this runs each
+    /// registered module has already been sent a module GOODBYE (see
+    /// `Supervisor::end_children_for_daemon_shutdown`), so the EOF that follows
+    /// is a planned stop; EOF with no GOODBYE before it stays reserved for a
+    /// daemon that went away unannounced. Closing while the daemon is still
+    /// alive lets it wait for the modules' own teardowns before it ends
+    /// whatever is left.
     #[cfg(unix)]
     pub(crate) fn close_all_connections(&self, reason: &CloseReason) -> usize {
         let senders: Vec<_> = self.lock_close_registry().drain().collect();
@@ -572,6 +594,34 @@ impl ForwardingTable {
             let _ = sender.send(reason.clone());
         }
         count
+    }
+
+    /// Every registered module connection, whichever slot it occupies (active,
+    /// swap candidate, or superseded incumbent), once each. Daemon shutdown
+    /// uses this to tell each of them it is a planned stop before closing it.
+    #[cfg(unix)]
+    pub(crate) fn module_connections(
+        &self,
+    ) -> Result<Vec<ModuleConnectionTarget>, ForwardingError> {
+        let inner = self.read_inner()?;
+        let mut seen = HashSet::new();
+        Ok(inner
+            .modules_by_id
+            .values()
+            .chain(inner.candidates_by_id.values())
+            .chain(inner.superseded_endpoints.values())
+            .filter(|module| seen.insert(module.endpoint))
+            .map(|module| ModuleConnectionTarget {
+                module_id: inner
+                    .module_id_by_endpoint
+                    .get(&module.endpoint)
+                    .cloned()
+                    .unwrap_or_default(),
+                endpoint: module.endpoint,
+                sink: module.sink.clone(),
+                negotiated_ver: module.negotiated_ver,
+            })
+            .collect())
     }
 
     /// Ask a registered connection to close. Returns true only for the request

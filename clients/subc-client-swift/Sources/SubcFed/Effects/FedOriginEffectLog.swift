@@ -184,26 +184,13 @@ public actor FedOriginEffectLog {
                 throw FedFailure.indeterminateMutation
             }
 
-            let reservation = try await store.reserveEffectSequence()
-            let snapshot = try await store.snapshot()
-            let effect = FedEffectID(
-                incarnation: snapshot.global.localIncarnation,
-                seq: reservation.value
-            )
-            let record = FedUnresolvedEffectRecord(
-                effect: effect,
+            // One call, so a store that can reserve and commit the intent in
+            // a single durable write does (the SQLite store does).
+            let effect = try await store.reserveEffectSequenceAndCommitIntent(
                 responderStaticPublicKey: responderStaticPublicKey,
-                phase: .intent,
-                disposition: .unknown,
                 peerLedgerEpoch: peerLedgerEpoch,
                 peerIncarnation: peerIncarnation
             )
-            do {
-                try await store.commitIntent(record)
-            } catch {
-                releaseLane()
-                throw FedFailure.reservationFailed
-            }
             openMutatingSequences.insert(effect.seq)
             return FedMutationSendCapability(effect: effect)
         } catch {
@@ -382,6 +369,27 @@ public actor FedOriginEffectLog {
         try await store.destination(forResponderPublicKey: responderStaticPublicKey)?.confirmedWatermark
     }
 
+    /// What a `call` or `keepalive` tells an effects-v2 peer about settlement:
+    /// the durable watermark and the lowest confirmed ranges above it, coalesced
+    /// as `FedSettlementRules.frameRanges` describes, at most
+    /// `FedEffectsV2Codec.maximumConfirmedRangesPerFrame` of them. Nothing is
+    /// confirmed while a ledger epoch of the peer is poisoned.
+    public func durableConfirmations(localIncarnation: String) async throws -> (
+        watermark: FedConfirmedWatermark?,
+        ranges: [FedConfirmedEffectRange]
+    ) {
+        guard let destination = try await store.destination(forResponderPublicKey: responderStaticPublicKey) else {
+            return (nil, [])
+        }
+        guard destination.poisonedLedgerEpochs.isEmpty else {
+            return (destination.confirmedWatermark, [])
+        }
+        return (
+            destination.confirmedWatermark,
+            FedSettlementRules.frameRanges(of: destination, localIncarnation: localIncarnation)
+        )
+    }
+
     /// Unsettled rows that must be reconciled before new mutations.
     public func unsettled() async throws -> [FedUnresolvedEffectRecord] {
         try await store.unsettledEffects(forResponderPublicKey: responderStaticPublicKey)
@@ -430,12 +438,15 @@ public actor FedOriginEffectLog {
     /// sentinel. If the peer reports this already-settled effect as not_found with
     /// a complete ledger at the same epoch, the serving ledger has regressed and
     /// the epoch must be poisoned. Returns nil when no recorded row matches.
+    ///
+    /// The selection lives in `FedSettledRecordPruning` because the stores
+    /// must never prune the record it picks; sharing it keeps the two in step.
     public func regressionSentinel(liveEpoch: String) async throws -> FedEffectID? {
         let destination = try await store.destination(forResponderPublicKey: responderStaticPublicKey)
-        let candidates = destination?.unresolvedEffects.filter {
-            $0.disposition == .recorded && $0.peerLedgerEpoch == liveEpoch
-        } ?? []
-        return candidates.max(by: { $0.effect.seq < $1.effect.seq })?.effect
+        return FedSettledRecordPruning.regressionSentinel(
+            in: destination?.unresolvedEffects ?? [],
+            liveEpoch: liveEpoch
+        )?.effect
     }
 
     /// Reconciles one effect_status_result without ever blind-replaying a call.
@@ -450,9 +461,22 @@ public actor FedOriginEffectLog {
         bodyOmitted: Bool
     ) async throws -> FedEffectDisposition? {
         let destination = try await store.destination(forResponderPublicKey: responderStaticPublicKey)
-        let intentEpoch = destination?.unresolvedEffects
-            .first(where: { $0.effect == effect })?
-            .peerLedgerEpoch
+        let row = destination?.unresolvedEffects.first(where: { $0.effect == effect })
+        let intentEpoch = row?.peerLedgerEpoch
+
+        if status == "confirmed" {
+            // The peer says this phone confirmed the id earlier, which it only
+            // does for an outcome it holds. If the row still holds that outcome
+            // the effect is settled and nothing changes. If it does not (a store
+            // restored from elsewhere, say), the outcome is gone: the effect
+            // must never be re-sent and never read as not executed, so it
+            // settles ambiguous, the terminal for an unrecoverable outcome.
+            if let row, FedSettlementRules.holdsOutcome(row.disposition) {
+                return row.disposition
+            }
+            try await commitTerminal(effect, disposition: .ambiguous)
+            return .ambiguous
+        }
 
         if resultLedgerEpoch != liveHelloEpoch {
             try await commitTerminal(effect, disposition: .ambiguous)

@@ -400,6 +400,7 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
         consumer_identity,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
 
     let direct = control::rpc(&run.connection_file, request(None)).await;
@@ -492,4 +493,54 @@ async fn record_server_describe(run: &AcceptanceRun) {
         panic!("observable server.describe must return its matching response variant");
     };
     eprintln!("fire-time server.describe build_git_sha={build_git_sha:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_ckbus_hello_declares_build_provenance() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let run = AcceptanceRun::start(Path::new(env!("CARGO_BIN_EXE_ck-bus"))).await;
+    run.wait_for_catalog_id(MODULE_ID).await;
+    let response = control::response(
+        &run.connection_file,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: Some(MODULE_ID.to_string()),
+        },
+    )
+    .await;
+    let ClientControlResponse::SupervisorProvenance { modules, .. } = response else {
+        panic!("expected supervisor provenance response");
+    };
+    assert_eq!(modules.len(), 1);
+    let subc_control::ModuleDeclaredProvenance::Reported { build } = &modules[0].module_declared
+    else {
+        panic!("real ckbus HELLO omitted build provenance");
+    };
+    assert_eq!(
+        build.wire_crate_version.as_deref(),
+        Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+    );
+    let sha = build
+        .build_git_sha
+        .as_deref()
+        .expect("real HELLO must carry build git SHA");
+    assert_eq!(sha.len(), 40);
+    assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(build.build_lock_digest.as_ref().unwrap().len(), 64);
+    assert_eq!(
+        build.launch_nonce_source,
+        Some(expected_launch_nonce_source())
+    );
+    run.shutdown().await;
+}
+
+/// Where a supervised module gets its launch nonce on this platform: the daemon
+/// hands it over on a pipe on Unix, and only in the environment on Windows,
+/// which has no pipe handover yet.
+fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
+    if cfg!(windows) {
+        subc_protocol::manifest::LaunchNonceSource::Env
+    } else {
+        subc_protocol::manifest::LaunchNonceSource::Fd
+    }
 }

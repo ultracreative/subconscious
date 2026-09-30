@@ -116,6 +116,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         &verdicts
             .into_iter()
             .map(|verdict| SupervisorEntry {
+                launch_nonce_env: None,
                 pending_reload: Some(verdict),
                 ..supervisor_entry()
             })
@@ -160,6 +161,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         ]
         .into_iter()
         .map(|resources| SupervisorEntry {
+            launch_nonce_env: None,
             resources: Some(resources),
             ..supervisor_entry()
         })
@@ -230,6 +232,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 admission_facts: Some(
                     serde_json::json!({"schema": 1, "verified_class": "service"}),
                 ),
+                scope: None,
             },
         ),
         (
@@ -246,6 +249,29 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 }),
                 consumer_capabilities: None,
                 admission_facts: None,
+                scope: None,
+            },
+        ),
+        (
+            "client_control_request_route_open_with_scope",
+            ClientControlRequest::RouteOpen {
+                target: RouteTarget::ToolProvider {
+                    module_id: "plexus".to_string(),
+                },
+                identity: bind_identity(),
+                consumer_identity: Some(ConsumerIdentity {
+                    module_id: "aft".to_string(),
+                    launch_nonce: "0123456789abcdef".to_string(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(subc_protocol::scope::ScopeSelector {
+                    owner: subc_protocol::Principal::Reserved {
+                        module_id: "prefrontal-core".to_string(),
+                    },
+                    scope_ref: "head-1".to_string(),
+                    scope_epoch: Some(3),
+                }),
             },
         ),
         (
@@ -549,18 +575,16 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorModuleProvenance {
                     module_id: "aft".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
-                        build: ManifestProvenance {
-                            build_git_sha: Some(
+                        build: ManifestProvenance::new()
+                            .with_build_git_sha(Some(
                                 "0123456789abcdef0123456789abcdef01234567".to_string(),
-                            ),
-                            build_git_sha_absence_reason: None,
-                            build_lock_digest: Some(
+                            ))
+                            .with_build_lock_digest(Some(
                                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                                     .to_string(),
-                            ),
-                            wire_crate_version: Some("0.13.0".to_string()),
-                            store_schema_version: Some("2".to_string()),
-                        },
+                            ))
+                            .with_wire_crate_version(Some("0.13.0".to_string()))
+                            .with_store_schema_version(Some("2".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
                         pid: Some(4201),
@@ -639,18 +663,16 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorModuleProvenance {
                     module_id: "mcp".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
-                        build: ManifestProvenance {
-                            build_git_sha: Some(
+                        build: ManifestProvenance::new()
+                            .with_build_git_sha(Some(
                                 "fedcba9876543210fedcba9876543210fedcba98-dirty".to_string(),
-                            ),
-                            build_git_sha_absence_reason: None,
-                            build_lock_digest: Some(
+                            ))
+                            .with_build_lock_digest(Some(
                                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                                     .to_string(),
-                            ),
-                            wire_crate_version: Some("0.13.0".to_string()),
-                            store_schema_version: Some("3".to_string()),
-                        },
+                            ))
+                            .with_wire_crate_version(Some("0.13.0".to_string()))
+                            .with_store_schema_version(Some("3".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
                         pid: Some(4401),
@@ -965,6 +987,7 @@ fn spawn_cursor(seq: u64) -> SpawnCursor {
 
 fn supervisor_entry() -> SupervisorEntry {
     SupervisorEntry {
+        launch_nonce_env: None,
         module_id: "aft-tools".to_string(),
         state: "running".to_string(),
         enabled: true,
@@ -1027,6 +1050,7 @@ fn reload_path_unknown_variant_and_reason_preserve_forward_wire() {
 /// recovered module as a nearly-dead one.
 fn supervisor_entry_with_restart_window() -> SupervisorEntry {
     SupervisorEntry {
+        launch_nonce_env: None,
         restart_window_secs: Some(600),
         // Deliberately unlike the built-in 30_000/100/30_000 policy so this
         // golden cannot be satisfied by reporting defaults instead of the
@@ -1123,6 +1147,7 @@ fn supervisor_entry_carries_the_declared_protocol_verbatim() {
     assert_eq!(subc["protocol"], "subc");
 
     let none_entry = SupervisorEntry {
+        launch_nonce_env: None,
         protocol: ModuleProtocol::None,
         ..supervisor_entry()
     };
@@ -1169,6 +1194,7 @@ fn supervisor_entry_without_resources_decodes_as_absent_not_zero() {
     assert_eq!(decoded.resources, None);
 
     let unavailable = SupervisorEntry {
+        launch_nonce_env: None,
         resources: Some(ChildResourceUsage::Unavailable {
             reason: ChildResourceUnavailableReason::Unreadable,
         }),

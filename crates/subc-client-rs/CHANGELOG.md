@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.23.4 — 2026-09-30
+
+- `ModuleHandler::on_draining(reason, deadline)` delivers the daemon's `module.draining` notice,
+  which it sends before stopping a module (restart, reload, disable, swap, daemon shutdown). Until
+  now the SDK dropped it. The hook runs on its own task, so pings and GOODBYE keep flowing while it
+  works, and it is always called before the GOODBYE that ends the drain is handled. `deadline` is
+  a wall-clock "no later than", never a grant. It has a no-op default, so existing handlers are
+  unaffected. The trait docs describe how to hold a drain open until background work finishes (a
+  `Busy` self-signal anchored to health gauges); the `echo-module` example declares one.
+- A channel-0 push the SDK cannot decode is ignored, and the first on each connection is logged at
+  warn through `tracing` (a new dependency); the connection stays up.
+
+## 0.23.2 — 2026-09-30
+
+- Add `SubcConsumer::open_route_scoped(target, identity, scope, opts)`, which opens (or reuses) a
+  managed route admitted under a daemon scope, so a carrier can open its onward route for a
+  session and the provider's bind is stamped with the scope. `ScopeSelector` is re-exported from
+  `subc-protocol`; build its `owner` with `subc_protocol::Principal`. The managed route cache keys
+  a scoped route by the whole selector (owner, ref and epoch): a route opened under one scope or
+  epoch is never returned for another, and scoped and unscoped opens never share a route. After
+  the route closes, the next call with the same selector reopens it under that selector.
+- `scope_not_synced` and `scope_changed` refusals are retried within the call's deadline;
+  `scope_ended`, `scope_not_live`, `scope_epoch_required` and `scope_not_carrier` end the call at
+  once, with the code in `CallError::route_open_refusal()`. A `route.closed` push with any of the
+  four `scope_*` reasons classifies as `RouteCloseDisposition::MustNotReopen`.
+
 ## 0.22.1 — 2026-09-29
 
 - `ModuleHandler::on_connection_end(end)` reports how a served module's daemon connection ended:

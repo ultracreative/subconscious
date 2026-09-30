@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant as StdInstant},
 };
 
@@ -23,6 +23,7 @@ use subc_protocol::{
         CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
         ProviderRole,
     },
+    scope::{ScopeRecord, ScopeSelector, CAP_SCOPES_V1, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP},
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -54,6 +55,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
+    scopes::{BoundScope, HelloLaunchNonces, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
@@ -100,8 +102,17 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_SPAWN_SUBSCRIBE,
 ];
 
-const MODULE_TO_SUBC_CONTROL_OPS: &[&str] =
-    &[MODULE_TO_SUBC_OP_CATALOG_UPDATE, "supervisor.live_roots"];
+const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
+    MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    "supervisor.live_roots",
+    SCOPE_SYNC_OP,
+    SCOPE_DESCRIBE_OP,
+];
+
+/// Module-originated ops the daemon answers but does not advertise in
+/// `HELLO_ACK`. Empty today; an op is served from here while the feature it
+/// belongs to is incomplete, so no module is told it works before it does.
+const MODULE_TO_SUBC_UNADVERTISED_OPS: &[&str] = &[];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 
@@ -217,6 +228,7 @@ struct SupervisorRescanContext {
     storage_config: Option<crate::daemon_config::StorageConfig>,
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
+    scope_authority_owners: Vec<String>,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -288,6 +300,16 @@ pub struct ControlHandler {
     machine_id: Option<crate::machine_id::MachineId>,
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
+    /// Scope records with their sync authorities and tombstones; see
+    /// `crate::scopes`. Shared by clones of this handler, so every connection
+    /// reads and writes one table.
+    scopes: Arc<RwLock<ScopeTable>>,
+    /// The configured `scope_authority_owners`, kept so a rescan can report a
+    /// changed value as needing a daemon restart; rescan never applies it.
+    scope_authority_owners: Vec<String>,
+    /// The launch nonce each module connection presented at HELLO, which is how
+    /// a `scope.sync` is matched to the owner's current launch.
+    hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
@@ -317,6 +339,7 @@ struct RouteOpenRequest {
     consumer_identity: Option<ConsumerIdentity>,
     consumer_capabilities: Option<Vec<String>>,
     admission_facts: Option<serde_json::Value>,
+    scope: Option<ScopeSelector>,
 }
 
 struct RouteBindReservationGuard {
@@ -726,6 +749,7 @@ impl ControlHandler {
                 CAP_PING_PONG.to_string(),
                 CAP_SESSION_ATTACH.to_string(),
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
+                CAP_SCOPES_V1.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -739,6 +763,11 @@ impl ControlHandler {
             machine_id: None,
             admission_facts_carrier_module_id: None,
             admission_facts_targets: None,
+            scopes: Arc::new(RwLock::new(ScopeTable::new(
+                crate::daemon_config::default_scope_authority_owners(),
+            ))),
+            scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
             counters,
@@ -778,6 +807,15 @@ impl ControlHandler {
     ) -> Self {
         self.admission_facts_carrier_module_id = carrier_module_id;
         self.admission_facts_targets = targets;
+        self
+    }
+
+    /// Set the module ids whose scopes may carry `agent_id` and `delegates`.
+    /// Replaces the scope table with an empty one under the new list, so call it
+    /// while building the handler, before any module can sync.
+    pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
+        self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
+        self.scope_authority_owners = owners;
         self
     }
 
@@ -914,6 +952,7 @@ impl ControlHandler {
             storage_config: self.storage_config.clone(),
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
+            scope_authority_owners: self.scope_authority_owners.clone(),
         });
         self
     }
@@ -1533,6 +1572,16 @@ impl ControlHandler {
             self.refresh_capability_requirements();
         }
         self.supervisor.remove_spawn_subscribers(connection_id);
+        // Sync authority dies with its connection, so the owner's next
+        // connection can take it; the owner's scopes stay as they are.
+        self.hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .forget(connection_id);
+        self.scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release_connection(connection_id);
         registrations
     }
 
@@ -1849,6 +1898,14 @@ impl ControlHandler {
             )?]);
         }
 
+        // Kept for scope sync authority, which goes only to the connection that
+        // presented the module's current launch nonce. Recorded before the
+        // registration is attempted: a connection whose registration then fails
+        // has no registration, so it cannot sync anyway, and cleanup forgets it.
+        self.hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(connection_id, hello.launch_nonce.as_deref());
         let control_ops = effective_module_control_ops(hello.control_ops);
         // Built before anything is registered so an encoding failure leaves no
         // registry or forwarding state behind.
@@ -2112,6 +2169,7 @@ impl ControlHandler {
                 consumer_identity,
                 consumer_capabilities,
                 admission_facts,
+                scope,
             } => {
                 self.handle_route_open(
                     ctx,
@@ -2122,6 +2180,7 @@ impl ControlHandler {
                         consumer_identity,
                         consumer_capabilities,
                         admission_facts,
+                        scope,
                     },
                 )
                 .await
@@ -2217,7 +2276,193 @@ impl ControlHandler {
                     "ModuleControlResponseToModule::LiveRoots",
                 )?])
             }
+            ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
+                self.handle_scope_sync(connection_id, frame, generation, scopes)
+            }
+            ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
+                self.handle_scope_describe(connection_id, frame, owner, scope_ref)
+            }
         }
+    }
+
+    /// `scope.sync`: the owner is the module registered on this connection.
+    /// A connection with no registration (every client connection, `direct`
+    /// included) is refused `not_registered` before the table is consulted.
+    fn handle_scope_sync(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(registration) = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "scope.sync requires an active module registration owned by this connection",
+            )?]);
+        };
+        let owner = registration.manifest.module_id;
+        let current_nonce = self.supervisor.spawn_launch_nonce_for(&owner);
+        let is_current_launch = |connection: ConnectionId| {
+            self.hello_launch_nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .presented(connection, current_nonce.as_deref())
+        };
+        // Lock order is the scope table, then the forwarding table: the new
+        // tags are published, and the routes the change closes are selected,
+        // while the scope table is still write-locked, so no admission can read
+        // a record whose tag is not yet published.
+        let mut table = self
+            .scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outcome = table.sync(&owner, connection_id, is_current_launch, generation, scopes);
+        let drained = match &outcome {
+            Ok(applied) => self
+                .forwarding
+                .publish_scope_changes(&applied.tag_changes)
+                .map_err(RouterError::Forwarding)?,
+            Err(_) => Vec::new(),
+        };
+        drop(table);
+        match outcome {
+            Ok(applied) => {
+                info!(
+                    owner = %owner,
+                    generation,
+                    records = applied.results.len(),
+                    ended = applied.ended.len(),
+                    tag_changes = applied.tag_changes.len(),
+                    routes_closed = drained.len(),
+                    "scope sync accepted"
+                );
+                self.close_scope_drained_routes(drained);
+                let response = ModuleControlResponseToModule::ScopeSync {
+                    generation,
+                    results: applied.results,
+                    ended: applied.ended,
+                };
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ModuleControlResponseToModule::ScopeSync",
+                )?])
+            }
+            Err(refusal) => {
+                info!(
+                    owner = %owner,
+                    generation,
+                    code = refusal.code,
+                    "scope sync refused"
+                );
+                Ok(vec![control_error_frame(
+                    &frame,
+                    refusal.code,
+                    refusal.message,
+                )?])
+            }
+        }
+    }
+
+    /// Tell both ends of each route a scope change closed. The module gets a
+    /// channel-scoped GOODBYE and so does the client: the GOODBYE is what ends
+    /// the client's route handle. The client also gets `route.closed` with the
+    /// scope reason, one push per module and reason, so it can tell a revoked
+    /// route from an ordinary close and not reopen it.
+    fn close_scope_drained_routes(&self, drained: Vec<crate::forwarding::ScopeDrainedRoute>) {
+        if drained.is_empty() {
+            return;
+        }
+        let mut pushes: BTreeMap<(String, String), (RouteCloseReason, Vec<EndpointRoute>)> =
+            BTreeMap::new();
+        let mut goodbyes = Vec::with_capacity(drained.len() * 2);
+        for route in drained {
+            warn!(
+                module_id = %route.module_id,
+                reason = ?route.reason,
+                client_connection_id = route.client.connection_id.get(),
+                route_channel = route.client.channel,
+                "closing route because its scope changed"
+            );
+            pushes
+                .entry((route.module_id.clone(), format!("{:?}", route.reason)))
+                .or_insert_with(|| (route.reason, Vec::new()))
+                .1
+                .push(EndpointRoute {
+                    goodbye_target: route.client.clone(),
+                    principal: Principal::Unverified,
+                    bound_at: Instant::now(),
+                    draining: false,
+                    drain_reason: None,
+                });
+            goodbyes.push(route.module);
+            goodbyes.push(route.client);
+        }
+        for ((module_id, _), (reason, routes)) in pushes {
+            send_route_control_pushes(
+                &self.forwarding,
+                routes,
+                ClientControlPush::RouteClosed {
+                    module_id,
+                    reason,
+                    drained: false,
+                    abandoned: 0,
+                    excluded_subscriptions: 0,
+                    terminal: Some(false),
+                },
+            );
+        }
+        self.emit_route_goodbyes(goodbyes);
+    }
+
+    /// `scope.describe`: any registered module may read any scope, because a
+    /// provider must read the scope a route it serves is stamped with.
+    fn handle_scope_describe(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        owner: Principal,
+        scope_ref: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let registered = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        if registered.is_none() {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "scope.describe requires an active module registration owned by this connection",
+            )?]);
+        }
+        let description = self
+            .scopes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .describe(&owner, &scope_ref);
+        let owner_configured = match &owner {
+            Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+            _ => false,
+        };
+        let response = ModuleControlResponseToModule::ScopeDescribe {
+            status: description.status,
+            scope_epoch: description.scope_epoch,
+            daemon_incarnation: self.supervisor.spawn_snapshot().cursor.daemon_incarnation,
+            owner_synced: description.owner_synced,
+            owner_configured,
+            scope: description.stamp,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ModuleControlResponseToModule::ScopeDescribe",
+        )?])
     }
 
     fn handle_catalog_update(
@@ -2626,6 +2871,7 @@ impl ControlHandler {
             consumer_identity,
             consumer_capabilities,
             admission_facts,
+            scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
         debug!(
@@ -2973,6 +3219,46 @@ impl ControlHandler {
             // and the configured destination allowlist.
         }
 
+        // Scope admission, on the attested principal above and never on the
+        // request body. The tag read here travels with the pending bind and is
+        // compared with the published one at commit, so a sync between here
+        // and the module's ack refuses the open instead of binding a stamp
+        // that is no longer true.
+        let (bound_scope, scope_stamp) = match scope {
+            None => (None, None),
+            Some(selector) => {
+                let owner_configured = match &selector.owner {
+                    Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+                    _ => false,
+                };
+                let admitted = self
+                    .scopes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .admit(&principal, &target_module_id, &selector, owner_configured);
+                match admitted {
+                    Ok(admission) => (
+                        Some(BoundScope {
+                            owner: admission.owner,
+                            scope_ref: admission.stamp.scope_ref.clone(),
+                            tag: admission.tag,
+                        }),
+                        Some(admission.stamp),
+                    ),
+                    Err(refusal) => {
+                        return Ok(vec![self.route_open_refusal_frame(
+                            ctx,
+                            &frame,
+                            &target_module_id,
+                            refusal.code,
+                            refusal.code,
+                            refusal.message,
+                        )?]);
+                    }
+                }
+            }
+        };
+
         // Bind admits a root that no longer exists on disk, because refusing here
         // closes the only exit from a paused run: cancel needs a bound route, and a
         // renamed or reclaimed directory makes that route unopenable forever. The
@@ -3075,6 +3361,7 @@ impl ControlHandler {
                 frame.header.corr,
                 &target_module_id,
                 principal.clone(),
+                bound_scope,
                 Some(project_root),
                 relay_deadline,
             )
@@ -3129,6 +3416,7 @@ impl ControlHandler {
             principal: Some(principal),
             consumer_capabilities,
             admission_facts,
+            scope: scope_stamp,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -3191,6 +3479,23 @@ impl ControlHandler {
                 // is a different condition with its own refusal and must not
                 // move the breaker.
                 breaker.record_inconclusive();
+                // The daemon's own commit re-check refused the bind because the
+                // scope ended or changed after admission. The module accepted;
+                // counting it as a module rejection would blame the module.
+                let scope_code = match body.code.as_str() {
+                    error_codes::SCOPE_CHANGED => Some(error_codes::SCOPE_CHANGED),
+                    error_codes::SCOPE_ENDED => Some(error_codes::SCOPE_ENDED),
+                    _ => None,
+                };
+                if let Some(code) = scope_code {
+                    self.observe_route_open_refusal(
+                        ctx,
+                        &target_module_id,
+                        "scope_changed_before_commit",
+                        code,
+                    );
+                    return Ok(vec![control_error_body_frame(&frame, body)?]);
+                }
                 self.counters
                     .increment_route_open_refused("module_rejected");
                 info!(
@@ -3369,6 +3674,10 @@ impl ControlHandler {
                 image,
             ));
             modules.push(SupervisorEntry {
+                launch_nonce_env: Some(
+                    configured.protocol != subc_control::ModuleProtocol::None
+                        && (!cfg!(unix) || configured.launch_nonce_env),
+                ),
                 module_id: status.module_id,
                 state: status.state.to_string(),
                 enabled: status.enabled,
@@ -3892,6 +4201,7 @@ impl ControlHandler {
             storage_config,
             admission_facts_carrier_module_id,
             admission_facts_targets,
+            scope_authority_owners,
             modules,
             reserved_capabilities,
         ) = (
@@ -3899,6 +4209,7 @@ impl ControlHandler {
             config.storage,
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
+            config.scope_authority_owners,
             config.modules,
             config.reserved_capabilities,
         );
@@ -3921,6 +4232,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::AdmissionFactsTargets => {
                     admission_facts_targets != context.admission_facts_targets
+                }
+                RestartRequiredSection::ScopeAuthorityOwners => {
+                    scope_authority_owners != context.scope_authority_owners
                 }
             };
             if changed {
@@ -5093,8 +5407,12 @@ fn is_known_module_push_op(body: &[u8]) -> bool {
 
 fn is_known_module_request_op(body: &[u8]) -> bool {
     serde_json::from_slice::<ControlOpProbe>(body)
-        .map(|probe| MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()))
+        .map(|probe| is_module_to_subc_op(&probe.op))
         .unwrap_or(false)
+}
+
+fn is_module_to_subc_op(op: &str) -> bool {
+    MODULE_TO_SUBC_CONTROL_OPS.contains(&op) || MODULE_TO_SUBC_UNADVERTISED_OPS.contains(&op)
 }
 
 fn log_control_dispatch_arrival(op: &'static str, connection_id: ConnectionId, corr: u64) {
@@ -5155,6 +5473,8 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
+        ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
+        ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
     }
 }
 
@@ -5178,9 +5498,7 @@ fn parse_module_control_request_from_module(
 ) -> Result<ModuleControlRequestFromModule, (serde_json::Error, ControlRequestBodyError)> {
     serde_json::from_slice::<ModuleControlRequestFromModule>(body).map_err(|err| {
         let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
-            Ok(probe) if MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
-                ControlRequestBodyError::InvalidBody
-            }
+            Ok(probe) if is_module_to_subc_op(&probe.op) => ControlRequestBodyError::InvalidBody,
             Ok(_) => ControlRequestBodyError::UnknownOp,
             Err(_) => ControlRequestBodyError::InvalidBody,
         };
@@ -6053,6 +6371,7 @@ mod tests {
             consumer_identity: None,
             consumer_capabilities,
             admission_facts: None,
+            scope: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -6077,6 +6396,7 @@ mod tests {
             consumer_identity,
             consumer_capabilities: None,
             admission_facts: facts,
+            scope: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -6227,6 +6547,7 @@ mod tests {
         let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "stderr-tail-wire".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -6336,6 +6657,7 @@ mod tests {
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "terminal-off-worker".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -6407,6 +6729,7 @@ mod tests {
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "terminal-golden".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8656,6 +8979,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -8811,6 +9135,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -8898,6 +9223,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: module_id.to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -9174,6 +9500,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: "failed".to_string(),
                     program: missing_program,
                     args: Vec::new(),
@@ -9275,6 +9602,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: "late-health-response".to_string(),
                     program: PathBuf::from("disabled-module"),
                     args: Vec::new(),
@@ -10954,6 +11282,1161 @@ mod tests {
                 .unwrap();
             assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
             assert!(registry.get_candidate("vault").unwrap().is_none());
+        }
+    }
+
+    /// `scope.sync` and `scope.describe` through the real control handler: who
+    /// may sync is decided by the registration and launch nonce of the module
+    /// connection, never by the request body.
+    mod scopes {
+        use subc_protocol::scope::{
+            ParentState, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome, ScopeStamp,
+            ScopeStatus,
+        };
+
+        use super::*;
+
+        const OWNER: &str = "prefrontal-core";
+
+        fn head(scope_ref: &str, scope_epoch: u64) -> ScopeRecord {
+            ScopeRecord {
+                scope_ref: scope_ref.to_string(),
+                scope_epoch,
+                kind: ScopeKind::Head,
+                parent: None,
+                child_owners: Vec::new(),
+                carriers: Vec::new(),
+                attributes: Default::default(),
+            }
+        }
+
+        async fn call(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            request: &ModuleControlRequestFromModule,
+        ) -> Frame {
+            let body = serde_json::to_vec(request).unwrap();
+            let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 77, body).unwrap();
+            let mut replies = handler.handle_control_frame(ctx, frame).await.unwrap();
+            assert_eq!(replies.len(), 1, "{replies:?}");
+            replies.pop().unwrap()
+        }
+
+        async fn sync(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            generation: u64,
+            scopes: Vec<ScopeRecord>,
+        ) -> Result<ModuleControlResponseToModule, String> {
+            let reply = call(
+                handler,
+                ctx,
+                &ModuleControlRequestFromModule::ScopeSync { generation, scopes },
+            )
+            .await;
+            match reply.header.ty {
+                FrameType::Response => Ok(serde_json::from_slice(&reply.body).unwrap()),
+                _ => Err(parse_error(&reply)["code"].as_str().unwrap().to_string()),
+            }
+        }
+
+        async fn describe(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            owner: &str,
+            scope_ref: &str,
+        ) -> ModuleControlResponseToModule {
+            let reply = call(
+                handler,
+                ctx,
+                &ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: Principal::Reserved {
+                        module_id: owner.to_string(),
+                    },
+                    scope_ref: scope_ref.to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{:?}",
+                parse_error(&reply)
+            );
+            serde_json::from_slice(&reply.body).unwrap()
+        }
+
+        /// Register `module_id` on `connection` with `nonce`, returning its ctx.
+        async fn module(
+            handler: &ControlHandler,
+            connection: u64,
+            module_id: &str,
+            nonce: Option<&str>,
+        ) -> (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>) {
+            let (ctx, mut rx) = route_ctx(ConnectionId::new(connection));
+            hello_via_sink(
+                handler,
+                &ctx,
+                &mut rx,
+                hello_frame_with_nonce(module_id, PROTOCOL_VERSION, connection, nonce),
+            )
+            .await;
+            (ctx, rx)
+        }
+
+        /// `direct` and every other client connection has no registration, so
+        /// it can neither sync nor own a scope.
+        #[tokio::test]
+        async fn a_client_connection_cannot_sync_or_describe() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, _rx) = route_ctx(ConnectionId::new(9));
+            for request in [
+                ModuleControlRequestFromModule::ScopeSync {
+                    generation: 1,
+                    scopes: vec![head("s", 1)],
+                },
+                ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: Principal::Direct,
+                    scope_ref: "s".to_string(),
+                },
+            ] {
+                let reply = call(&handler, &ctx, &request).await;
+                assert_eq!(parse_error(&reply)["code"], "not_registered", "{request:?}");
+            }
+            assert!(
+                !handler
+                    .scopes
+                    .read()
+                    .unwrap()
+                    .describe(
+                        &Principal::Reserved {
+                            module_id: OWNER.to_string()
+                        },
+                        "s"
+                    )
+                    .owner_synced
+            );
+        }
+
+        /// A module the supervisor did not spawn registers without a launch
+        /// nonce, so it is never an owner's current launch.
+        #[tokio::test]
+        async fn a_module_without_a_supervised_launch_cannot_sync() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, _rx) = module(&handler, 1, OWNER, None).await;
+            assert_eq!(
+                sync(&handler, &ctx, 1, vec![head("s", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_authority_follows_the_supervisors_recorded_spawn_nonce_across_a_swap() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor.clone());
+            let (incumbent, _incumbent_rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &incumbent, 1, vec![head("s", 1)])
+                .await
+                .expect("the current launch syncs");
+
+            // A swap candidate registers with the swap token and is refused
+            // while the incumbent keeps syncing.
+            supervisor.open_swap(OWNER, "n2".to_string());
+            let (candidate, _candidate_rx) = module(&handler, 2, OWNER, Some("n2")).await;
+            assert_eq!(
+                sync(&handler, &candidate, 1, vec![head("x", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+            sync(&handler, &incumbent, 2, vec![head("s", 1)])
+                .await
+                .expect("the serving owner syncs during the swap");
+
+            // The swap fails and is rolled back. The candidate never held sync
+            // authority, and still cannot sync.
+            supervisor.close_swap(OWNER);
+            assert_eq!(
+                sync(&handler, &candidate, 1, vec![head("x", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+            sync(&handler, &incumbent, 3, vec![head("s", 1)])
+                .await
+                .expect("the serving owner syncs after the rollback");
+            handler.cleanup_connection(candidate.connection_id).unwrap();
+
+            // A swap that cuts over. Promotion records the candidate's nonce as
+            // the module's spawn nonce, which is what `set_spawn_nonce` does
+            // here; the promoted connection then takes authority at any
+            // generation and the superseded incumbent is refused.
+            supervisor.open_swap(OWNER, "n3".to_string());
+            let (promoted, _promoted_rx) = module(&handler, 3, OWNER, Some("n3")).await;
+            supervisor.set_spawn_nonce(OWNER, "n3".to_string());
+            let reply = sync(&handler, &promoted, 1, vec![head("s", 1)])
+                .await
+                .expect("the promoted launch takes authority");
+            let ModuleControlResponseToModule::ScopeSync { results, .. } = reply else {
+                panic!("unexpected reply {reply:?}");
+            };
+            assert_eq!(results[0].outcome, ScopeRecordOutcome::Unchanged);
+            assert_eq!(
+                sync(&handler, &incumbent, 4, Vec::new()).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+        }
+
+        /// Authority dies with its connection: the cleanup path releases it,
+        /// so the owner's next connection takes it at any generation.
+        #[tokio::test]
+        async fn closing_the_authority_connection_frees_sync_authority() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor.clone());
+            let (first, _first_rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &first, 10, vec![head("s", 1)])
+                .await
+                .unwrap();
+            handler.cleanup_connection(first.connection_id).unwrap();
+
+            let (second, _second_rx) = module(&handler, 2, OWNER, Some("n1")).await;
+            sync(&handler, &second, 1, vec![head("s", 1)])
+                .await
+                .expect("the next connection takes the released authority");
+        }
+
+        #[tokio::test]
+        async fn describe_reports_the_incarnation_and_whether_the_owner_is_configured() {
+            let registry = Arc::new(Registry::default());
+            let supervisor_handle = SupervisorHandle::new();
+            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+                .with_handle(supervisor_handle.clone())
+                .with_daemon_incarnation("incarnation-7".to_string());
+            // Configured with enabled: false, so the supervisor lists the
+            // module without spawning a process for it.
+            supervisor
+                .supervise_configured(
+                    ModuleSpec {
+                        launch_nonce_env: true,
+                        module_id: OWNER.to_string(),
+                        program: PathBuf::from("/nonexistent/prefrontal-core"),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        reserved: false,
+                        reserved_prefixes: Vec::new(),
+                        protocol: ModuleProtocol::Subc,
+                        overlap: Default::default(),
+                    },
+                    false,
+                )
+                .unwrap();
+            supervisor_handle.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler =
+                ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+            let (reader, _reader_rx) = module(&handler, 5, "reader", None).await;
+
+            // Configured but not yet synced: a reader waits for the owner.
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                daemon_incarnation,
+                owner_synced,
+                owner_configured,
+                scope,
+                ..
+            } = describe(&handler, &reader, OWNER, "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::NotLive);
+            assert_eq!(daemon_incarnation, "incarnation-7");
+            assert!(!owner_synced);
+            assert!(owner_configured);
+            assert!(scope.is_none());
+
+            // Not a supervised module: the owner will never sync, and a reader
+            // refuses rather than waits.
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                owner_configured,
+                ..
+            } = describe(&handler, &reader, "ghost", "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::NotLive);
+            assert!(!owner_configured);
+
+            // Live, with the stamp fields and the computed owner_authorized.
+            let (owner, _owner_rx) = module(&handler, 6, OWNER, Some("n1")).await;
+            sync(&handler, &owner, 1, vec![head("s", 4)]).await.unwrap();
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                scope_epoch,
+                owner_synced,
+                scope,
+                ..
+            } = describe(&handler, &reader, OWNER, "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::Live);
+            assert_eq!(scope_epoch, Some(4));
+            assert!(owner_synced);
+            let stamp = scope.expect("a live scope carries its stamp");
+            assert!(
+                stamp.owner_authorized,
+                "prefrontal-core is the default authority"
+            );
+            assert_eq!(stamp.kind, ScopeKind::Head);
+        }
+
+        #[tokio::test]
+        async fn scope_authority_owners_decides_owner_authorized() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce("broca", "b1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor)
+                .with_scope_authority_owners(vec!["broca".to_string()]);
+            let (broca, _rx) = module(&handler, 1, "broca", Some("b1")).await;
+            let mut gated = head("s", 1);
+            gated.attributes.agent_id = Some("agent".to_string());
+            sync(&handler, &broca, 1, vec![gated]).await.unwrap();
+            let ModuleControlResponseToModule::ScopeDescribe { scope, .. } =
+                describe(&handler, &broca, "broca", "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert!(scope.unwrap().owner_authorized);
+        }
+
+        /// With route admission, the stamp, the commit re-check and drains in
+        /// place, the feature is advertised: the module ops in HELLO_ACK, and
+        /// `scopes/v1` in HELLO_ACK and `server.describe`.
+        #[tokio::test]
+        async fn scope_ops_and_the_scopes_capability_are_advertised() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, mut rx) = route_ctx(ConnectionId::new(1));
+            let ack = hello_via_sink(
+                &handler,
+                &ctx,
+                &mut rx,
+                hello_frame("m", PROTOCOL_VERSION, 1),
+            )
+            .await;
+            let ack = parse_ack(&ack);
+            for op in [SCOPE_SYNC_OP, SCOPE_DESCRIBE_OP] {
+                assert!(ack.subc_ops.iter().any(|o| o == op), "{:?}", ack.subc_ops);
+            }
+            assert!(ack.subc_capabilities.iter().any(|c| c == CAP_SCOPES_V1));
+
+            let (client, _client_rx) = route_ctx(ConnectionId::new(2));
+            let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+            let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+            let reply = handler
+                .handle_control_frame(&client, frame)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let ClientControlResponse::ServerDescribe { capabilities, .. } =
+                serde_json::from_slice(&reply.body).unwrap()
+            else {
+                panic!("not a server.describe reply");
+            };
+            assert!(
+                capabilities.iter().any(|c| c == CAP_SCOPES_V1),
+                "{capabilities:?}"
+            );
+        }
+
+        // ---- route admission, stamps, commit re-check and drains ----------
+
+        const PLEXUS: &str = "plexus";
+        const OTHER: &str = "other";
+        const AFT: &str = "aft";
+        const BROCA: &str = "broca";
+        const MAGIC: &str = "magic-context";
+
+        fn nonce(module_id: &str) -> String {
+            format!("nonce-{module_id}")
+        }
+
+        fn wide_ctx(connection: u64) -> (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>) {
+            let (tx, rx) = mpsc::channel(64);
+            (
+                RouteCtx {
+                    connection_id: ConnectionId::new(connection),
+                    egress: FrameSink::new(tx),
+                },
+                rx,
+            )
+        }
+
+        /// A daemon with a configured owner (prefrontal-core) registered on its
+        /// own module connection, two routable targets (plexus, other), and
+        /// launch nonces minted for the modules that open routes as carriers.
+        struct Rig {
+            handler: ControlHandler,
+            forwarding: Arc<ForwardingTable>,
+            owner: RouteCtx,
+            _owner_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+            modules: BTreeMap<String, (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>)>,
+            generation: u64,
+            next_connection: u64,
+            _supervisor: Supervisor,
+        }
+
+        async fn rig() -> Rig {
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let supervisor_handle = SupervisorHandle::new();
+            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+                .with_handle(supervisor_handle.clone());
+            supervisor
+                .supervise_configured(
+                    ModuleSpec {
+                        launch_nonce_env: true,
+                        module_id: OWNER.to_string(),
+                        program: PathBuf::from("/nonexistent/prefrontal-core"),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        reserved: false,
+                        reserved_prefixes: Vec::new(),
+                        protocol: ModuleProtocol::Subc,
+                        overlap: Default::default(),
+                    },
+                    false,
+                )
+                .unwrap();
+            for module_id in [OWNER, AFT, BROCA, MAGIC] {
+                supervisor_handle.set_spawn_nonce(module_id, nonce(module_id));
+            }
+            let handler =
+                ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                    .with_supervisor(supervisor_handle);
+            let (owner, mut owner_rx) = wide_ctx(1);
+            hello_via_sink(
+                &handler,
+                &owner,
+                &mut owner_rx,
+                hello_frame_with_nonce(OWNER, PROTOCOL_VERSION, 1, Some(&nonce(OWNER))),
+            )
+            .await;
+            let mut modules = BTreeMap::new();
+            for (connection, module_id) in [(2, PLEXUS), (3, OTHER)] {
+                let (ctx, mut rx) = wide_ctx(connection);
+                hello_via_sink(
+                    &handler,
+                    &ctx,
+                    &mut rx,
+                    hello_frame(module_id, PROTOCOL_VERSION, connection),
+                )
+                .await;
+                modules.insert(module_id.to_string(), (ctx, rx));
+            }
+            Rig {
+                handler,
+                forwarding,
+                owner,
+                _owner_rx: owner_rx,
+                modules,
+                generation: 0,
+                next_connection: 100,
+                _supervisor: supervisor,
+            }
+        }
+
+        fn carrier(module_id: &str, targets: Option<&[&str]>) -> ScopeCarrier {
+            ScopeCarrier {
+                principal: Principal::Reserved {
+                    module_id: module_id.to_string(),
+                },
+                targets: targets.map(|targets| targets.iter().map(|t| t.to_string()).collect()),
+            }
+        }
+
+        /// The scope most tests open under: aft carries to any module, broca
+        /// only to plexus and other, and the owner delegates as agent-1.
+        fn session(scope_epoch: u64) -> ScopeRecord {
+            let mut record = head("s", scope_epoch);
+            record.carriers = vec![carrier(AFT, None), carrier(BROCA, Some(&[PLEXUS, OTHER]))];
+            record.attributes.agent_id = Some("agent-1".to_string());
+            record.attributes.delegates = true;
+            record
+        }
+
+        impl Rig {
+            async fn sync(&mut self, scopes: Vec<ScopeRecord>) {
+                self.generation += 1;
+                sync(&self.handler, &self.owner, self.generation, scopes)
+                    .await
+                    .expect("the owner's sync is accepted");
+            }
+
+            fn selector(&self, scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
+                ScopeSelector {
+                    owner: Principal::Reserved {
+                        module_id: OWNER.to_string(),
+                    },
+                    scope_ref: scope_ref.to_string(),
+                    scope_epoch,
+                }
+            }
+
+            fn open_frame(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> (
+                RouteCtx,
+                mpsc::Receiver<crate::router::OutboundFrame>,
+                Frame,
+            ) {
+                self.next_connection += 1;
+                let (ctx, rx) = wide_ctx(self.next_connection);
+                let root = unique_project_root("scoped-open");
+                let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+                    target: RouteTarget::ToolProvider {
+                        module_id: target.to_string(),
+                    },
+                    identity: BindIdentity::new(
+                        root.path().to_path_buf(),
+                        "unit".to_string(),
+                        "session".to_string(),
+                    ),
+                    consumer_identity: opener.map(|module_id| ConsumerIdentity {
+                        module_id: module_id.to_string(),
+                        launch_nonce: nonce(module_id),
+                    }),
+                    consumer_capabilities: None,
+                    admission_facts: None,
+                    scope,
+                })
+                .unwrap();
+                let frame = Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    self.next_connection,
+                    body,
+                )
+                .unwrap();
+                (ctx, rx, frame)
+            }
+
+            /// Open and expect a refusal before anything is relayed.
+            async fn refused(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> String {
+                let (ctx, _rx, frame) = self.open_frame(opener, target, scope);
+                let replies = self
+                    .handler
+                    .handle_control_frame(&ctx, frame)
+                    .await
+                    .unwrap();
+                assert_eq!(replies.len(), 1, "{replies:?}");
+                assert_eq!(replies[0].header.ty, FrameType::Error);
+                let (_, module_rx) = self.modules.get_mut(target).unwrap();
+                assert!(
+                    module_rx.try_recv().is_err(),
+                    "a refused open relays nothing"
+                );
+                parse_error(&replies[0])["code"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+
+            /// Start an open and return its task and the bind the target got.
+            async fn relayed(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> Relayed {
+                let (ctx, rx, frame) = self.open_frame(opener, target, scope);
+                let handler = self.handler.clone();
+                let task_ctx = ctx.clone();
+                let task = tokio::spawn(async move {
+                    handler
+                        .handle_control_frame(&task_ctx, frame)
+                        .await
+                        .unwrap()
+                });
+                let (_, module_rx) = self.modules.get_mut(target).unwrap();
+                let bind = tokio::time::timeout(Duration::from_secs(2), module_rx.recv())
+                    .await
+                    .expect("the target receives the relayed route.bind")
+                    .unwrap()
+                    .frame;
+                Relayed {
+                    target: target.to_string(),
+                    client: ctx,
+                    client_rx: rx,
+                    task,
+                    bind,
+                }
+            }
+
+            async fn ack(&self, relayed: &Relayed) {
+                let (module, _) = &self.modules[&relayed.target];
+                self.handler
+                    .handle_control_frame(module, route_bind_ack(relayed.bind.header.corr))
+                    .await
+                    .unwrap();
+            }
+
+            /// Open, ack and return the bound route.
+            async fn bound(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> Bound {
+                let relayed = self.relayed(opener, target, scope).await;
+                self.ack(&relayed).await;
+                let Relayed {
+                    target,
+                    client,
+                    mut client_rx,
+                    task,
+                    bind,
+                } = relayed;
+                assert!(
+                    task.await.unwrap().is_empty(),
+                    "the open is answered by commit"
+                );
+                let (channel, epoch) = published_route(&client_rx.recv().await.unwrap().frame);
+                Bound {
+                    target,
+                    client,
+                    client_rx,
+                    channel,
+                    epoch,
+                    bind,
+                }
+            }
+
+            fn live(&self, route: &Bound) -> bool {
+                matches!(
+                    self.forwarding
+                        .lookup_data_route(route.client.connection_id, route.channel, route.epoch)
+                        .unwrap(),
+                    DataRoute::Client(DataRouteState::Bound(_))
+                )
+            }
+        }
+
+        struct Relayed {
+            target: String,
+            client: RouteCtx,
+            client_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+            task: tokio::task::JoinHandle<Vec<Frame>>,
+            bind: Frame,
+        }
+
+        struct Bound {
+            target: String,
+            client: RouteCtx,
+            client_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+            channel: u16,
+            epoch: u32,
+            bind: Frame,
+        }
+
+        impl Bound {
+            /// The reason of the `route.closed` this client was sent, after
+            /// checking it also got a GOODBYE on exactly this route.
+            fn closed_reason(&mut self) -> RouteCloseReason {
+                let mut reason = None;
+                let mut goodbye = false;
+                while let Ok(outbound) = self.client_rx.try_recv() {
+                    let frame = outbound.frame;
+                    match frame.header.ty {
+                        FrameType::Goodbye => {
+                            assert_eq!(
+                                (frame.header.channel, frame.header.epoch),
+                                (self.channel, self.epoch)
+                            );
+                            goodbye = true;
+                        }
+                        FrameType::Push => {
+                            let ClientControlPush::RouteClosed {
+                                reason: r,
+                                module_id,
+                                ..
+                            } = serde_json::from_slice(&frame.body).unwrap()
+                            else {
+                                panic!("unexpected push");
+                            };
+                            assert_eq!(module_id, self.target);
+                            reason = Some(r);
+                        }
+                        other => panic!("unexpected frame {other:?}"),
+                    }
+                }
+                assert!(goodbye, "the client is sent a GOODBYE for the closed route");
+                reason.expect("the client is told why the route closed")
+            }
+
+            fn untouched(&mut self) -> bool {
+                self.client_rx.try_recv().is_err()
+            }
+
+            fn stamp(&self) -> Option<ScopeStamp> {
+                match serde_json::from_slice::<ModuleControlRequest>(&self.bind.body).unwrap() {
+                    ModuleControlRequest::RouteBind { scope, .. } => scope,
+                    other => panic!("expected a route.bind, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_owner_or_a_listed_carrier_is_admitted_and_a_targeted_carrier_only_to_its_modules(
+        ) {
+            let mut rig = rig().await;
+            let mut record = session(1);
+            record.carriers = vec![carrier(AFT, None), carrier(BROCA, Some(&[PLEXUS]))];
+            record.child_owners = vec![Principal::Reserved {
+                module_id: MAGIC.to_string(),
+            }];
+            rig.sync(vec![record]).await;
+            let scope = || Some(rig_selector("s", Some(1)));
+
+            // Admitted: the owner, a bare carrier to any module, a targeted
+            // carrier to its listed module.
+            rig.bound(Some(OWNER), PLEXUS, scope()).await;
+            rig.bound(Some(AFT), OTHER, scope()).await;
+            rig.bound(Some(BROCA), PLEXUS, scope()).await;
+
+            // Refused scope_not_carrier: a targeted carrier to an unlisted
+            // module, a module that is not listed at all (a child owner is not
+            // a carrier), and a direct key-holder.
+            for (opener, target) in [(Some(BROCA), OTHER), (Some(MAGIC), PLEXUS), (None, PLEXUS)] {
+                assert_eq!(
+                    rig.refused(opener, target, scope()).await,
+                    error_codes::SCOPE_NOT_CARRIER,
+                    "{opener:?} -> {target}"
+                );
+            }
+        }
+
+        fn rig_selector(scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
+            ScopeSelector {
+                owner: Principal::Reserved {
+                    module_id: OWNER.to_string(),
+                },
+                scope_ref: scope_ref.to_string(),
+                scope_epoch,
+            }
+        }
+
+        #[tokio::test]
+        async fn an_open_without_an_epoch_is_refused_the_owners_included() {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            for opener in [OWNER, AFT] {
+                assert_eq!(
+                    rig.refused(Some(opener), PLEXUS, Some(rig.selector("s", None)))
+                        .await,
+                    error_codes::SCOPE_EPOCH_REQUIRED,
+                    "{opener}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn admission_separates_not_synced_not_live_and_ended() {
+            let mut rig = rig().await;
+            // Before the configured owner's first sync: retryable.
+            let code = rig
+                .refused(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert_eq!(code, error_codes::SCOPE_NOT_SYNCED);
+            assert!(subc_protocol::error_codes::is_retryable_route_open(&code));
+
+            // An owner that is not configured will never sync: terminal.
+            let ghost = ScopeSelector {
+                owner: Principal::Reserved {
+                    module_id: "ghost".to_string(),
+                },
+                scope_ref: "s".to_string(),
+                scope_epoch: Some(1),
+            };
+            assert_eq!(
+                rig.refused(Some(AFT), PLEXUS, Some(ghost)).await,
+                error_codes::SCOPE_NOT_LIVE
+            );
+
+            rig.sync(vec![session(2)]).await;
+            assert_eq!(
+                rig.refused(Some(AFT), PLEXUS, Some(rig_selector("missing", Some(1))))
+                    .await,
+                error_codes::SCOPE_NOT_LIVE
+            );
+            for epoch in [1, 3] {
+                assert_eq!(
+                    rig.refused(Some(AFT), PLEXUS, Some(rig_selector("s", Some(epoch))))
+                        .await,
+                    error_codes::SCOPE_ENDED,
+                    "epoch {epoch}"
+                );
+            }
+            // Control: the live epoch is admitted.
+            rig.bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(2))))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn the_bind_is_stamped_and_owner_authorized_only_for_listed_owners() {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            let stamp = route.stamp().expect("a scoped bind carries the stamp");
+            assert_eq!(stamp.scope_ref, "s");
+            assert_eq!(stamp.scope_epoch, 1);
+            assert_eq!(stamp.kind, ScopeKind::Head);
+            assert_eq!(stamp.attributes.agent_id.as_deref(), Some("agent-1"));
+            assert!(stamp.attributes.delegates);
+            assert!(stamp.owner_authorized);
+            let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            assert_eq!(unscoped.stamp(), None, "an unscoped open is not stamped");
+
+            // broca owns a scope of its own on its own module connection; it is
+            // not in scope_authority_owners, so its stamp is not authorized.
+            let (broca, mut broca_rx) = wide_ctx(50);
+            hello_via_sink(
+                &rig.handler,
+                &broca,
+                &mut broca_rx,
+                hello_frame_with_nonce(BROCA, PROTOCOL_VERSION, 50, Some(&nonce(BROCA))),
+            )
+            .await;
+            sync(&rig.handler, &broca, 1, vec![head("b", 1)])
+                .await
+                .unwrap();
+            let own = ScopeSelector {
+                owner: Principal::Reserved {
+                    module_id: BROCA.to_string(),
+                },
+                scope_ref: "b".to_string(),
+                scope_epoch: Some(1),
+            };
+            let route = rig.bound(Some(BROCA), PLEXUS, Some(own)).await;
+            assert!(!route.stamp().unwrap().owner_authorized);
+        }
+
+        /// The owner's sync lands between admission and the module's ack. The
+        /// open is refused by name, the module's other routes stay up, and the
+        /// reserved pair is released. Changed content is retryable; an ended
+        /// scope is not.
+        #[tokio::test]
+        async fn a_scope_changed_or_ended_between_admission_and_commit_refuses_the_open() {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            let mut cotenant = rig
+                .bound(Some(OWNER), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+
+            let mut changed = session(1);
+            changed.child_owners.push(Principal::Reserved {
+                module_id: MAGIC.to_string(),
+            });
+            let mut ended = None;
+            for (code, next) in [
+                (error_codes::SCOPE_CHANGED, vec![changed]),
+                (error_codes::SCOPE_ENDED, Vec::new()),
+            ] {
+                let relayed = rig
+                    .relayed(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                let (bind_channel, bind_epoch) = route_bind_channel(&relayed.bind);
+                ended = Some(next.is_empty());
+                rig.sync(next).await;
+                rig.ack(&relayed).await;
+                let replies = relayed.task.await.unwrap();
+                assert_eq!(replies.len(), 1, "{replies:?}");
+                assert_eq!(parse_error(&replies[0])["code"], code);
+                assert_eq!(
+                    subc_protocol::error_codes::is_retryable_route_open(code),
+                    code == error_codes::SCOPE_CHANGED
+                );
+                assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+                // The module is told to drop just the binding it created.
+                let (_, plexus_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+                // Collected, because ending the scope also closes the co-tenant
+                // route, whose GOODBYE comes first.
+                let mut goodbyes = Vec::new();
+                while let Ok(outbound) = plexus_rx.try_recv() {
+                    assert_eq!(outbound.frame.header.ty, FrameType::Goodbye);
+                    goodbyes.push((outbound.frame.header.channel, outbound.frame.header.epoch));
+                }
+                assert!(
+                    goodbyes.contains(&(bind_channel, bind_epoch)),
+                    "{goodbyes:?}"
+                );
+                assert!(rig
+                    .handler
+                    .registry
+                    .get_module_by_connection(rig.modules[PLEXUS].0.connection_id)
+                    .unwrap()
+                    .is_some());
+            }
+            assert_eq!(ended, Some(true));
+            // The co-tenant stayed up through the change, and closed only when
+            // the scope ended, by the drain rule rather than by the commit.
+            assert_eq!(cotenant.closed_reason(), RouteCloseReason::ScopeEnded);
+        }
+
+        /// Each row of the drain table on one set of routes: the owner's, a
+        /// bare carrier's, and a targeted carrier's to each of its targets.
+        #[tokio::test]
+        async fn each_revocation_drains_exactly_the_affected_routes_with_its_own_reason() {
+            struct Case {
+                name: &'static str,
+                change: fn(&mut ScopeRecord),
+                /// Closed routes by index: owner->plexus, aft->plexus,
+                /// broca->plexus, broca->other.
+                closed: [Option<RouteCloseReason>; 4],
+            }
+            use RouteCloseReason::*;
+            let cases = [
+                Case {
+                    name: "a carrier entry removed",
+                    change: |r| {
+                        r.carriers.retain(|c| {
+                            c.principal
+                                != Principal::Reserved {
+                                    module_id: AFT.to_string(),
+                                }
+                        })
+                    },
+                    closed: [None, Some(ScopeCarrierRemoved), None, None],
+                },
+                Case {
+                    name: "a target removed from a carrier",
+                    change: |r| r.carriers[1].targets = Some(vec![PLEXUS.to_string()]),
+                    closed: [None, None, None, Some(ScopeCarrierRemoved)],
+                },
+                Case {
+                    name: "a bare carrier narrowed to targets",
+                    change: |r| r.carriers[0].targets = Some(vec![OTHER.to_string()]),
+                    closed: [None, Some(ScopeCarrierRemoved), None, None],
+                },
+                Case {
+                    name: "delegates turned off",
+                    change: |r| r.attributes.delegates = false,
+                    closed: [Some(ScopeDelegationChanged); 4],
+                },
+                Case {
+                    name: "agent_id changed",
+                    change: |r| r.attributes.agent_id = Some("agent-2".to_string()),
+                    closed: [Some(ScopeDelegationChanged); 4],
+                },
+                Case {
+                    name: "a carrier added, child owners changed, the record re-sent",
+                    change: |r| {
+                        r.carriers.push(carrier(MAGIC, None));
+                        r.child_owners.push(Principal::Reserved {
+                            module_id: MAGIC.to_string(),
+                        });
+                    },
+                    closed: [None; 4],
+                },
+                Case {
+                    name: "a target added",
+                    change: |r| {
+                        r.carriers[1]
+                            .targets
+                            .as_mut()
+                            .unwrap()
+                            .push("third".to_string())
+                    },
+                    closed: [None; 4],
+                },
+                Case {
+                    name: "delegates turned on",
+                    change: |r| r.attributes.delegates = true,
+                    closed: [None; 4],
+                },
+            ];
+            for case in cases {
+                let mut rig = rig().await;
+                rig.sync(vec![session(1)]).await;
+                let scope = || Some(rig_selector("s", Some(1)));
+                let mut routes = [
+                    rig.bound(Some(OWNER), PLEXUS, scope()).await,
+                    rig.bound(Some(AFT), PLEXUS, scope()).await,
+                    rig.bound(Some(BROCA), PLEXUS, scope()).await,
+                    rig.bound(Some(BROCA), OTHER, scope()).await,
+                ];
+                let mut record = session(1);
+                (case.change)(&mut record);
+                rig.sync(vec![record]).await;
+                for (index, expected) in case.closed.iter().enumerate() {
+                    let route = &mut routes[index];
+                    match expected {
+                        Some(reason) => {
+                            assert!(!rig.live(route), "{}: route {index} still live", case.name);
+                            assert_eq!(
+                                route.closed_reason(),
+                                *reason,
+                                "{}: route {index}",
+                                case.name
+                            );
+                        }
+                        None => {
+                            assert!(rig.live(route), "{}: route {index} closed", case.name);
+                            assert!(
+                                route.untouched(),
+                                "{}: route {index} was told something",
+                                case.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn ending_or_replacing_a_scope_and_a_parent_ending_drain_every_route_under_it() {
+            // Removed, and replaced by a higher epoch.
+            for next in [Vec::new(), vec![session(2)]] {
+                let mut rig = rig().await;
+                rig.sync(vec![session(1)]).await;
+                let mut route = rig
+                    .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                rig.sync(next).await;
+                assert!(!rig.live(&route));
+                assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
+            }
+
+            // A child whose parent ends: its routes close as parent-ended, the
+            // child stays live, and routes under the parent close as ended.
+            let mut rig = rig().await;
+            let mut child = session(1);
+            child.scope_ref = "child".to_string();
+            child.kind = ScopeKind::Worker;
+            child.parent = Some(ScopeParent {
+                owner: Principal::Reserved {
+                    module_id: OWNER.to_string(),
+                },
+                scope_ref: "s".to_string(),
+                scope_epoch: 1,
+            });
+            rig.sync(vec![session(1), child.clone()]).await;
+            let mut child_route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("child", Some(1))))
+                .await;
+            assert_eq!(
+                child_route.stamp().unwrap().parent_state,
+                Some(ParentState::Linked)
+            );
+            rig.sync(vec![child]).await;
+            assert!(!rig.live(&child_route));
+            assert_eq!(
+                child_route.closed_reason(),
+                RouteCloseReason::ScopeParentEnded
+            );
+        }
+
+        #[tokio::test]
+        async fn re_sending_an_unchanged_record_drains_nothing_and_a_new_carrier_leaves_in_flight_calls(
+        ) {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            let mut route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            let before = rig.forwarding.published_scope_tag(OWNER, "s");
+            rig.sync(vec![session(1)]).await;
+            assert_eq!(rig.forwarding.published_scope_tag(OWNER, "s"), before);
+            assert!(rig.live(&route) && route.untouched());
+
+            // A call in flight on the route when another carrier is added. A
+            // forwarded REQUEST holds one credit on the route's flow until the
+            // module answers; the router takes it exactly like this.
+            let DataRoute::Client(DataRouteState::Bound(binding)) = rig
+                .forwarding
+                .lookup_data_route(route.client.connection_id, route.channel, route.epoch)
+                .unwrap()
+            else {
+                panic!("the route is bound");
+            };
+            binding.flow.acquire_tagged(9, false).await.unwrap();
+            let mut widened = session(1);
+            widened.carriers.push(carrier(MAGIC, None));
+            rig.sync(vec![widened]).await;
+            assert!(rig.live(&route) && route.untouched());
+            let (_, plexus_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+            assert!(plexus_rx.try_recv().is_err(), "the module is told nothing");
+            // The call's credit is still held on an open flow, so its answer
+            // will be delivered: closing the route would have closed the flow.
+            assert_eq!(binding.flow.in_flight(), 1);
+            binding
+                .flow
+                .acquire_tagged(10, false)
+                .await
+                .expect("the flow is still open");
+        }
+
+        /// A swap's superseded endpoint keeps its routes until drained; ending
+        /// the scope closes them there too.
+        #[tokio::test]
+        async fn ending_a_scope_drains_its_routes_on_a_superseded_endpoint() {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            let mut on_incumbent = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+
+            // Swap plexus: register a candidate and cut over, leaving the
+            // incumbent superseded with the route still on it.
+            let (candidate, _candidate_rx) = wide_ctx(9);
+            let registration = rig
+                .handler
+                .registry
+                .register_candidate_with_control_ops(
+                    manifest(PLEXUS, PROTOCOL_VERSION),
+                    PROTOCOL_VERSION,
+                    candidate.connection_id,
+                    module_baseline_control_ops(),
+                )
+                .unwrap();
+            rig.forwarding
+                .register_candidate_module_connection(
+                    candidate.connection_id,
+                    PLEXUS.to_string(),
+                    PROTOCOL_VERSION,
+                    manifest_concurrency(&registration.manifest),
+                    candidate.egress.clone(),
+                )
+                .unwrap();
+            rig.forwarding.cutover_candidate(PLEXUS).unwrap().unwrap();
+            rig.handler
+                .registry
+                .promote_candidate(PLEXUS)
+                .unwrap()
+                .unwrap();
+            assert!(rig.live(&on_incumbent), "cutover alone does not drain");
+
+            rig.sync(Vec::new()).await;
+            assert!(!rig.live(&on_incumbent));
+            assert_eq!(on_incumbent.closed_reason(), RouteCloseReason::ScopeEnded);
+            let (_, incumbent_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+            let goodbye = incumbent_rx
+                .try_recv()
+                .expect("the superseded endpoint is told")
+                .frame;
+            assert_eq!(goodbye.header.ty, FrameType::Goodbye);
         }
     }
 }

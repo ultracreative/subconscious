@@ -16,6 +16,7 @@ use serde::{
 };
 use subc_protocol::{
     manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole, SelfSignalDeclaration},
+    scope::ScopeSelector,
     session::HealthStatus,
     BindIdentity, RouteTarget,
 };
@@ -176,6 +177,14 @@ pub enum ClientControlRequest {
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<serde_json::Value>,
+        /// The scope to open the route under. The daemon admits the open only
+        /// when the opener (its attested principal, never anything in this
+        /// body) is the scope's owner or a listed carrier, and stamps the
+        /// scope on the module's bind. Send it only to a daemon advertising
+        /// `scopes/v1`: an older daemon drops unknown fields and would open an
+        /// unscoped route.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ScopeSelector>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll {
@@ -1904,6 +1913,9 @@ pub struct SupervisorEntry {
     /// what those daemons meant.
     #[serde(default)]
     pub protocol: ModuleProtocol,
+    /// Whether the module's next spawn includes SUBC_LAUNCH_NONCE in its environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_env: Option<bool>,
     pub health: SupervisorHealthStatus,
     /// Computed from the stored launch spec and observed process at list time;
     /// None means an older daemon did not report this comparison.
@@ -2218,6 +2230,7 @@ mod tests {
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         };
 
         let body = serde_json::to_value(request).unwrap();
@@ -2761,6 +2774,7 @@ mod launch_nonce_redaction_tests {
             consumer_identity: Some(identity()),
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         };
         let printed = format!("{request:?}");
         assert!(!printed.contains(NONCE), "launch nonce printed: {printed}");

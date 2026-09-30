@@ -4,7 +4,8 @@ import { AuthError, authenticateClient } from "./auth.js";
 import {
   DEFAULT_RECONNECT_BACKOFF,
   isEstablishedRouteDead,
-  SUBC_LAUNCH_NONCE_ENV,
+  parseRouteCloseReason,
+  type RouteCloseReason,
   SUBC_MODULE_ID_ENV,
   type BindIdentity,
   type ReconnectBackoff,
@@ -24,6 +25,13 @@ import {
   PROTOCOL_VERSION,
   type Frame,
 } from "./envelope.js";
+import {
+  isLaunchNonceError,
+  launchNonce as processLaunchNonce,
+  launchNonceOrUndefined,
+  type LaunchNonceError,
+  type LaunchNonceSource,
+} from "./launch-nonce.js";
 import {
   belongsToConnection,
   createRouteHandle,
@@ -45,6 +53,7 @@ const BODY_READ_TIMEOUT_MS = 30_000;
 const WRITE_TIMEOUT_MS = 30_000;
 const DEFAULT_RESTORED_DEBOUNCE_MS = 250;
 const DEFAULT_PROVIDER_HANDLER_CAPACITY = 64;
+const DRAINING_HOOK_START_LIMIT_MS = 2_000;
 const HEALTH_CHECK_OP = "health.check";
 export const HELLO_CORR = 1n;
 
@@ -74,6 +83,35 @@ export interface ManifestInput {
   provides: ProviderRoleInput[];
   consumes: ConsumerRoleInput[];
   bindings: BindingsInput;
+  /**
+   * Facts about the running build, sent in HELLO only when declared. When it is
+   * declared without `launch_nonce_source`, the provider fills that field in
+   * from the launch nonce it sends.
+   */
+  provenance?: ManifestProvenance;
+}
+
+/**
+ * Build provenance a module declares in its manifest; mirrors
+ * `ManifestProvenance` in subc-protocol. Every field is optional and is left
+ * off the wire when unset. Omit a field you cannot know rather than sending a
+ * placeholder such as "unknown".
+ */
+export interface ManifestProvenance {
+  build_git_sha?: string;
+  /** Why `build_git_sha` is unavailable; an open set of reasons. */
+  build_git_sha_absence_reason?: string;
+  build_lock_digest?: string;
+  /** The subc-protocol crate version this module's wire vocabulary matches. */
+  wire_crate_version?: string;
+  store_schema_version?: string;
+  /**
+   * Where the running module read its launch nonce from: `fd` (the pipe the
+   * daemon hands over as descriptor 3) or `env` (the environment variable kept
+   * while modules move to the pipe). A fact about the running process, not
+   * the build. Filled in by the provider when left unset.
+   */
+  launch_nonce_source?: LaunchNonceSource;
 }
 
 export type ProviderRoleInput =
@@ -252,6 +290,22 @@ export interface SubcProviderConnectOptions {
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
+  /**
+   * The daemon has stopped admitting routes and is draining the module. Stop
+   * taking new work and finish or hand off work in flight. Called once per
+   * notice, independently of the frame reader; throws and rejections are contained.
+   * GOODBYE and connection-end reporting wait at most 2 s for hooks to start,
+   * not for them to finish. Hooks may still be running after serving ends.
+   * The wall-clock deadline is "no later than", never a grant of time: the
+   * daemon enforces its own monotonic ceiling, which can expire earlier.
+   *
+   * Background work the daemon cannot see holds a drain open only when the
+   * manifest declares a Busy self-signal anchored to health gauges. Report
+   * those gauges above zero in health metrics until that work finishes. During
+   * draining the daemon waits for every declared gauge to reach zero (a missing
+   * gauge counts as busy), or for its deadline. A pending hook alone is not busy.
+   */
+  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
   /** Backoff for provider reconnect after an unexpected socket drop. */
   reconnectBackoff?: ReconnectBackoff;
   /** Injectable sleep for timer-free reconnect and debounce tests. */
@@ -262,16 +316,19 @@ export interface SubcProviderConnectOptions {
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /**
    * The one-time launch nonce to echo in HELLO for a reserved module. Defaults to
-   * the `SUBC_LAUNCH_NONCE` environment variable subc injects on spawn; pass
-   * explicitly to override. Omitted from the wire when empty (non-reserved modules).
+   * the process's launch nonce (see `launchNonce`: the descriptor subc hands
+   * over, or the `SUBC_LAUNCH_NONCE` environment copy), and `connect()` rejects
+   * with code `launch_nonce_unavailable` when a named descriptor is refused.
+   * Pass explicitly to override. Omitted from the wire when empty
+   * (non-reserved modules).
    */
   launchNonce?: string;
   /**
    * Whether an unexpected connection drop starts a reconnect-and-re-register
    * cycle (`true`) or ends serving and resolves {@link SubcProvider.closed}
    * (`false`). Defaults to `false` when the process runs under the daemon's
-   * supervision (both `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` are set and
-   * non-empty in its environment, the pair the daemon injects at spawn), since
+   * supervision (`SUBC_MODULE_ID` is set and the process has a launch nonce,
+   * the pair the daemon injects at spawn), since
    * the daemon owns a supervised module's restarts and waits for it to exit;
    * `true` otherwise, so plugins and other self-connecting providers keep
    * reconnecting. A daemon GOODBYE and `close()` end serving regardless.
@@ -290,6 +347,7 @@ interface NormalizedSubcProviderConnectOptions {
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
+  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
@@ -297,6 +355,11 @@ interface NormalizedSubcProviderConnectOptions {
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
   reconnectOnDrop: boolean;
+}
+
+interface ControlPushState {
+  undecodablePushLogged: boolean;
+  drainingHooks: Set<Promise<void>>;
 }
 
 interface OpenedProviderConnection {
@@ -653,16 +716,18 @@ export class SubcProvider {
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
+    const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() };
     try {
       for (;;) {
         const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
-        const keepGoing = await this.dispatch(frame, sock, generation);
+        const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) this.closeStarted = true;
           break;
         }
       }
     } catch (error) {
+      await this.waitForDrainingHooksToStart(control);
       if (this.sock === sock && this.generation === generation && !this.closeStarted) {
         this.handleUnexpectedDrop(sock, generation, error instanceof Error ? error : new SubcProviderError(String(error)));
         return;
@@ -675,7 +740,7 @@ export class SubcProvider {
     }
   }
 
-  private async dispatch(frame: Frame, sock: SubcSocket, generation: number): Promise<boolean> {
+  private async dispatch(frame: Frame, sock: SubcSocket, generation: number, control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() }): Promise<boolean> {
     let handle: RouteHandle | null = null;
     if (frame.header.channel !== 0) {
       handle = this.liveRoutes.get(frame.header.channel) ?? null;
@@ -723,7 +788,11 @@ export class SubcProvider {
           );
         }
         return true;
+      case FrameType.Push:
+        if (frame.header.channel === 0) this.handleControlPush(frame, control);
+        return true;
       case FrameType.Goodbye:
+        await this.waitForDrainingHooksToStart(control);
         if (!handle) return false;
         this.liveRoutes.delete(handle.channel);
         this.abortHandle(handle);
@@ -748,21 +817,58 @@ export class SubcProvider {
     }
   }
 
-  /**
-   * Invoke the consumer's route-gone callback without letting it break the
-   * read loop. Every call site is awaited on the read loop's path, so a throw
-   * escaping from it is read as an unexpected connection drop and tears down
-   * every route on the connection; report and absorb it here instead, the same
-   * way a failing request handler is reported.
-   */
-  /**
-   * Invoke the consumer's bound callback without letting it break the read
-   * loop. By the time it runs the bind is acknowledged and the route installed,
-   * so a throw here is a failure of the consumer's setup for THIS route, and
-   * letting it escape would be read as an unexpected connection drop and tear
-   * down every other route on the connection. The route stays bound: the
-   * daemon already considers it live, and the consumer can close it.
-   */
+  private handleControlPush(frame: Frame, control: ControlPushState): void {
+    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown };
+    try {
+      body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+      if (body === null || body.op !== "module.draining" || typeof body.reason !== "string" ||
+          typeof body.deadline_ms !== "number" || !Number.isInteger(body.deadline_ms) || body.deadline_ms < 0) {
+        throw new Error("invalid module control command");
+      }
+    } catch (error) {
+      if (!control.undecodablePushLogged) {
+        control.undecodablePushLogged = true;
+        console.warn("SubcProvider ignoring undecodable channel-0 Push; further warnings suppressed on this connection", error);
+      }
+      return;
+    }
+    const deadline = new Date(body.deadline_ms as number);
+    // Out-of-range wall clocks expire now rather than granting extra drain time.
+    if (Number.isNaN(deadline.getTime())) deadline.setTime(Date.now());
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    control.drainingHooks.add(started);
+    // A separate microtask runs the hook through its first await, without waiting
+    // for its completion on the reader. JavaScript hooks must not block synchronously.
+    void Promise.resolve().then(() => {
+      try {
+        const result = this.opts.onDraining?.(parseRouteCloseReason(body.reason), deadline);
+        void Promise.resolve(result).catch((error) => {
+          console.warn("SubcProvider draining callback failed", error);
+        });
+      } catch (error) {
+        console.warn("SubcProvider draining callback failed", error);
+      } finally {
+        markStarted();
+        control.drainingHooks.delete(started);
+      }
+    });
+  }
+
+  private async waitForDrainingHooksToStart(control: ControlPushState): Promise<void> {
+    if (control.drainingHooks.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all(control.drainingHooks),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, DRAINING_HOOK_START_LIMIT_MS); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Contain callback failures so consumer setup cannot tear down unrelated routes. */
   private async reportRouteBound(handle: RouteHandle): Promise<void> {
     if (!this.opts.onBound) return;
     try {
@@ -772,6 +878,7 @@ export class SubcProvider {
     }
   }
 
+  /** Contain callback failures so route teardown cannot end the frame reader. */
   private async reportRouteGone(handle: RouteHandle): Promise<void> {
     if (!this.opts.onRouteGone) return;
     try {
@@ -1343,7 +1450,22 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
   // spawns a module; together they mark the process as supervised, and the nonce
   // is also what HELLO echoes for a reserved module_id.
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
-  const envLaunchNonce = nonEmpty(process.env[SUBC_LAUNCH_NONCE_ENV]);
+  // The nonce comes from the process-wide accessor, which reads the daemon's
+  // descriptor at most once. A refused descriptor fails the connect, unless the
+  // caller supplied the nonce itself, in which case it only means "not
+  // supervised".
+  let processNonce: string | undefined;
+  if (opts.launchNonce === undefined) {
+    try {
+      processNonce = processLaunchNonce()?.value;
+    } catch (error) {
+      if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
+      throw error;
+    }
+  } else {
+    processNonce = launchNonceOrUndefined()?.value;
+  }
+  const envLaunchNonce = nonEmpty(processNonce);
   const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;
   return {
     connectionFile: opts.connectionFile,
@@ -1355,6 +1477,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     onBind: opts.onBind,
     onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,
+    onDraining: opts.onDraining,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,
@@ -1371,6 +1494,22 @@ function normalizedControlOps(controlOps: string[] | null | undefined): string[]
   return [...merged];
 }
 
+/**
+ * The typed HELLO failure for a refused launch-nonce descriptor. The message
+ * matches the Rust SDK's `SubcModuleError::LaunchNonce`; `detail.kind` and
+ * `cause` carry the accessor's error.
+ */
+function launchNonceUnavailable(error: LaunchNonceError): SubcProviderError {
+  const wrapped = new SubcProviderError(
+    `launch nonce unavailable: ${error.message}`,
+    "launch_nonce_unavailable",
+    "terminal",
+    { kind: error.kind },
+  );
+  wrapped.cause = error;
+  return wrapped;
+}
+
 function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
   const nonce = opts.launchNonce;
   return buildFrame(
@@ -1380,7 +1519,7 @@ function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
     0,
     HELLO_CORR,
     encodeJson({
-      manifest: normalizeManifest(opts.manifest),
+      manifest: normalizeManifest(opts.manifest, nonce),
       protocol_ver: PROTOCOL_VERSION,
       control_ops: normalizedControlOps(opts.controlOps),
       // Echo the one-time launch nonce subc injects for a reserved module
@@ -1481,7 +1620,11 @@ function bindRejection(decision: BindDecision | undefined): { code: string; mess
   };
 }
 
-function normalizeManifest(manifest: ManifestInput): ManifestInput {
+/**
+ * The manifest exactly as HELLO sends it. Exported for the conformance tests,
+ * not from the package entry.
+ */
+export function normalizeManifest(manifest: ManifestInput, sentNonce: string | undefined): ManifestInput {
   return {
     module_id: manifest.module_id,
     module_version: manifest.module_version,
@@ -1504,7 +1647,35 @@ function normalizeManifest(manifest: ManifestInput): ManifestInput {
         optional: [...manifest.bindings.identity.optional],
       },
     },
+    ...(manifest.provenance === undefined
+      ? {}
+      : { provenance: normalizeProvenance(manifest.provenance, sentNonce) }),
   };
+}
+
+function normalizeProvenance(provenance: ManifestProvenance, sentNonce: string | undefined): ManifestProvenance {
+  const out: ManifestProvenance = {};
+  if (provenance.build_git_sha !== undefined) out.build_git_sha = provenance.build_git_sha;
+  if (provenance.build_git_sha_absence_reason !== undefined) {
+    out.build_git_sha_absence_reason = provenance.build_git_sha_absence_reason;
+  }
+  if (provenance.build_lock_digest !== undefined) out.build_lock_digest = provenance.build_lock_digest;
+  if (provenance.wire_crate_version !== undefined) out.wire_crate_version = provenance.wire_crate_version;
+  if (provenance.store_schema_version !== undefined) out.store_schema_version = provenance.store_schema_version;
+  const source = provenance.launch_nonce_source ?? launchNonceSourceOf(sentNonce);
+  if (source !== undefined) out.launch_nonce_source = source;
+  return out;
+}
+
+/**
+ * Where the nonce HELLO sends came from, as the Rust SDK reports it: the
+ * accessor's source when the accessor holds that same nonce, and nothing when
+ * HELLO sends none or the caller supplied a different one.
+ */
+function launchNonceSourceOf(sentNonce: string | undefined): LaunchNonceSource | undefined {
+  if (sentNonce === undefined) return undefined;
+  const nonce = launchNonceOrUndefined();
+  return nonce !== undefined && nonce.value === sentNonce ? nonce.source : undefined;
 }
 
 function normalizeProviderRole(role: ProviderRoleInput): ProviderRoleInput {

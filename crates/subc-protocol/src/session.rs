@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::{
     manifest::{CapabilityDeclarations, ProviderRole},
+    scope::{ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus},
     BindIdentity, Principal, RouteCloseReason, RouteTarget,
 };
 
@@ -83,6 +84,17 @@ pub enum ModuleControlRequest {
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<Value>,
+        /// The daemon's stamp of the scope the route was admitted under, taken
+        /// from the owner's synced record at admission. Like `principal`, it is
+        /// the daemon's, never the opener's: a provider may act on it (on
+        /// `owner_authorized`, `delegates` and `agent_id` together), and must
+        /// treat it as fixed for the route's life, because a change that
+        /// revokes authority closes the route.
+        ///
+        /// Absent means the route was opened without a scope, or by a daemon
+        /// that predates scopes. A provider that needs a scope refuses the bind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ScopeStamp>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},
@@ -156,6 +168,23 @@ pub enum ModuleControlRequestFromModule {
     },
     #[serde(rename = "supervisor.live_roots")]
     LiveRoots {},
+    /// Register this module's full scope set. The owner is the module whose
+    /// registered connection sends it; nothing in the body names the owner.
+    /// Per-record refusals come back in the reply; a refusal of the whole sync
+    /// (not the owner's sync authority, a stale generation, a bound exceeded)
+    /// is an `Error` frame and changes nothing.
+    #[serde(rename = "scope.sync")]
+    ScopeSync {
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+    },
+    /// Read one scope's current state.
+    #[serde(rename = "scope.describe")]
+    ScopeDescribe {
+        owner: Principal,
+        #[serde(rename = "ref")]
+        scope_ref: String,
+    },
 }
 
 /// Counts of routes for one canonical project root.
@@ -177,6 +206,28 @@ pub enum ModuleControlResponseToModule {
         roots: Vec<LiveRoot>,
         unknown_root_bindings: u64,
         total_bindings: u64,
+    },
+    #[serde(rename = "scope.sync")]
+    ScopeSync {
+        generation: u64,
+        results: Vec<ScopeRecordResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<ScopeEnded>,
+    },
+    #[serde(rename = "scope.describe")]
+    ScopeDescribe {
+        status: ScopeStatus,
+        /// The live epoch, or for `ended` the most recent epoch that ended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_epoch: Option<u64>,
+        daemon_incarnation: String,
+        /// Whether the owner has synced since this daemon incarnation started.
+        owner_synced: bool,
+        /// Whether the owner is a module in the daemon's supervised roster.
+        owner_configured: bool,
+        /// The stamp fields, present only when `status` is `live`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ScopeStamp>,
     },
 }
 

@@ -7,8 +7,8 @@ pub use consumer::{
     ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
     ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
     ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RoutePollResult,
-    SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription,
-    SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions,
+    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
     DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
     SPAWN_SUBSCRIBER_LAGGED,
 };
@@ -28,30 +28,34 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
+/// The one launch-nonce reader for a module process: `launch_nonce()` reads
+/// the inherited descriptor (or, while the daemon still sets it, the
+/// `SUBC_LAUNCH_NONCE` environment copy) once and caches it. The SDK's HELLO and route opens go through it too; a module's
+/// own readers must as well, and it should call it before spawning anything.
+pub use subc_os::launch_nonce;
 use subc_protocol::{
     manifest::ModuleManifest,
     session::{
-        ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
-        ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
+        ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
+        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
         MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
-    ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
-    SUBC_MODULE_ID_ENV,
+    ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 pub use subc_protocol::{
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
-        ExecutionMode, ManifestProvenance, ProvenanceFormError, ProviderRole, Tool,
-        PROVENANCE_SENTINELS,
+        ExecutionMode, LaunchNonceSource, ManifestProvenance, ProvenanceFormError, ProviderRole,
+        Tool, PROVENANCE_SENTINELS,
     },
     session::{HealthReport, HealthStatus},
     AdmissionClass, MachineId, SUBC_PROTOCOL_CRATE_VERSION,
@@ -80,6 +84,14 @@ const HELLO_CORR: u64 = 1;
 /// How long a closing module waits for its writer to flush the frames still
 /// queued before aborting it; see the serve future in `serve_with_handle`.
 const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
+/// When a module's daemon connection ends (GOODBYE, EOF, or the module closing
+/// it), how long the serve loop waits for each `on_draining` hook it already
+/// spawned to start running before it cancels requests and calls
+/// `on_connection_end`. The wait is only for the hook's first step, which is
+/// normally immediate; the bound matters because the daemon kills a module
+/// that has not exited within its stop timeout after GOODBYE, and a hook that
+/// blocks its thread must not hold the shutdown up that long.
+const DRAINING_HOOK_START_LIMIT: Duration = Duration::from_secs(2);
 static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 type RequestKey = (u16, u32, u64);
@@ -207,6 +219,14 @@ pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleEr
 struct RequestDispatcher {
     in_flight: InFlight,
     permits: Arc<Semaphore>,
+    /// One receiver per `on_draining` hook spawned on this connection, resolved
+    /// once that hook has started running. The connection waits on them before
+    /// acting on its end, so a hook is always called before the GOODBYE that
+    /// follows its drain is handled.
+    draining_hooks: Arc<Mutex<Vec<oneshot::Receiver<()>>>>,
+    /// Set after the first channel-0 push this SDK could not decode has been
+    /// logged, so a daemon that repeats a newer push cannot flood the log.
+    undecodable_push_logged: Arc<AtomicBool>,
 }
 
 impl RequestDispatcher {
@@ -214,6 +234,28 @@ impl RequestDispatcher {
         Self {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(HANDLER_TASK_CAPACITY)),
+            draining_hooks: Arc::new(Mutex::new(Vec::new())),
+            undecodable_push_logged: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Wait, within [`DRAINING_HOOK_START_LIMIT`], until every `on_draining`
+    /// hook spawned on this connection has started. Only the start is awaited:
+    /// a hook may still be finishing its work after the connection has ended.
+    async fn wait_for_draining_hooks_to_start(&self) {
+        let started = std::mem::take(
+            &mut *self
+                .draining_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let deadline = tokio::time::Instant::now() + DRAINING_HOOK_START_LIMIT;
+        for hook in started {
+            // A dropped sender means the hook task ended (or panicked) before
+            // reporting; either way there is nothing left to wait for.
+            if tokio::time::timeout_at(deadline, hook).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -709,6 +751,51 @@ impl Error for CatalogUpdateError {}
 
 /// Trait implemented by a module for its business logic. The serve functions in
 /// this crate own all wire-protocol plumbing.
+///
+/// # Stopping cleanly: drains
+///
+/// Before the daemon stops a module (restart, reload, disable, swap, or its own
+/// shutdown) it closes route admission, tells the module with
+/// [`ModuleHandler::on_draining`], waits for the module's in-flight requests to
+/// finish, and only then sends GOODBYE and closes the connection. The wait ends
+/// at the drain deadline whether or not the work is done.
+///
+/// Requests the daemon forwarded are counted by the daemon itself. Work it
+/// cannot see (a job a request started in the background, a batch being
+/// flushed) holds the drain open only if the module says so. The module does
+/// that with a counter it reports in its health answer (a "health gauge"),
+/// and a manifest entry telling the daemon that the counter means "busy": a
+/// `Busy` self-signal anchored to those health gauges. Declare it, and report those
+/// gauges in [`ModuleHandler::health`]'s `metrics` above zero until the work
+/// has finished. During a drain the daemon probes `health` and waits until
+/// every declared gauge reads 0 (or the deadline passes); a declared gauge
+/// missing from the report counts as busy. The manifest entry, as built by the
+/// `echo-module` example in this crate:
+///
+/// ```
+/// use subc_protocol::manifest::{
+///     ModuleManifest, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+/// };
+///
+/// let manifest = ModuleManifest::builder("my-module", "1.0.0")
+///     .self_signals(Some(vec![SelfSignalDeclaration {
+///         name: "background_work".to_string(),
+///         kind: SelfSignalKind::Busy,
+///         effect: SelfSignalEffect::Observe,
+///         anchored_to: SignalAnchor::HealthGauges {
+///             gauges: vec!["background_jobs".to_string()],
+///         },
+///         cadence: None,
+///         domain: None,
+///         note: None,
+///     }]))
+///     .build();
+/// # let _ = manifest;
+/// ```
+///
+/// and `health` then reports `{"background_jobs": <count>}` in `metrics`. Count
+/// only work whose result would still be delivered if it finished during the
+/// drain; see [`SelfSignalDeclaration::kind`](subc_protocol::manifest::SelfSignalDeclaration::kind).
 #[async_trait]
 pub trait ModuleHandler: Send + Sync + 'static {
     /// Handle a data-plane request on a route channel. Return a unary response, a
@@ -770,6 +857,25 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// A route was torn down, rejected, or abandoned before its bind ACK was queued.
     async fn on_route_gone(&self, _handle: &RouteHandle) {}
+
+    /// The daemon has started draining this module: it will stop it for
+    /// `reason` (a restart, reload, disable, or the daemon's own shutdown), and
+    /// has already stopped admitting new routes to it. Stop taking new work
+    /// here and finish or hand off what is in flight; see the trait docs for
+    /// how to keep the drain open while background work finishes.
+    ///
+    /// `deadline` is the wall-clock time by which the module must be done. It
+    /// is "no later than", never a grant of that much time: the daemon enforces
+    /// its own ceiling on a monotonic clock and tears the connection down when
+    /// that runs out, and after the host sleeps the ceiling can fall before
+    /// this wall-clock time does. Aim to finish early.
+    ///
+    /// Called once for each drain notice the daemon sends, on its own task, so
+    /// a slow hook never holds up pings, requests, or the GOODBYE that ends the
+    /// drain. It is always called before that GOODBYE is handled (and before
+    /// [`ModuleHandler::on_connection_end`]); it may still be running after
+    /// them.
+    async fn on_draining(&self, _reason: RouteCloseReason, _deadline: SystemTime) {}
 
     /// The daemon connection ended without a protocol error, and serving is
     /// about to return `Ok(())`. `end` says how: a daemon GOODBYE is a planned
@@ -1082,6 +1188,11 @@ where
 {
     let dispatcher = RequestDispatcher::new();
     let result = serve_frames(&mut reader, &egress, &handler, &module_handle, &dispatcher).await;
+    // A drain notice is followed shortly by the daemon's GOODBYE, and the two
+    // can arrive in one read. Let every drain hook start before the
+    // connection's end (GOODBYE or otherwise) is acted on, so a module always
+    // hears about its drain before it hears that the connection is over.
+    dispatcher.wait_for_draining_hooks_to_start().await;
     dispatcher.cancel_all();
     result
 }
@@ -1197,8 +1308,101 @@ where
             spawn_data_request(frame, egress.clone(), handler, dispatcher, module_handle)?;
             Ok(true)
         }
+        FrameType::Push if frame.header.channel == 0 => {
+            handle_control_push(&frame, handler, &dispatcher);
+            Ok(true)
+        }
         _ => Ok(true),
     }
+}
+
+/// Act on a one-way channel-0 command from the daemon. Never fails the
+/// connection: a push this SDK cannot decode is most likely a newer daemon's
+/// command, and ignoring it is what an older module did before this SDK
+/// decoded any of them.
+fn handle_control_push<H>(frame: &Frame, handler: Arc<H>, dispatcher: &RequestDispatcher)
+where
+    H: ModuleHandler,
+{
+    match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
+        Ok(ModuleControlCommand::Draining {
+            reason,
+            deadline_ms,
+        }) => {
+            let started = spawn_draining_hook(
+                handler,
+                sdk_route_close_reason(reason),
+                drain_deadline(deadline_ms),
+            );
+            dispatcher
+                .draining_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(started);
+        }
+        Err(error) => {
+            if !dispatcher
+                .undecodable_push_logged
+                .swap(true, Ordering::Relaxed)
+            {
+                let op = serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .ok()
+                    .and_then(|body| body.get("op")?.as_str().map(str::to_string));
+                tracing::warn!(
+                    op = op.as_deref().unwrap_or("<none>"),
+                    error = %error,
+                    "ignoring a channel-0 push from subc that this SDK cannot decode; \
+                     further undecodable pushes on this connection are ignored without logging"
+                );
+            }
+        }
+    }
+}
+
+/// Run `on_draining` on its own task, so a slow hook cannot stall the frame
+/// reader. The returned receiver resolves once the hook has been polled for
+/// the first time, i.e. has run up to its first await.
+fn spawn_draining_hook<H>(
+    handler: Arc<H>,
+    reason: RouteCloseReason,
+    deadline: SystemTime,
+) -> oneshot::Receiver<()>
+where
+    H: ModuleHandler,
+{
+    let (started_tx, started_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut hook = handler.on_draining(reason, deadline);
+        let mut started_tx = Some(started_tx);
+        std::future::poll_fn(|cx| {
+            let poll = hook.as_mut().poll(cx);
+            if let Some(started) = started_tx.take() {
+                let _ = started.send(());
+            }
+            poll
+        })
+        .await;
+    });
+    started_rx
+}
+
+/// Convert the wire reason into this crate's public [`RouteCloseReason`], via
+/// its wire name so a reason this crate has no variant for arrives as
+/// [`RouteCloseReason::Unknown`] rather than being dropped.
+fn sdk_route_close_reason(reason: subc_protocol::RouteCloseReason) -> RouteCloseReason {
+    match serde_json::to_value(reason) {
+        Ok(serde_json::Value::String(wire)) => RouteCloseReason::from_wire(&wire),
+        _ => RouteCloseReason::Unknown(format!("{reason:?}")),
+    }
+}
+
+/// The drain deadline as a wall-clock time. A value too large for this
+/// platform's clock becomes "now": the deadline is a "no later than", so
+/// reading it early is the safe direction.
+fn drain_deadline(deadline_ms: u64) -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(deadline_ms))
+        .unwrap_or_else(SystemTime::now)
 }
 
 fn spawn_data_request<H>(
@@ -1395,6 +1599,10 @@ where
             principal,
             consumer_capabilities,
             admission_facts,
+            // This SDK does not pass the scope stamp to handlers, so a provider
+            // built on it cannot act on it; ignoring the field is also exactly
+            // what builds that predate the field do.
+            scope: _,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -1505,17 +1713,20 @@ where
 
 async fn send_hello(
     egress: &mpsc::Sender<Frame>,
-    manifest: ModuleManifest,
+    mut manifest: ModuleManifest,
 ) -> Result<(), SubcModuleError> {
+    let launch_nonce = match retained_launch_nonce() {
+        Some(retained) => Some(retained),
+        None => launch_nonce()
+            .map_err(SubcModuleError::LaunchNonce)?
+            .map(|nonce| nonce.value().to_string()),
+    };
+    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce: retained_launch_nonce().or_else(|| {
-            env::var(SUBC_LAUNCH_NONCE_ENV)
-                .ok()
-                .filter(|value| !value.is_empty())
-        }),
+        launch_nonce,
     })
     .map_err(SubcModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -1689,6 +1900,9 @@ pub enum SubcModuleError {
     HelloRejected {
         body: ErrorBody,
     },
+    /// The descriptor named for the launch nonce could not be read. HELLO is
+    /// not sent without it, and the environment copy is not tried instead.
+    LaunchNonce(launch_nonce::LaunchNonceError),
 }
 
 impl fmt::Display for SubcModuleError {
@@ -1745,6 +1959,7 @@ impl fmt::Display for SubcModuleError {
                 "HELLO rejected by subc: {} ({})",
                 body.code, body.message
             ),
+            Self::LaunchNonce(err) => write!(f, "launch nonce unavailable: {err}"),
         }
     }
 }
@@ -1758,6 +1973,7 @@ impl Error for SubcModuleError {
             Self::FrameIo(err) => Some(err),
             Self::FrameBuild(err) => Some(err),
             Self::Json(err) => Some(err),
+            Self::LaunchNonce(err) => Some(err),
             Self::WriterTask(err) => Some(err),
             Self::MissingSubcArg
             | Self::MissingSubcValue
@@ -2069,8 +2285,8 @@ mod tests {
             release_first: Arc::clone(&release_first),
         });
         let dispatcher = RequestDispatcher {
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(1)),
+            ..RequestDispatcher::new()
         };
         let (module_handle, _unused_rx) = test_module_handle(&[]);
         module_handle
@@ -2293,6 +2509,7 @@ mod tests {
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -2663,6 +2880,7 @@ mod module_close_tests {
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         })
         .unwrap();
         send(
@@ -2839,6 +3057,159 @@ mod module_close_tests {
         );
     }
 
+    /// What a drain-recording handler saw, in the order it saw it.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Seen {
+        Draining(RouteCloseReason, SystemTime),
+        End(ConnectionEnd),
+    }
+
+    /// Records drain notices and the connection end. With `park` set, the
+    /// drain hook never returns after recording, to stand for a slow hook.
+    #[derive(Clone, Default)]
+    struct DrainRecorder {
+        seen: Arc<Mutex<Vec<Seen>>>,
+        park: bool,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for DrainRecorder {
+        async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
+        async fn on_draining(&self, reason: RouteCloseReason, deadline: SystemTime) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(Seen::Draining(reason, deadline));
+            if self.park {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn on_connection_end(&self, end: ConnectionEnd) {
+            self.seen.lock().unwrap().push(Seen::End(end));
+        }
+    }
+
+    fn control_push(body: &[u8]) -> Frame {
+        Frame::build(FrameType::Push, control_flags(), 0, 0, 0, body.to_vec()).unwrap()
+    }
+
+    fn draining_push(reason: subc_protocol::RouteCloseReason, deadline_ms: u64) -> Frame {
+        control_push(
+            &serde_json::to_vec(&ModuleControlCommand::Draining {
+                reason,
+                deadline_ms,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Send a channel-0 PING and require the PONG, proving the frame reader
+    /// is still serving.
+    async fn ping_is_answered(served: &mut Served, corr: u64) {
+        send(
+            &mut served.daemon,
+            Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new()).unwrap(),
+        )
+        .await;
+        let pong = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+            .await
+            .expect("the module must answer PING")
+            .unwrap()
+            .expect("the module must not close the connection");
+        assert_eq!(pong.header.ty, FrameType::Pong);
+        assert_eq!(pong.header.corr, corr);
+    }
+
+    /// The daemon sends `module.draining` and, once the drain settles, GOODBYE;
+    /// with nothing to wait for, both can land in one read. The hook runs on its
+    /// own task, and must still be called before the GOODBYE is acted on.
+    #[tokio::test]
+    async fn a_drain_notice_calls_on_draining_before_the_goodbye_that_follows_it() {
+        let recorder = DrainRecorder::default();
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        // Any fixed value works; this one (2100-01-01T00:00:00Z) is far enough
+        // ahead to be plainly a future deadline.
+        let deadline_ms = 4_102_444_800_000;
+        write_frame(
+            &mut served.daemon,
+            &draining_push(subc_protocol::RouteCloseReason::Restart, deadline_ms),
+        )
+        .await
+        .unwrap();
+        write_frame(&mut served.daemon, &goodbye()).await.unwrap();
+        served.daemon.flush().await.unwrap();
+
+        timeout(Duration::from_secs(5), &mut served.serve)
+            .await
+            .expect("serving must end after GOODBYE")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec![
+                Seen::Draining(
+                    RouteCloseReason::Restart,
+                    UNIX_EPOCH + Duration::from_millis(deadline_ms)
+                ),
+                Seen::End(ConnectionEnd::Goodbye),
+            ]
+        );
+    }
+
+    /// A drain lasts until the daemon's deadline, and the daemon keeps pinging
+    /// through it; a hook still busy must not stop the module answering.
+    #[tokio::test]
+    async fn a_drain_hook_that_never_returns_does_not_stop_the_frame_reader() {
+        let recorder = DrainRecorder {
+            park: true,
+            ..DrainRecorder::default()
+        };
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        send(
+            &mut served.daemon,
+            draining_push(subc_protocol::RouteCloseReason::Reload, 1),
+        )
+        .await;
+        ping_is_answered(&mut served, 41).await;
+        assert!(matches!(
+            recorder.seen.lock().unwrap().as_slice(),
+            [Seen::Draining(RouteCloseReason::Reload, _)]
+        ));
+
+        send(&mut served.daemon, goodbye()).await;
+        timeout(Duration::from_secs(5), &mut served.serve)
+            .await
+            .expect("a parked drain hook must not keep the serve future alive")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A channel-0 push this SDK cannot decode (a newer daemon's command, or a
+    /// malformed body) is ignored: no hook is called and the connection keeps
+    /// serving.
+    #[tokio::test]
+    async fn an_undecodable_channel_zero_push_is_ignored_and_the_connection_stays_up() {
+        let recorder = DrainRecorder::default();
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        send(
+            &mut served.daemon,
+            control_push(br#"{"op":"module.some_future_command","x":1}"#),
+        )
+        .await;
+        send(&mut served.daemon, control_push(b"not json")).await;
+        send(
+            &mut served.daemon,
+            control_push(br#"{"op":"module.draining","reason":"restart"}"#),
+        )
+        .await;
+        ping_is_answered(&mut served, 42).await;
+        assert!(!served.handle.is_closed());
+        assert!(!served.serve.is_finished());
+        assert!(recorder.seen.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_module_closing_its_own_connection_is_reported_as_closed() {
         let recorder = EndRecorder::default();
@@ -2900,4 +3271,36 @@ pub fn retain_launch_nonce_for_hello(launch_nonce: String) -> Result<(), String>
 
 fn retained_launch_nonce() -> Option<String> {
     RETAINED_LAUNCH_NONCE.get().cloned()
+}
+
+/// Where this process read its launch nonce, in the form module provenance
+/// reports it (`fd` or `env`), or `None` when it has none or could not read
+/// it. For a module that builds its provenance block itself:
+/// `.with_launch_nonce_source(subc_client_rs::launch_nonce_source())`.
+pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
+    launch_nonce()
+        .ok()
+        .flatten()
+        .map(|nonce| LaunchNonceSource::from_wire_name(nonce.source().as_str()))
+}
+
+/// Fill in `launch_nonce_source` on a module's declared provenance, so
+/// `ck provenance` can tell a module reading the pipe from one still reading
+/// the environment variable. Only when the module declared provenance and left the field
+/// unset, and only when the nonce HELLO carries is the one the accessor read:
+/// a nonce retained by the module itself came from somewhere this SDK cannot
+/// vouch for.
+fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) {
+    let Some(provenance) = manifest.provenance.as_mut() else {
+        return;
+    };
+    if provenance.launch_nonce_source.is_some() {
+        return;
+    }
+    if let Ok(Some(nonce)) = launch_nonce() {
+        if sent == Some(nonce.value()) {
+            provenance.launch_nonce_source =
+                Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
+        }
+    }
 }

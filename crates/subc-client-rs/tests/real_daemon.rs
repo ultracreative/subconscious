@@ -17,9 +17,10 @@ use subc_test_support::TestTempDir;
 use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
-    ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, PolicyResolveError,
-    PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
-    RouteHandle, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler,
+    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef,
+    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeSelector, SubcConsumer,
+    SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -29,7 +30,7 @@ use subc_protocol::{
         Tool,
     },
     session::HealthStatus,
-    BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
+    BindIdentity, ErrorBody, Flags, Frame, FrameType, Principal, Priority, RouteTarget,
 };
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -758,6 +759,86 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     .await;
 
     let _ = daemon.child.kill();
+}
+
+/// The daemon hands a spawned module its launch nonce on descriptor 3, the
+/// module's SDK reads it there, and its HELLO carries it: the module is
+/// declared `reserved`, so the daemon admits it only with its exact spawn
+/// nonce, and its provenance reports that the nonce came from `fd`. The
+/// daemon still sets the environment copy too, which is why the source is
+/// what tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hello_carries_it() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-launch-nonce-fd");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let events_path = temp_dir.join("events.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let env = BTreeMap::from([
+        (
+            "SUBC_MODULE_ECHO_EVENTS".to_string(),
+            events_path.to_string_lossy().into_owned(),
+        ),
+        ("SUBC_MODULE_ECHO_PROVENANCE".to_string(), "1".to_string()),
+    ]);
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "modules": {
+                MODULE_ID: {
+                    "program": module_bin.to_string_lossy(),
+                    "args": [],
+                    "env": env,
+                    "enabled": true,
+                    "reserved": true,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let expected_source = if cfg!(unix) { "fd" } else { "env" };
+    let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
+        event["kind"] == "launch_nonce"
+    })
+    .await;
+    assert_eq!(started["source"], expected_source, "{started}");
+    wait_for_catalog_module(&daemon.connection_file, MODULE_ID, START_TIMEOUT).await;
+
+    let mut client = connect_authed_client(&daemon.connection_file)
+        .await
+        .unwrap();
+    let response = control_rpc_on_stream(
+        &mut client,
+        7,
+        serde_json::to_value(ClientControlRequest::SupervisorProvenance {
+            module_id: Some(MODULE_ID.to_string()),
+        })
+        .unwrap(),
+    )
+    .await;
+    let modules = &response["modules"];
+    assert_eq!(
+        modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
+        "{response}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1837,6 +1918,7 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
     Command::new(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+        .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -3146,4 +3228,845 @@ async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnectin
         joined.expect("serve task panicked").is_ok(),
         "serve() must return Ok on a clean connection close, not an error"
     );
+}
+
+// Scoped route.open against a real daemon.
+//
+// Four copies of fake-aft-stub (crates/subc-core/src/bin/fake-aft-stub.rs, a
+// raw-protocol module whose behaviour is chosen by FAKE_AFT_* environment
+// variables), all supervised by the daemon under test:
+// - the scope OWNER, which syncs whatever scopes the test writes to its sync
+//   file (writing the file is "the owner synced");
+// - the CARRIER, listed as a carrier on every scope the tests sync;
+// - a STRANGER, supervised like the carrier but never listed;
+// - the PROVIDER the routes open to, which records each bind and its stamp.
+// The carrier and stranger write their launch nonces out, so a consumer in this
+// process can present them and be attested as that module. The owner, carrier
+// and stranger are reserved because a scope's owner and carriers are named as
+// reserved principals.
+
+const SCOPE_OWNER: &str = "subc-client-rs-scope-owner";
+const SCOPE_CARRIER: &str = "subc-client-rs-scope-carrier";
+const SCOPE_STRANGER: &str = "subc-client-rs-scope-stranger";
+const SCOPE_PROVIDER: &str = "subc-client-rs-scope-provider";
+/// Must equal `SCOPE_SYNC_CORR_BASE` in crates/subc-core/src/bin/fake-aft-stub.rs:
+/// the stub sends its `n`th scope.sync with corr `SCOPE_SYNC_CORR_BASE + n` and
+/// records the daemon's reply under that corr, which is how `sync` below finds
+/// the reply to the sync it asked for.
+const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
+
+struct ScopeHarness {
+    daemon: LiveDaemon,
+    _temp_dir: TestTempDir,
+    sync_path: PathBuf,
+    owner_events: PathBuf,
+    provider_events: PathBuf,
+    carrier: ConsumerIdentity,
+    stranger: ConsumerIdentity,
+    syncs: u64,
+}
+
+impl ScopeHarness {
+    fn options_as(&self, identity: &ConsumerIdentity) -> CallOptions {
+        CallOptions {
+            consumer_identity: Some(identity.clone()),
+            ..fast_call_options()
+        }
+    }
+
+    fn carrier_options(&self) -> CallOptions {
+        self.options_as(&self.carrier)
+    }
+
+    /// Have the owner sync `scopes` (a JSON array of scope records) and wait
+    /// for the daemon to accept every record.
+    async fn sync(&mut self, scopes: Value) {
+        self.syncs += 1;
+        let corr = SCOPE_SYNC_CORR_BASE + self.syncs;
+        let staging = self.sync_path.with_extension("staging");
+        fs::write(&staging, serde_json::to_vec(&scopes).unwrap()).unwrap();
+        fs::rename(&staging, &self.sync_path).unwrap();
+        let reply = wait_for_event(&self.owner_events, EVENT_TIMEOUT, |event| {
+            event["corr"] == corr
+                && (event["kind"] == "scope_sync_response" || event["kind"] == "error")
+        })
+        .await;
+        assert_eq!(
+            reply["kind"], "scope_sync_response",
+            "the daemon refused scope.sync: {reply}"
+        );
+        for result in reply["body_json"]["results"].as_array().unwrap() {
+            assert_ne!(
+                result["outcome"], "refused",
+                "a scope record was refused: {result}"
+            );
+        }
+    }
+
+    fn provider_attaches(&self) -> Vec<Value> {
+        read_events(&self.provider_events)
+            .into_iter()
+            .filter(|event| event["kind"] == "attach")
+            .collect()
+    }
+
+    async fn connect(&self) -> SubcConsumer {
+        SubcConsumer::connect(&self.daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap()
+    }
+
+    fn stop(mut self) {
+        self.daemon.kill_and_wait();
+    }
+}
+
+async fn start_scope_harness() -> ScopeHarness {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let stub_bin = binary_path(&workspace, "fake-aft-stub");
+    assert!(stub_bin.exists(), "expected {}", stub_bin.display());
+
+    let temp_dir = unique_temp_dir("subc-client-rs-scopes");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let sync_path = temp_dir.join("owner-scopes.json");
+    let owner_events = temp_dir.join("owner-events.jsonl");
+    let provider_events = temp_dir.join("provider-events.jsonl");
+    let carrier_nonce = temp_dir.join("carrier.nonce");
+    let stranger_nonce = temp_dir.join("stranger.nonce");
+
+    let module = |module_id: &str, reserved: bool, extra: &[(&str, &Path)]| {
+        let mut env = BTreeMap::from([("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())]);
+        for (key, path) in extra {
+            env.insert((*key).to_string(), path.to_string_lossy().into_owned());
+        }
+        json!({
+            "program": stub_bin.to_string_lossy(),
+            "args": [],
+            "env": env,
+            "enabled": true,
+            "reserved": reserved,
+        })
+    };
+    let config = json!({
+        "version": 1,
+        "modules": {
+            SCOPE_OWNER: module(SCOPE_OWNER, true, &[
+                ("FAKE_AFT_SCOPE_SYNC_PATH", &sync_path),
+                ("FAKE_AFT_EVENTS_PATH", &owner_events),
+            ]),
+            SCOPE_CARRIER: module(SCOPE_CARRIER, true, &[
+                ("FAKE_AFT_LAUNCH_NONCE_PATH", &carrier_nonce),
+            ]),
+            SCOPE_STRANGER: module(SCOPE_STRANGER, true, &[
+                ("FAKE_AFT_LAUNCH_NONCE_PATH", &stranger_nonce),
+            ]),
+            SCOPE_PROVIDER: module(SCOPE_PROVIDER, false, &[
+                ("FAKE_AFT_EVENTS_PATH", &provider_events),
+            ]),
+        }
+    });
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    for module_id in [SCOPE_OWNER, SCOPE_CARRIER, SCOPE_STRANGER, SCOPE_PROVIDER] {
+        wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    }
+    let carrier = ConsumerIdentity {
+        module_id: SCOPE_CARRIER.to_string(),
+        launch_nonce: wait_for_file(&carrier_nonce).await,
+    };
+    let stranger = ConsumerIdentity {
+        module_id: SCOPE_STRANGER.to_string(),
+        launch_nonce: wait_for_file(&stranger_nonce).await,
+    };
+    ScopeHarness {
+        daemon,
+        _temp_dir: temp_dir,
+        sync_path,
+        owner_events,
+        provider_events,
+        carrier,
+        stranger,
+        syncs: 0,
+    }
+}
+
+async fn wait_for_file(path: &Path) -> String {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        if let Ok(raw) = fs::read_to_string(path) {
+            return raw;
+        }
+        if Instant::now() >= deadline {
+            panic!("{} did not appear within {START_TIMEOUT:?}", path.display());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A head scope with the carrier module listed as a carrier for any target.
+fn scope_record(scope_ref: &str, scope_epoch: u64) -> Value {
+    json!({
+        "ref": scope_ref,
+        "scope_epoch": scope_epoch,
+        "kind": "head",
+        "carriers": [
+            { "principal": { "kind": "reserved", "module_id": SCOPE_CARRIER } }
+        ],
+    })
+}
+
+fn scope_selector(scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
+    ScopeSelector {
+        owner: Principal::Reserved {
+            module_id: SCOPE_OWNER.to_string(),
+        },
+        scope_ref: scope_ref.to_string(),
+        scope_epoch: Some(scope_epoch),
+    }
+}
+
+fn refusal_code(err: &CallError) -> Option<&str> {
+    err.route_open_refusal().map(|body| body.code.as_str())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carriers_scoped_open_is_admitted_and_the_provider_bind_carries_the_scope() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = harness.connect().await;
+
+    consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            consumer_identity("scoped-admitted"),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("the carrier's scoped open must be admitted: {err}"));
+
+    let attach = wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(
+        attach["scope"]["owner"],
+        json!({ "kind": "reserved", "module_id": SCOPE_OWNER })
+    );
+    assert_eq!(attach["scope"]["ref"], "session-a");
+    assert_eq!(attach["scope"]["scope_epoch"], 1);
+    assert_eq!(
+        attach["principal"],
+        json!({ "kind": "reserved", "module_id": SCOPE_CARRIER }),
+        "the bind names the carrier as the opener"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_open_before_the_owners_first_sync_retries_until_the_owner_syncs() {
+    let mut harness = start_scope_harness().await;
+    let consumer = Arc::new(harness.connect().await);
+    let identity = consumer_identity("scoped-before-sync");
+
+    // Control: with a short retry budget the open runs out on scope_not_synced,
+    // so the daemon really is refusing with it while the owner has not synced.
+    let short = CallOptions {
+        timeout: Duration::from_secs(2),
+        route_retry_deadline: Duration::from_millis(300),
+        ..harness.carrier_options()
+    };
+    let err = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            short,
+        )
+        .await
+        .expect_err("no scope is live before the owner syncs");
+    assert_eq!(refusal_code(&err), Some("scope_not_synced"), "{err}");
+
+    let patient = CallOptions {
+        timeout: Duration::from_secs(10),
+        route_retry_deadline: Duration::from_secs(10),
+        ..harness.carrier_options()
+    };
+    let opener = Arc::clone(&consumer);
+    let open = tokio::spawn(async move {
+        opener
+            .open_route_scoped(
+                tool_target(SCOPE_PROVIDER),
+                identity,
+                scope_selector("session-a", 1),
+                patient,
+            )
+            .await
+    });
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        !open.is_finished(),
+        "the open must still be retrying scope_not_synced, not settled"
+    );
+
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    timeout(Duration::from_secs(10), open)
+        .await
+        .expect("the open must settle within its deadline")
+        .unwrap()
+        .unwrap_or_else(|err| panic!("the open must succeed once the owner syncs: {err}"));
+    let attach = wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(attach["scope"]["ref"], "session-a");
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_not_carrier_and_scope_ended_are_terminal_refusals_with_their_codes() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 2)])).await;
+    let consumer = harness.connect().await;
+    let identity = consumer_identity("scoped-refusals");
+
+    let mut no_epoch = scope_selector("session-a", 2);
+    no_epoch.scope_epoch = None;
+    let cases = [
+        (
+            "a supervised module that is not a listed carrier",
+            harness.stranger.clone(),
+            scope_selector("session-a", 2),
+            "scope_not_carrier",
+        ),
+        (
+            "an epoch the scope has moved past",
+            harness.carrier.clone(),
+            scope_selector("session-a", 1),
+            "scope_ended",
+        ),
+        (
+            "a ref the owner holds no live scope for",
+            harness.carrier.clone(),
+            scope_selector("session-unknown", 1),
+            "scope_not_live",
+        ),
+        (
+            "a selector without an epoch",
+            harness.carrier.clone(),
+            no_epoch,
+            "scope_epoch_required",
+        ),
+    ];
+    for (label, opener, selector, code) in cases {
+        // terminal_absence_options sets a two-second route-retry backoff, and
+        // jitter keeps at least half of it, so if the SDK wrongly retried a
+        // terminal code the call would take a second or more.
+        let options = CallOptions {
+            consumer_identity: Some(opener),
+            ..terminal_absence_options()
+        };
+        let started = Instant::now();
+        let err = consumer
+            .open_route_scoped(
+                tool_target(SCOPE_PROVIDER),
+                identity.clone(),
+                selector,
+                options,
+            )
+            .await
+            .expect_err(label);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, CallError::NotSent(_)), "{label}: {err}");
+        assert_eq!(refusal_code(&err), Some(code), "{label}: {err}");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "{label}: {code} is terminal and must not be retried (took {elapsed:?})"
+        );
+    }
+    assert!(
+        harness.provider_attaches().is_empty(),
+        "no refused open may reach the provider"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_opens_under_other_refs_or_epochs_and_unscoped_opens_get_their_own_routes() {
+    let mut harness = start_scope_harness().await;
+    harness
+        .sync(json!([
+            scope_record("session-a", 1),
+            scope_record("session-b", 1)
+        ]))
+        .await;
+    let consumer = harness.connect().await;
+    let identity = consumer_identity("scoped-cache");
+    let carrier_options = harness.carrier_options();
+    let open = |selector: ScopeSelector| {
+        consumer.open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            selector,
+            carrier_options.clone(),
+        )
+    };
+
+    let session_a = open(scope_selector("session-a", 1)).await.unwrap();
+    let session_a_again = open(scope_selector("session-a", 1)).await.unwrap();
+    assert_eq!(
+        session_a_again, session_a,
+        "the same selector reuses the cached route"
+    );
+    let session_b = open(scope_selector("session-b", 1)).await.unwrap();
+    assert_ne!(session_b, session_a, "another scope ref gets its own route");
+    let unscoped = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            carrier_options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(unscoped, session_a, "an unscoped open gets its own route");
+    assert_ne!(unscoped, session_b, "an unscoped open gets its own route");
+
+    // An epoch the owner has not synced is refused by the daemon, so it must
+    // reach the daemon: the session-a route cached under epoch 1 must not be
+    // handed to a caller asking for epoch 2.
+    let err = open(scope_selector("session-a", 2))
+        .await
+        .expect_err("epoch 2 of session-a is not live");
+    assert_eq!(refusal_code(&err), Some("scope_ended"), "{err}");
+
+    let mut scopes = harness
+        .provider_attaches()
+        .into_iter()
+        .map(|attach| attach["scope"]["ref"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    scopes.sort();
+    assert_eq!(
+        scopes,
+        vec![None, Some("session-a".into()), Some("session-b".into())],
+        "three binds: one per scope and one unscoped"
+    );
+
+    // Once the owner moves session-a to epoch 2, an open under epoch 2 is a
+    // second route for session-a, distinct from the one epoch 1 had.
+    harness
+        .sync(json!([
+            scope_record("session-a", 2),
+            scope_record("session-b", 1)
+        ]))
+        .await;
+    let session_a_epoch_2 = open(scope_selector("session-a", 2)).await.unwrap();
+    assert_ne!(session_a_epoch_2, session_a);
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach" && event["scope"]["scope_epoch"] == 2
+    })
+    .await;
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_the_scope_closes_the_route_with_scope_ended_and_it_is_not_reopened() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = harness.connect().await;
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("scoped-ended");
+
+    let handle = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+
+    // The owner syncs an empty set: session-a has ended.
+    harness.sync(json!([])).await;
+
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .expect("route.closed must arrive after the scope ends")
+            .expect("control push receiver open");
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    assert_eq!(closed.body["reason"], "scope_ended", "{}", closed.body);
+    let reason = closed
+        .route_close_reason()
+        .expect("route.closed carries a reason");
+    assert_eq!(
+        reason.disposition(),
+        RouteCloseDisposition::MustNotReopen,
+        "a route whose scope ended must not be reopened"
+    );
+
+    // The daemon also sends a GOODBYE on the route's channel, and the SDK drops
+    // a route from its managed cache when that arrives, so the handle goes
+    // stale. The GOODBYE and the push travel separately, hence the poll.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        match consumer
+            .request(&handle, b"{}".to_vec(), fast_call_options())
+            .await
+        {
+            Err(CallError::StaleRouteHandle(_)) => break,
+            other if Instant::now() >= deadline => {
+                panic!("the ended route's handle is still live: {other:?}")
+            }
+            _ => sleep(Duration::from_millis(20)).await,
+        }
+    }
+
+    // Asking again under the ended selector reaches the daemon and is refused;
+    // nothing reopens the route behind the caller's back.
+    let err = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity,
+            scope_selector("session-a", 1),
+            terminal_absence_options_as(&harness.carrier),
+        )
+        .await
+        .expect_err("an ended scope admits no new route");
+    assert_eq!(refusal_code(&err), Some("scope_not_live"), "{err}");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.provider_attaches().len(),
+        1,
+        "the provider saw exactly the one bind made before the scope ended"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+fn terminal_absence_options_as(identity: &ConsumerIdentity) -> CallOptions {
+    CallOptions {
+        consumer_identity: Some(identity.clone()),
+        ..terminal_absence_options()
+    }
+}
+
+// `module.draining` reaching a module built on `serve`, against a real daemon.
+//
+// Both tests supervise the `echo-module` example, which records each
+// `on_draining` call, each `health` answer (when it declares a busy gauge) and
+// its `on_connection_end` in an events file, every line stamped with its pid.
+// `supervisor.restart` replaces the process, and the replacement writes to the
+// same file, so the assertions read only the drained process's lines.
+
+const DRAIN_MODULE_ID: &str = "subc-client-rs-drain";
+
+/// A daemon supervising `echo-module` as [`DRAIN_MODULE_ID`] with the given
+/// extra environment and module settings.
+async fn start_drain_harness(
+    name: &str,
+    extra_env: &[(&str, &str)],
+    module_settings: Value,
+) -> (TestTempDir, LiveDaemon, PathBuf) {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir(name);
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let events_path = temp_dir.join("events.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let mut env = BTreeMap::from([(
+        "SUBC_MODULE_ECHO_EVENTS".to_string(),
+        events_path.to_string_lossy().into_owned(),
+    )]);
+    for (key, value) in extra_env {
+        env.insert((*key).to_string(), (*value).to_string());
+    }
+    let mut module = json!({
+        "program": module_bin.to_string_lossy(),
+        "args": [],
+        "env": env,
+        "enabled": true,
+    });
+    if let (Some(module), Some(settings)) = (module.as_object_mut(), module_settings.as_object()) {
+        module.extend(settings.clone());
+    }
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "modules": { DRAIN_MODULE_ID: module },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, DRAIN_MODULE_ID, START_TIMEOUT).await;
+    (temp_dir, daemon, events_path)
+}
+
+/// Run `supervisor.restart` on [`DRAIN_MODULE_ID`] and require its ACK. The
+/// ACK can come before the drain has finished, so callers wait for the
+/// drained process's `connection_end` event to know it is over.
+async fn restart_drain_module(connection_file: &Path) {
+    let mut client = connect_authed_client(connection_file).await.unwrap();
+    let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
+        module_id: DRAIN_MODULE_ID.to_string(),
+        drain_timeout_ms: None,
+    })
+    .unwrap();
+    write_frame(&mut client, &control_request_frame(77, body))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(30), read_frame(&mut client))
+        .await
+        .expect("supervisor.restart must be answered")
+        .unwrap()
+        .expect("daemon closed the control connection");
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "supervisor.restart failed: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// The pid of the process that registered first: its `hello_ack` line.
+async fn first_module_pid(events_path: &Path) -> u64 {
+    wait_for_event(events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "hello_ack"
+    })
+    .await["pid"]
+        .as_u64()
+        .expect("the module must stamp its events with its pid")
+}
+
+/// Every event `pid` recorded, in order.
+fn events_of(events_path: &Path, pid: u64) -> Vec<Value> {
+    read_events(events_path)
+        .into_iter()
+        .filter(|event| event["pid"].as_u64() == Some(pid))
+        .collect()
+}
+
+fn position_of(events: &[Value], what: &str, predicate: impl Fn(&Value) -> bool) -> usize {
+    events
+        .iter()
+        .position(predicate)
+        .unwrap_or_else(|| panic!("no {what} event; events: {events:#?}"))
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// `supervisor.restart` drains the module before stopping it. The daemon
+/// tells the module so with `module.draining`, and a module built on `serve`
+/// must hear it through `on_draining`: reason `restart`, a deadline still in
+/// the future and inside the configured drain budget, and before the GOODBYE
+/// that ends the drain (seen as `on_connection_end(goodbye)`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervisor_restart_calls_on_draining_with_restart_and_a_future_deadline_before_goodbye() {
+    const DRAIN_BUDGET_MS: u64 = 10_000;
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-notice",
+        &[],
+        json!({ "drain_timeout_ms": DRAIN_BUDGET_MS }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let restart_sent_ms = unix_ms_now();
+    restart_drain_module(&daemon.connection_file).await;
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end"
+    })
+    .await;
+
+    let events = events_of(&events_path, drained_pid);
+    let draining_at = position_of(&events, "draining", |event| event["kind"] == "draining");
+    let end_at = position_of(&events, "connection_end", |event| {
+        event["kind"] == "connection_end"
+    });
+    let draining = &events[draining_at];
+    assert_eq!(draining["reason"], "Restart", "{draining}");
+    let deadline_ms = draining["deadline_ms"].as_u64().unwrap();
+    let now_ms = draining["at_ms"].as_u64().unwrap();
+    assert!(
+        deadline_ms > now_ms,
+        "the drain deadline must still be ahead when the hook runs: {draining}"
+    );
+    assert!(
+        deadline_ms <= restart_sent_ms + DRAIN_BUDGET_MS + 1_000,
+        "the deadline must come from the configured drain budget: {draining}"
+    );
+    assert_eq!(events[end_at]["end"], "goodbye", "{:#?}", events);
+    assert!(
+        draining_at < end_at,
+        "on_draining must be called before the GOODBYE that ends the drain: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "draining")
+            .count(),
+        1,
+        "one drain notice, one call: {events:#?}"
+    );
+    daemon.kill_and_wait();
+}
+
+/// A module that declares a `Busy` health gauge holds its drain open until the
+/// gauge reads 0. Here the gauge reads 1 until `on_draining` has run plus a
+/// delay, so the drain can only finish early if the hook ran and the daemon's
+/// drain probe read the gauge falling:
+///
+/// - the module is not torn down (GOODBYE, `on_connection_end`) until after
+///   it answered a health probe with the gauge at 0;
+/// - the drain (from the hook's call to the module's GOODBYE) lasts at least
+///   the delay and ends well before the drain budget, so it was the gauge, not
+///   the deadline, that ended the wait;
+/// - the route the test holds is closed with `drained: true`, which the daemon
+///   reports only when its drain wait saw every declared gauge at zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_it_reads_zero() {
+    const BUSY_AFTER_DRAIN_MS: u64 = 1_500;
+    const DRAIN_BUDGET_MS: u64 = 8_000;
+    let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-busy",
+        &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
+        json!({
+            "drain_timeout_ms": DRAIN_BUDGET_MS,
+            // The drain re-probes on the health cadence; keep it short so the
+            // wait ends soon after the gauge falls.
+            "health": { "cadence_ms": 200, "deadline_ms": 150 },
+        }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    consumer
+        .open_route(
+            tool_target(DRAIN_MODULE_ID),
+            consumer_identity("drain-busy"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let mut control = consumer.control_pushes(8);
+
+    restart_drain_module(&daemon.connection_file).await;
+    // Wait out the whole budget: a drain that is never released ends at its
+    // deadline, and the assertions below should say so rather than this wait.
+    wait_for_event(
+        &events_path,
+        Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+    )
+    .await;
+
+    let events = events_of(&events_path, drained_pid);
+    let draining_at = position_of(&events, "draining", |event| event["kind"] == "draining");
+    let busy_done_at = position_of(&events, "busy_done", |event| event["kind"] == "busy_done");
+    let end_at = position_of(&events, "connection_end", |event| {
+        event["kind"] == "connection_end"
+    });
+    assert_eq!(events[end_at]["end"], "goodbye", "{events:#?}");
+    assert!(
+        draining_at < busy_done_at && busy_done_at < end_at,
+        "{events:#?}"
+    );
+    assert!(
+        events[draining_at..busy_done_at]
+            .iter()
+            .any(|event| event["kind"] == "health" && event["drain_work"] == 1),
+        "the drain must have probed the gauge while it was still 1: {events:#?}"
+    );
+    assert!(
+        events[busy_done_at..end_at]
+            .iter()
+            .any(|event| event["kind"] == "health" && event["drain_work"] == 0),
+        "the module must be probed and read 0 before it is torn down: {events:#?}"
+    );
+    let drain_ms =
+        events[end_at]["at_ms"].as_u64().unwrap() - events[draining_at]["at_ms"].as_u64().unwrap();
+    assert!(
+        drain_ms >= BUSY_AFTER_DRAIN_MS,
+        "the drain ended before the gauge could fall: {drain_ms}ms"
+    );
+    assert!(
+        drain_ms < DRAIN_BUDGET_MS - 2_000,
+        "the drain ran to its deadline instead of ending on the gauge: {drain_ms}ms"
+    );
+
+    let closed = timeout(EVENT_TIMEOUT, async {
+        loop {
+            let push = control
+                .recv()
+                .await
+                .expect("control push receiver should remain open");
+            if push.op == "route.closed" {
+                return push;
+            }
+        }
+    })
+    .await
+    .expect("route.closed should arrive after the drain");
+    assert_eq!(closed.body["reason"], "restart", "{:?}", closed.body);
+    assert_eq!(
+        closed.body["drained"], true,
+        "the daemon's drain wait must have seen the gauge at zero: {:?}",
+        closed.body
+    );
+    daemon.kill_and_wait();
 }

@@ -2065,15 +2065,23 @@ async fn start_supervision_connection_if_configured(
 }
 
 async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Result<()> {
+    let nonce = subc_os::launch_nonce()
+        .map_err(|error| other_error(format!("launch nonce unavailable: {error}")))?;
+    let mut manifest = supervision_manifest(module_id.to_owned());
+    // Unlike SDK-managed HELLOs, this message is built here, so report the source
+    // from the same launch_nonce() result whose value is sent to the daemon.
+    if let Some(provenance) = manifest.provenance.as_mut() {
+        provenance.launch_nonce_source = nonce.as_ref().map(|nonce| {
+            subc_protocol::manifest::LaunchNonceSource::from_wire_name(nonce.source().as_str())
+        });
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: supervision_manifest(module_id.to_owned()),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_owned()]),
         // Echo the one-time launch nonce subc injects for a reserved module; absent
         // (None) when this module is not reserved.
-        launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty()),
+        launch_nonce: nonce.map(|nonce| nonce.value().to_owned()),
     })
     .map_err(|source| {
         other_error(format!(
@@ -2317,13 +2325,11 @@ fn manifest_output_always_includes_an_empty_runtime_computed_array() {
 #[test]
 fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
     let mut manifest = supervision_manifest(MANIFEST_MODULE_ID.to_string());
-    manifest.provenance = Some(subc_protocol::manifest::ManifestProvenance {
-        build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-        build_git_sha_absence_reason: None,
-        build_lock_digest: None,
-        wire_crate_version: Some("0.13.0".to_string()),
-        store_schema_version: None,
-    });
+    manifest.provenance = Some(
+        subc_protocol::manifest::ManifestProvenance::new()
+            .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
+            .with_wire_crate_version(Some("0.13.0".to_string())),
+    );
 
     let value = manifest_json(manifest);
     assert_eq!(
@@ -2338,6 +2344,14 @@ fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .provenance(Some(
+            subc_protocol::manifest::build_provenance(
+                option_env!("CK_BUILD_REV"),
+                option_env!("CK_BUILD_LOCK_DIGEST"),
+                None,
+            )
+            .expect("build provenance must be canonical"),
+        ))
         .consumes(vec![ConsumerRole::ToolClient { of: Vec::new() }])
         .build()
 }
@@ -2622,6 +2636,7 @@ async fn open_route(
         consumer_identity: consumer_identity_from_env(),
         consumer_capabilities,
         admission_facts: None,
+        scope: None,
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr()?;
@@ -2679,9 +2694,17 @@ fn require_spawn_attestation() -> Result<()> {
     let module_id_present = env::var(SUBC_MODULE_ID_ENV)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
-    let nonce_present = env::var(SUBC_LAUNCH_NONCE_ENV)
-        .map(|value| !value.is_empty())
-        .unwrap_or(false);
+    // The first read of the launch nonce in this process, before it spawns
+    // anything, so no child can inherit the still-unread descriptor. Every
+    // later reader gets the cached value from the same accessor.
+    let nonce_present = subc_os::launch_nonce()
+        .map_err(|error| {
+            other_error(format!(
+                "subc-mcp module requires daemon spawn attestation, and its launch nonce \
+                 could not be read: {error}"
+            ))
+        })?
+        .is_some();
     if module_id_present && nonce_present {
         return Ok(());
     }
@@ -2698,9 +2721,12 @@ fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.is_empty())?;
-    let launch_nonce = env::var(SUBC_LAUNCH_NONCE_ENV)
+    // An accessor error was already a startup refusal in
+    // `require_spawn_attestation`; here it can only mean no identity.
+    let launch_nonce = subc_os::launch_nonce()
         .ok()
-        .filter(|value| !value.is_empty())?;
+        .flatten()
+        .map(|nonce| nonce.value().to_owned())?;
     Some(ConsumerIdentity {
         module_id,
         launch_nonce,
@@ -4559,6 +4585,13 @@ fn route_tool_call_request(
         arguments: serde_json::Value::Object(arguments),
         tool_call_id: None,
         progress_token,
+        // The gateway sends no call key: any key it minted for a host's call
+        // would be its own invention, which it cannot keep stable across
+        // reconnects (the same reason it mints no tool_call_id).
+        call_key: None,
+        // Nor a schema pin: the gateway does not know which schema version
+        // the host built the arguments against.
+        schema_pin: None,
     })
 }
 

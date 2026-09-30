@@ -106,6 +106,8 @@ pub struct BootstrapConfig {
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
+    /// Module ids whose scopes may carry the attributes that grant authority.
+    scope_authority_owners: Vec<String>,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
@@ -155,6 +157,7 @@ impl BootstrapConfig {
             configured_modules: Vec::new(),
             storage_config: None,
             admission_facts: AdmissionFactsConfig::default(),
+            scope_authority_owners: daemon_config::default_scope_authority_owners(),
             daemon_config_path: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
@@ -245,6 +248,10 @@ impl BootstrapConfig {
         let admission_facts_targets = daemon_config
             .as_ref()
             .and_then(|config| config.admission_facts_targets.clone());
+        let scope_authority_owners = daemon_config
+            .as_ref()
+            .map(|config| config.scope_authority_owners.clone())
+            .unwrap_or_else(daemon_config::default_scope_authority_owners);
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -283,6 +290,7 @@ impl BootstrapConfig {
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
+            .with_scope_authority_owners(scope_authority_owners)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port)
@@ -306,6 +314,10 @@ impl BootstrapConfig {
         let admission_facts_targets = daemon_config
             .as_ref()
             .and_then(|config| config.admission_facts_targets.clone());
+        let scope_authority_owners = daemon_config
+            .as_ref()
+            .map(|config| config.scope_authority_owners.clone())
+            .unwrap_or_else(daemon_config::default_scope_authority_owners);
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -320,6 +332,7 @@ impl BootstrapConfig {
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
+            .with_scope_authority_owners(scope_authority_owners)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, configured_port))
@@ -352,6 +365,13 @@ impl BootstrapConfig {
             carrier_module_id,
             targets,
         };
+        self
+    }
+
+    /// Set the module ids whose scopes may carry `agent_id` and `delegates`.
+    /// Absent from a config, this is `daemon_config::default_scope_authority_owners`.
+    pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
+        self.scope_authority_owners = owners;
         self
     }
 
@@ -504,6 +524,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
+    let scope_authority_owners = config.scope_authority_owners.clone();
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
@@ -528,6 +549,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 configured_modules,
                 storage_config,
                 admission_facts,
+                scope_authority_owners,
                 daemon_config_path,
                 configured_port,
                 route_bind_relay_default_ms,
@@ -653,6 +675,7 @@ async fn serve_bound_daemon(
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
+    scope_authority_owners: Vec<String>,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
@@ -786,6 +809,7 @@ async fn serve_bound_daemon(
         .with_storage_config(storage_config)
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
+        .with_scope_authority_owners(scope_authority_owners)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(
             bound.connection_info.pid,
@@ -1523,6 +1547,7 @@ mod tests {
         );
         let capture = temp.join("logs").join(format!("{module_id}.stderr.log"));
         let module = ConfiguredModule {
+            launch_nonce_env: true,
             module_id,
             program: PathBuf::from("sh"),
             args: vec!["-c".to_string(), "sleep 30".to_string()],

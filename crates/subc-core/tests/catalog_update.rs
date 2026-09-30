@@ -166,13 +166,11 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
     let server = TestServer::start().await;
     let module_id = "catalog-update-provider";
     let mut module = connect_endpoint(&server, "module").await;
-    let provenance = ManifestProvenance {
-        build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-        build_git_sha_absence_reason: None,
-        build_lock_digest: Some("lock-digest".to_string()),
-        wire_crate_version: Some("0.13.0".to_string()),
-        store_schema_version: Some("3".to_string()),
-    };
+    let provenance = ManifestProvenance::new()
+        .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
+        .with_build_lock_digest(Some("lock-digest".to_string()))
+        .with_wire_crate_version(Some("0.13.0".to_string()))
+        .with_store_schema_version(Some("3".to_string()));
     let mut initial_manifest =
         tool_provider_manifest(module_id, &["a", "b"], Concurrency::ModuleManaged);
     initial_manifest.provenance = Some(provenance.clone());
@@ -401,6 +399,7 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
     let absent_ready = server.temp_dir.join("supervised-absent-ready");
     let absent = supervisor
         .spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: absent_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -962,6 +961,7 @@ fn route_open_frame(project: &TestProject, module_id: &str, corr: u64) -> Frame 
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         },
     )
 }
@@ -1132,6 +1132,7 @@ async fn open_route(
                 consumer_capabilities: None,
 
                 admission_facts: None,
+                scope: None,
             },
         ))
         .await;
@@ -1310,6 +1311,7 @@ async fn spawn_ready_stub(
     }
     let module = supervisor
         .spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1345,6 +1347,7 @@ async fn route_open_terminal(
                 consumer_identity: None,
                 consumer_capabilities: None,
                 admission_facts: None,
+                scope: None,
             },
         ))
         .await;

@@ -1,8 +1,9 @@
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, closeSync, constants, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import {
   CLIENT_AUTH_DOMAIN,
@@ -22,10 +23,14 @@ import {
   Priority,
   PROTOCOL_VERSION,
   SubcProvider,
+  SubcProviderError,
   type Frame,
   type ManifestInput,
+  type ManifestProvenance,
   type ProviderConnectionState,
+  type SubcProviderConnectOptions,
 } from "../src/index.js";
+import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4b));
@@ -47,9 +52,16 @@ function reconnectInternals(provider: SubcProvider): ProviderReconnectInternals 
 const tempDirs: string[] = [];
 const scriptedDaemons: ScriptedProviderDaemon[] = [];
 
+// The launch nonce is read once per process and cached; these tests change the
+// environment between cases, so each starts from an unread accessor.
+beforeEach(() => {
+  resetLaunchNonceForTests();
+});
+
 afterEach(async () => {
   for (const daemon of scriptedDaemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  resetLaunchNonceForTests();
 });
 
 describe("managementSurfaceManifest", () => {
@@ -85,6 +97,74 @@ describe("managementSurfaceManifest", () => {
         identity: { requires: [], optional: [] },
       },
     });
+  });
+});
+
+describe("SubcProvider draining", () => {
+  test("calls draining with reason and deadline before same-write GOODBYE", async () => {
+    const seen: Array<[string, number]> = [];
+    const deadline = Date.now() + 30_000;
+    await withDrainPeer((reason, date) => { seen.push([reason, date.getTime()]); }, async (provider, socket) => {
+      await writeAll(socket, Buffer.concat([
+        encodeFrame(drainPush("reload", deadline)),
+        encodeFrame(buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0))),
+      ]), Date.now() + 1_000);
+      await provider.closed;
+      expect(seen).toEqual([["reload", deadline]]);
+    });
+  });
+
+  test("a never-settling draining hook does not stop PING being answered", async () => {
+    let calls = 0;
+    await withDrainPeer(() => { calls += 1; return new Promise<void>(() => undefined); }, async (provider, socket, reader) => {
+      await writeFrame(socket, drainPush("restart", Date.now() + 30_000), Date.now() + 1_000);
+      await expectDrainPong(socket, reader);
+      expect(calls).toBe(1);
+      await writeFrame(socket, buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0)), Date.now() + 1_000);
+      await provider.closed;
+    });
+  });
+
+  test("undecodable Push is ignored once per connection and leaves it up", async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args); };
+    const seen: string[] = [];
+    try {
+      await withDrainPeer((reason) => { seen.push(reason); }, async (_provider, socket, reader) => {
+        for (const body of ["{", JSON.stringify({ op: "module.draining", reason: "reload" }), JSON.stringify({ op: "future.command" })]) {
+          await writeFrame(socket, buildFrame(FrameType.Push, CONTROL_FLAGS, 0, 0, 0n, Buffer.from(body)), Date.now() + 1_000);
+        }
+        await writeFrame(socket, buildFrame(FrameType.Push, CONTROL_FLAGS, 9, 1, 0n, encodeJson({ op: "module.draining", reason: "reload", deadline_ms: 123 })), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(seen).toEqual([]);
+        expect(warnings.length).toBe(1);
+        await writeFrame(socket, drainPush("future_reason", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(seen).toEqual(["unknown"]);
+      });
+    } finally { console.warn = originalWarn; }
+  });
+
+  test("throwing or rejecting draining hooks do not end the connection", async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args); };
+    let calls = 0;
+    try {
+      await withDrainPeer(() => {
+        calls += 1;
+        if (calls === 1) throw new Error("sync drain failure");
+        return Promise.reject(new Error("async drain failure"));
+      }, async (_provider, socket, reader) => {
+        await writeFrame(socket, drainPush("disable", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        await writeFrame(socket, drainPush("disable", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(calls).toBe(2);
+        expect(warnings.length).toBe(2);
+      });
+    } finally { console.warn = originalWarn; }
   });
 });
 
@@ -498,6 +578,66 @@ describe("SubcProvider serve loop", () => {
       { channel: 8, epoch: 5 },
     ]);
     expect(provider.liveRoutes.get(8)?.epoch).toBe(5);
+  });
+
+  // A daemon that admits routes under scopes stamps the bind with a `scope`
+  // object this SDK does not know. The provider reads only the fields it knows,
+  // so a module built on this SDK must still accept the bind. The body is the
+  // Rust golden vector, so a change to the stamped shape is checked here too.
+  test("accepts a route.bind stamped with a scope it does not read", async () => {
+    const stamped = JSON.parse(
+      readFileSync(
+        join(
+          import.meta.dir,
+          "../../../crates/subc-protocol/tests/golden/module_control_request_route_bind_with_scope.json",
+        ),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(stamped.scope).toBeDefined();
+
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const bound: { channel: number; epoch: number }[] = [];
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      pending: Map<string, unknown>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { handler: () => Uint8Array; onBound: (handle: RouteHandle) => void };
+      handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.pending = new Map();
+    provider.liveRoutes = new Map();
+    provider.connectionToken = newConnectionToken();
+    provider.opts = {
+      handler: () => new Uint8Array(0),
+      onBound: (handle) => bound.push({ channel: handle.channel, epoch: handle.epoch }),
+    };
+
+    const frame = buildFrameWithVersion(
+      PROTOCOL_VERSION,
+      FrameType.Request,
+      CONTROL_FLAGS,
+      0,
+      0,
+      44n,
+      encodeJson(stamped),
+    );
+    await provider.handleControlRequest(frame, sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Response);
+    expect(bound).toEqual([
+      { channel: stamped.route_channel as number, epoch: stamped.epoch as number },
+    ]);
   });
 
   // onRouteGone is consumer code awaited inside the read loop. A throw from it
@@ -1056,6 +1196,116 @@ describe("SubcProvider closed", () => {
   });
 });
 
+describe("SubcProvider launch nonce", () => {
+  const PROVENANCE: ManifestProvenance = { build_git_sha: "0123456789abcdef0123456789abcdef01234567", wire_crate_version: "0.16.0" };
+  const NO_NONCE_ENV = { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: undefined, SUBC_LAUNCH_NONCE_FD: undefined };
+
+  async function helloFor(
+    env: Record<string, string | undefined>,
+    opts: { provenance?: ManifestProvenance; launchNonce?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    const daemon = await ScriptedProviderDaemon.start();
+    const connFile = writeConnectionFile(trackedTempDir("subc-provider-nonce-"), daemon.port);
+    const manifest = managementSurfaceManifest({ moduleId: "nonce-provider", operations: ["echo"] });
+    const provider = await withEnv({ ...NO_NONCE_ENV, ...env }, () =>
+      SubcProvider.connect({
+        connectionFile: connFile,
+        manifest: opts.provenance === undefined ? manifest : { ...manifest, provenance: opts.provenance },
+        handler: async (_routeChannel, body) => body,
+        ...(opts.launchNonce === undefined ? {} : { launchNonce: opts.launchNonce }),
+      }),
+    );
+    await provider.close();
+    expect(daemon.hellos).toHaveLength(1);
+    return daemon.hellos[0]!;
+  }
+
+  function provenanceOf(hello: Record<string, unknown>): unknown {
+    return (hello.manifest as Record<string, unknown>).provenance;
+  }
+
+  /** A FIFO holding `nonce`, returned as the daemon's `<fd>:<inode>` value for it. */
+  function daemonPipe(nonce: string): string {
+    const path = join(trackedTempDir("subc-provider-fifo-"), "nonce");
+    execFileSync("mkfifo", [path]);
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const writer = openSync(path, constants.O_WRONLY);
+    writeSync(writer, nonce);
+    closeSync(writer);
+    return `${fd}:${BigInt.asUintN(64, fstatSync(fd, { bigint: true }).ino)}`;
+  }
+
+  test("HELLO carries the nonce read from the descriptor and provenance reports fd", async () => {
+    const fdValue = daemonPipe("nonce-from-the-pipe");
+    const hello = await helloFor(
+      { SUBC_LAUNCH_NONCE_FD: fdValue, SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      { provenance: PROVENANCE },
+    );
+    expect(hello.launch_nonce).toBe("nonce-from-the-pipe");
+    expect(provenanceOf(hello)).toEqual({ ...PROVENANCE, launch_nonce_source: "fd" });
+  });
+
+  test("HELLO carries the environment copy when no descriptor is named and provenance reports env", async () => {
+    const hello = await helloFor({ SUBC_LAUNCH_NONCE: "nonce-from-the-environment" }, { provenance: PROVENANCE });
+    expect(hello.launch_nonce).toBe("nonce-from-the-environment");
+    expect(provenanceOf(hello)).toEqual({ ...PROVENANCE, launch_nonce_source: "env" });
+  });
+
+  test("provenance is sent only when declared, and a declared source is kept", async () => {
+    const undeclared = await helloFor({ SUBC_LAUNCH_NONCE: "n1" });
+    expect("provenance" in (undeclared.manifest as Record<string, unknown>)).toBe(false);
+
+    resetLaunchNonceForTests();
+    const declared = await helloFor({ SUBC_LAUNCH_NONCE: "n2" }, { provenance: { launch_nonce_source: "fd" } });
+    expect(provenanceOf(declared)).toEqual({ launch_nonce_source: "fd" });
+  });
+
+  test("no source is reported without a nonce, or for a nonce the caller supplied", async () => {
+    const none = await helloFor({}, { provenance: PROVENANCE });
+    expect("launch_nonce" in none).toBe(false);
+    expect(provenanceOf(none)).toEqual(PROVENANCE);
+
+    resetLaunchNonceForTests();
+    const supplied = await helloFor(
+      { SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      { provenance: PROVENANCE, launchNonce: "handed-over-by-a-parent" },
+    );
+    expect(supplied.launch_nonce).toBe("handed-over-by-a-parent");
+    expect(provenanceOf(supplied)).toEqual(PROVENANCE);
+  });
+
+  test("a refused descriptor fails connect with a typed error before HELLO, never the environment copy", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const connFile = writeConnectionFile(trackedTempDir("subc-provider-nonce-"), daemon.port);
+    const attempt = withEnv(
+      { SUBC_MODULE_ID: "nonce-provider", SUBC_LAUNCH_NONCE_FD: "not-a-descriptor", SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      () =>
+        SubcProvider.connect({
+          connectionFile: connFile,
+          manifest: managementSurfaceManifest({ moduleId: "nonce-provider", operations: ["echo"] }),
+          handler: async (_routeChannel, body) => body,
+        }),
+    );
+
+    const error = await attempt.then(
+      () => {
+        throw new Error("connect should have refused");
+      },
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(SubcProviderError);
+    const providerError = error as SubcProviderError;
+    expect(providerError.code).toBe("launch_nonce_unavailable");
+    expect(providerError.detail).toEqual({ kind: "Malformed" });
+    expect(providerError.cause).toBeInstanceOf(LaunchNonceError);
+    expect(providerError.message).toBe(
+      'launch nonce unavailable: SUBC_LAUNCH_NONCE_FD="not-a-descriptor" is not <fd>:<inode>',
+    );
+    expect(daemon.helloCount).toBe(0);
+    expect(daemon.hellos).toHaveLength(0);
+  });
+});
+
 /** Runs `fn` with the given variables set (or unset when undefined), then restores them. */
 async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved = new Map<string, string | undefined>();
@@ -1349,6 +1599,8 @@ type HelloResult = "ack" | "drop" | { code: string; message: string };
 class ScriptedProviderDaemon {
   readonly sockets = new Set<Socket>();
   helloCount = 0;
+  /** Every HELLO body received, parsed, in arrival order. */
+  readonly hellos: Array<Record<string, unknown>> = [];
   private readonly waiters: Array<{ count: number; resolve: () => void }> = [];
   private stopped = false;
 
@@ -1413,6 +1665,7 @@ class ScriptedProviderDaemon {
     expect(hello.header.ty).toBe(FrameType.Hello);
     expect(hello.header.channel).toBe(0);
     expect(hello.header.corr).toBe(HELLO_CORR);
+    this.hellos.push(JSON.parse(Buffer.from(hello.body).toString("utf8")) as Record<string, unknown>);
 
     const result = this.helloResults.shift() ?? "ack";
     if (result === "ack") {
@@ -1608,4 +1861,57 @@ async function waitForCondition(predicate: () => boolean, label: string, timeout
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+function drainPush(reason: string, deadline_ms: number): Frame {
+  return buildFrame(FrameType.Push, CONTROL_FLAGS, 0, 0, 0n, encodeJson({ op: "module.draining", reason, deadline_ms }));
+}
+
+async function expectDrainPong(socket: Socket, reader: SocketReader): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  await writeFrame(socket, buildFrame(FrameType.Ping, CONTROL_FLAGS, 0, 0, 77n, new Uint8Array(0)), deadline);
+  const pong = await readFrame(reader, deadline);
+  expect(pong.header.ty).toBe(FrameType.Pong);
+  expect(pong.header.corr).toBe(77n);
+}
+
+async function withDrainPeer(
+  onDraining: NonNullable<SubcProviderConnectOptions["onDraining"]>,
+  run: (provider: SubcProvider, socket: Socket, reader: SocketReader) => Promise<void>,
+): Promise<void> {
+  const server = await listenFakeServer();
+  const dir = trackedTempDir("subc-provider-drain-");
+  let socket: Socket | undefined;
+  const peer = new Promise<SocketReader>((resolve, reject) => {
+    server.server.once("connection", (connected) => {
+      socket = connected;
+      const reader = new SocketReader(connected);
+      void (async () => {
+        const deadline = Date.now() + 1_000;
+        await authenticateFakeServer(reader, connected, deadline);
+        const hello = await readFrame(reader, deadline);
+        await writeFrame(connected, buildFrame(FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
+          negotiated_ver: PROTOCOL_VERSION, subc_ops: [], subc_capabilities: [],
+        })), deadline);
+        resolve(reader);
+      })().catch(reject);
+    });
+  });
+  let provider: SubcProvider | undefined;
+  try {
+    const [connected, reader] = await Promise.all([
+      SubcProvider.connect({
+        connectionFile: writeConnectionFile(dir, server.port),
+        manifest: managementSurfaceManifest({ moduleId: "drain-provider", operations: ["echo"] }),
+        handler: (_handle, body) => body, onDraining, launchNonce: "", reconnectOnDrop: false,
+      }),
+      peer,
+    ]);
+    provider = connected;
+    await run(provider, socket!, reader);
+  } finally {
+    await provider?.close();
+    socket?.destroy();
+    server.server.close();
+  }
 }

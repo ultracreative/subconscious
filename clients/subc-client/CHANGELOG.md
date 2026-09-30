@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.19.0 — 2026-09-30
+
+- Add optional `onDraining(reason: RouteCloseReason, deadline: Date)` to `SubcProviderConnectOptions`. Channel-0 `module.draining` Push notices start the callback without waiting for completion, so PING and GOODBYE keep flowing. GOODBYE and connection-end reporting wait at most 2 seconds for hooks to start. Throws and rejections are contained; unknown reasons arrive as `unknown`. Undecodable channel-0 Push frames are ignored with one warning per connection.
+- Document the wall-clock deadline as a no-later-than bound. To keep draining open for background work, declare a Busy self-signal in the manifest that names health gauges (work counters), and report them above zero in health metrics until work finishes; the daemon waits for those counters to reach zero or for its deadline.
+
+## 0.18.1 — 2026-09-30
+
+- `isRetryableRouteOpenCode` treats `scope_not_synced` and `scope_changed` as retryable, following the shared `decision_tables.json` record. The daemon returns them for scoped `route.open` requests: the first when the scope's owner has not re-synced since a daemon restart, the second when the scope changed between admission and commit. In both cases nothing was sent. Daemons that do not support scopes never return either code.
+
+## 0.18.0 — 2026-09-30
+
+- Add `launchNonce()`, the one reader of the launch nonce, matching `subc_os::launch_nonce` in Rust. When `SUBC_LAUNCH_NONCE_FD=<fd>:<inode>` is set (not on Windows) it takes the named descriptor only if it is a pipe with that inode holding bytes, reads it to end of file and closes it; a closed descriptor, a non-pipe, a different pipe, an empty pipe or a malformed value throws `LaunchNonceError` (`kind` `NotOpen`, `NotAPipe`, `WrongPipe`, `Empty`, `Malformed`; also `Unreadable`, `NotUtf8`), leaves the descriptor untouched and never falls back to `SUBC_LAUNCH_NONCE`. Without the variable it reads `SUBC_LAUNCH_NONCE`. The answer and its source (`fd` or `env`) are cached for the process, shared by every copy of the package in the same realm, and `process.env` is never changed. Also exported: `launchNonceOrUndefined`, `isLaunchNonceError`, `SUBC_LAUNCH_NONCE_FD_ENV`, `LAUNCH_NONCE_FD` and the `LaunchNonce`, `LaunchNonceSource`, `LaunchNonceErrorKind` types.
+- Unlike the Rust accessor, which counts the waiting bytes with FIONREAD, the emptiness check is a first read (Node and Bun expose no FIONREAD). At end of file it returns nothing and consumes nothing, so an empty pipe is still refused untouched; but if the pipe's write end were still open somewhere, an empty blocking pipe would block that read instead of reporting `Empty`. The daemon closes the write end before spawning the module.
+- `SubcProvider.connect()` reads the HELLO nonce through the accessor. A refused descriptor rejects `connect()` with a `SubcProviderError` coded `launch_nonce_unavailable` (`detail.kind` and `cause` carry the accessor error, the message matches the Rust SDK's) before anything is sent. A provider counts as supervised when `SUBC_MODULE_ID` is set and the accessor holds a nonce.
+- `route.open` takes its consumer identity nonce from the accessor; a refused descriptor opens the route without identity.
+- `ManifestInput` gains optional `provenance` (`ManifestProvenance`, mirroring subc-protocol), sent in HELLO only when declared. When declared without `launch_nonce_source`, the provider fills it with the accessor's source if the accessor holds the nonce HELLO sends.
+- Behaviour change for tools a module spawns: once the module has read the descriptor, a process it spawns inherits `SUBC_LAUNCH_NONCE_FD` without the pipe, so its accessor refuses (`NotOpen`, `NotAPipe` or `WrongPipe`) instead of silently acting as the module with the inherited `SUBC_LAUNCH_NONCE`.
+
 ## 0.17.0 — 2026-09-28
 
 - Managed calls now keep retrying a retryable `route.open` refusal for up to 90s instead of 30s (`ROUTE_OPEN_RETRY_DEADLINE_MS`). A module restart drains its routes (up to 30s), waits for the old process to stop, then boots the new one; one measured restart kept routes refused for 62.5s, which the old deadline gave up on. A call that passes `timeoutMs` stops retrying at that timeout when it comes first, and a call waiting on another call's in-flight open of the same route also stops at its own `timeoutMs`.

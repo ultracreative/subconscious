@@ -1325,6 +1325,7 @@ impl CkClient {
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         };
         let value = self.rpc_value(request).await?;
         match serde_json::from_value::<ClientControlResponse>(value)? {
@@ -3029,6 +3030,13 @@ async fn provenance(
             println!(
                 "  store schema version: {}",
                 provenance_value(build.get("store_schema_version"))
+            );
+            // Whether this module read its launch nonce from the daemon's pipe
+            // (`fd`) or from the environment copy (`env`). Owners check it before
+            // the environment copy is withdrawn.
+            println!(
+                "  launch nonce source: {}",
+                provenance_value(build.get("launch_nonce_source"))
             );
         }
         _ => println!("  unverifiable"),
@@ -6244,6 +6252,9 @@ fn print_status_table(
     // exactly as it did before this field existed.
     if declares_no_protocol(module) {
         println!("  protocol: none");
+    }
+    if let Some(value) = module.get("launch_nonce_env").and_then(Value::as_bool) {
+        println!("  launch_nonce_env: {value}");
     }
     println!("  resources: {}", format_child_resources(module));
     println!("  last exit: {}", format_last_exit(module));

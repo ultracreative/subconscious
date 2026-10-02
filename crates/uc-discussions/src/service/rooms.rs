@@ -174,47 +174,61 @@ impl RoomsService {
             require_non_empty("reply_to_post_id", reply_to_post_id)?;
         }
 
-        {
-            let connection = self.storage.lock_connection()?;
-            require_active_room(&connection, &req.room_id)?;
-            let bound_incarnation = connection
-                .query_row(
-                    "SELECT incarnation FROM room_members WHERE room_id = ?1 AND member_id = ?2",
-                    params![req.room_id, req.author],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()?;
-            if let Some(Some(expected)) = bound_incarnation {
-                if req.incarnation != Some(expected) {
-                    return Err(ServiceError::StaleIncarnation {
-                        room_id: req.room_id.clone(),
-                        member_id: req.author.clone(),
-                        expected,
-                        received: req.incarnation,
-                    });
-                }
-            }
-            if let Some(reply_to_post_id) = req.reply_to_post_id.as_deref() {
-                require_post_in_room(&connection, &req.room_id, reply_to_post_id)?;
+        let mut connection = self.storage.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_room(&transaction, &req.room_id)?;
+        let bound_incarnation = transaction
+            .query_row(
+                "SELECT incarnation FROM room_members WHERE room_id = ?1 AND member_id = ?2",
+                params![req.room_id, req.author],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        if let Some(Some(expected)) = bound_incarnation {
+            if req.incarnation != Some(expected) {
+                return Err(ServiceError::StaleIncarnation {
+                    room_id: req.room_id.clone(),
+                    member_id: req.author.clone(),
+                    expected,
+                    received: req.incarnation,
+                });
             }
         }
+        if let Some(reply_to_post_id) = req.reply_to_post_id.as_deref() {
+            require_post_in_room(&transaction, &req.room_id, reply_to_post_id)?;
+        }
+
+        #[cfg(test)]
+        post_tests::post_admitted();
 
         let post_id = format!("post-{}", Uuid::new_v4());
-        let seq = self.storage.insert_room_post(
-            &req.room_id,
-            &post_id,
-            &req.author,
-            &req.post_type,
-            &req.content,
-            req.reply_to_post_id.as_deref(),
+        let seq = transaction.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM room_posts WHERE room_id = ?1",
+            params![req.room_id],
+            |row| row.get::<_, i64>(0),
         )?;
-        let connection = self.storage.lock_connection()?;
-        let post = connection.query_row(
+        transaction.execute(
+            "INSERT INTO room_posts (
+                room_id, seq, post_id, author, post_type, content, reply_to_post_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                req.room_id,
+                seq,
+                post_id,
+                req.author,
+                req.post_type,
+                req.content,
+                req.reply_to_post_id,
+                now_timestamp()
+            ],
+        )?;
+        let post = transaction.query_row(
             "SELECT seq, post_id, author, post_type, content, reply_to_post_id, created_at
              FROM room_posts WHERE post_id = ?1",
             params![post_id],
             room_post_from_row,
         )?;
+        transaction.commit()?;
 
         Ok(PostRoomResponse { post, seq })
     }
@@ -763,6 +777,9 @@ fn invalid_json(context: &str, error: serde_json::Error) -> ServiceError {
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
+
+#[cfg(test)]
+mod post_tests;
 
 #[cfg(test)]
 mod tests {

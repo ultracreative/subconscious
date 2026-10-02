@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::sync::RwLock;
+use std::sync::{RwLock, TryLockError};
 
 use cortexkit_store_types::StorageDescriptor;
 use serde::{de::DeserializeOwned, Serialize};
@@ -281,9 +281,23 @@ impl ModuleHandler for DiscussionsHandler {
     }
 
     async fn health(&self) -> HealthReport {
+        let (status, detail) = match self.storage_error.try_read() {
+            Ok(storage_error) => match storage_error.as_ref() {
+                Some(message) => (HealthStatus::Failing, message.clone()),
+                None => (HealthStatus::Ok, "uc-discussions operational".to_owned()),
+            },
+            Err(TryLockError::WouldBlock) => (
+                HealthStatus::Degraded,
+                "discussions storage initialization status is being updated".to_owned(),
+            ),
+            Err(TryLockError::Poisoned(_)) => (
+                HealthStatus::Failing,
+                "discussions storage error lock is poisoned".to_owned(),
+            ),
+        };
         HealthReport {
-            status: HealthStatus::Ok,
-            detail: Some("uc-discussions operational".into()),
+            status,
+            detail: Some(detail),
             metrics: None,
         }
     }

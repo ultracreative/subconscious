@@ -10,11 +10,11 @@ This document defines the canonical Arcus v0.4.0 packaging, dist directory hiera
 
 ### Invariants & Boundaries
 
-1. **Self-Contained Submission Bundles**: Releasing software via Arcus emits an immutable submission bundle to `dist/<version>/<sequence>/<component>/`.
+1. **Self-Contained Submission Bundles**: Releasing software via Arcus emits an immutable submission bundle to `dist/<sequence>/<package>/<version>/`.
 2. **Strict Submodule Prohibition**: Consuming projects must **never** vendor the `arcus` repository as a git submodule and must **never** attempt direct git commits or pushes to an Arcus checkout. All publisher tooling is managed through `packages/arcus/bootstrap.sh` which links against the Arcus-managed `arcus-publisher` toolchain (`arcus install arcus-publisher`).
 3. **Gateway Ingestion & Hydration**: Submission to the gateway is performed over authenticated HTTPS using `arcus publish submit <bundle_dir>`.
-4. **Anti-Rollback Sequence Enforcement**: Monotonic sequence numbers strictly increase per package release. Coordinated multi-component suites share a single unified sequence to guarantee release-set atomicity.
-5. **Distinct Digest Triples**: For every target platform payload, `arcus pack` computes and validates distinct SHA-256 hashes across the payload archive (`.tar.zst`), content source (`-content.zip`), and Wharf tree signature (`.pwr`).
+4. **Anti-Rollback Sequence Enforcement**: Monotonic sequence numbers strictly increase per package release. Coordinated multi-component suites share a single unified sequence to guarantee release-set atomicity across packages. Note that a shared build sequence confirms coordinated pipeline staging, but is not proof of cross-package atomic catalog promotion on the gateway.
+5. **Distinct Digest Triples & Release Dimensions**: For every target platform payload, `arcus pack` computes and validates distinct SHA-256 hashes across the payload archive (`.tar.zst`), content source (`-content.zip`), and Wharf tree signature (`.pwr`). Release tracking distinguishes crate version, package display version, source revision, sequence, and binary digest.
 
 ---
 
@@ -48,10 +48,9 @@ dist/
 ```
 
 ### Why Sequence-First Organization is Critical:
-- **Sequence is the true immutable timeline**: Filesystem sorting by `<sequence>` directly reflects the release timeline and catalog promotion order, whereas sorting by SemVer breaks when components have different version cadences (e.g., `0.20.35` vs `0.1.10`).
-- **Whole-submission atomic staging**: A single folder (`dist/<sequence>/`) contains the complete immutable set of packages and descriptors that ship together in that suite release.
+- **Sequence is the true immutable timeline**: Filesystem sorting by `dist/<sequence>/<package>/<version>/` directly reflects the release timeline and catalog promotion order, whereas sorting by SemVer breaks when components have different version cadences (e.g., `0.20.35` vs `0.1.10`).
+- **Whole-submission atomic staging**: A single folder (`dist/<sequence>/`) contains the complete immutable set of packages and descriptors that ship together in that suite release. Note: shared sequence staging coordinates the build output, but catalog promotion across multiple packages depends on gateway intake policies.
 - **No ambiguity**: When Arcus intake tools ingest or audit submission bundles, there is zero confusion about which version belongs to which sequence.
-
 ### Distributed Artifact Inventory
 
 | Component ID | Software Type | Action ID | Action Executable | Action Type | Description |
@@ -69,11 +68,10 @@ For coordinated multi-artifact releases across `subconscious`, the release orche
 
 $$\text{suite\_seq} = \max_{c \in \text{suite}}(\text{catalog\_seq}(c)) + 1$$
 
-- **Strict Monotonicity**: Sequence must ALWAYS increment up and **never reset to 1**.
+- **Strict Monotonicity**: Sequence must ALWAYS increment up and **never reset to 1**. Avoid hardcoding fixed sequences (such as `seq-1`) in examples or release automation.
 - **Anti-Rollback Guarantee**: Arcus client anti-rollback rules enforce $\text{requested.sequence} > \text{installed.sequence}$.
-- **Compatibility Lock**: Immediate proof that all binaries in `dist/<sequence>/` came from the exact same unified suite build.
+- **Compatibility Lock**: Proof that all binaries in `dist/<sequence>/` came from the same coordinated suite build run.
 - **Eliminates Drift**: Addons and daemons do not develop mismatched per-component sequence skew.
-
 ---
 
 ## 4. Agent Instructions & Lifecycle Commands
@@ -107,8 +105,8 @@ bun run bootstrap:arcus
 #### Step 2: Build and Package All Components
 ```bash
 bun run pack:arcus
-# or with explicit version/sequence:
-sh scripts/pack-all-arcus.sh --version 0.20.8 --sequence 1
+# or with explicit version and monotonic sequence:
+sh scripts/pack-all-arcus.sh --version <version> --sequence <next_seq>
 ```
 - Compiles release binaries with Cargo (`cargo build --release`).
 - Stages binaries and runs `arcus pack` to emit signed envelopes and distinct digest triples.
@@ -117,7 +115,7 @@ sh scripts/pack-all-arcus.sh --version 0.20.8 --sequence 1
 
 #### Step 3: Validate Release Assets
 ```bash
-sh scripts/validate-arcus.sh dist/0.20.8/1/ck-subc/releases/ck-subc-0.20.8-1.json
+sh scripts/validate-arcus.sh dist/<sequence>/ck-subc/<version>/releases/ck-subc-<version>-<sequence>.json
 ```
 - Fail-closed verification of Ed25519 signatures, payload targets, and hash manifests.
 
@@ -126,10 +124,9 @@ sh scripts/validate-arcus.sh dist/0.20.8/1/ck-subc/releases/ck-subc-0.20.8-1.jso
 There are two submission paths depending on gateway feature deployment:
 
 1. **Active Direct Ingestion (Today)**:
-   - Deliver the generated bundle path under `dist/<version>/<sequence>/<component>/` via mailbox to `arcus` (`arcus-a3e4dd68`).
+   - Deliver the generated bundle path under `dist/<sequence>/<package>/<version>/` via mailbox to `arcus` (`arcus-a3e4dd68`).
    - The Arcus owner executes intake via `scripts/arcus-accept-submission.sh <bundle-dir> --commit --push`.
    - Requires `"gateway": "https://arcus-auth.rustybret.com"` declared in `packages/arcus/*.json` for dynamic sequence allocation.
-
 2. **Automated HTTPS Submission (`arcus publish submit` / Arcus 0.4.1)**:
    - When Cloudhome deploys `POST /v1/publish` on the gateway and Arcus 0.4.1 ships:
      ```bash
@@ -137,7 +134,7 @@ There are two submission paths depending on gateway feature deployment:
      sh packages/arcus/toolchain/scripts/arcus-pipeline.sh all --submit
 
      # Or via direct CLI:
-     arcus publish submit dist/0.20.8/1/ck-subc/ --wait
+     arcus publish submit dist/<sequence>/ck-subc/<version>/ --wait
      ```
    - Running `bun run bootstrap:arcus` will automatically update `packages/arcus/toolchain` to enable `--submit` natively once released.
 

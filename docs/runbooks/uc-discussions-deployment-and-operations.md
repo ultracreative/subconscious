@@ -51,15 +51,20 @@ The `uc-discussions` service provides CortexKit agent environments with durable 
 
 ## 2. How to Deploy
 
-The `uc-discussions` service ships as a compiled Rust binary named `ck-uc-discussions`. Operators can run it as an optional managed component within UC Studio (UCS), supervise it through platform init systems, or invoke the standalone binary directly.
+The `uc-discussions` service ships as a compiled Rust binary named `ck-uc-discussions`.
+In standard deployment, `ck-uc-discussions` runs as a supervised module under the
+`ck-subc` process fabric rather than a disconnected service manager. When spawned
+by `ck-subc`, the supervisor injects `SUBC_MODULE_ID` and passes `--subc <connection-file>`
+pointing to the authenticated daemon connection file.
 
 ### Binary Information
 
-- **Canonical Path**: `/Volumes/Topper2TB/.cargo-target/release/ck-uc-discussions`
-- **Architecture**: Mach-O 64-bit executable arm64 (macOS Apple Silicon)
-- **Codesigning**: Hardened runtime enabled (`flags=0x10000(runtime)`), signed under designated authority `Arcus Local Dev`.
-
-### Method A: UC Studio Configuration Toggle
+- **Release Binary**: `ck-uc-discussions`
+- **Target Architecture**: Platform release binary (e.g. `darwin-arm64`, `linux-x64`)
+- **Invocation Contract**: Requires `--subc <connection-file-path>`. Default connection file discovery is not implemented by this binary; the Rust SDK entrypoint explicitly parses `--subc <path>` from arguments.
+- **Supervision Model**: Supervised child module under `ck-subc`. Prefer the existing `subc` supervision path over separate service managers.
+- **Authority Boundary**: The daemon owns deliberation room state, attributable membership, ordered posts, and active SQLite leases. It does not own host launch or model selection.
+- **Release Artifact Triple**: Distinguish crate version, package display version, source revision, monotonic sequence, and binary digest across release records. Unverified machine-specific codesigning assertions must not be claimed as universal release invariants.
 
 Within UC Studio, `uc-discussions` is registered as an optional bundled daemon. It stays disabled by default so minimal setups don't spawn idle services.
 
@@ -82,11 +87,16 @@ When `components.discussions_daemon.enabled` is `true`:
 
 Setting the field to `false` disables startup. In-flight calls finish cleanly, the module sends a `Goodbye` frame on channel 0, releases open leases, and shuts down without corrupting SQLite state.
 
-### Method B: macOS LaunchAgent
+### Method B: Supervised Module under `ck-subc` (Preferred)
 
-For persistent workstation operation on macOS, install a LaunchAgent plist in the user domain. This runs without root privileges and starts on graphical user login.
+Because `ck-uc-discussions` is a `subc` module, the canonical supervision path is
+via `ck-subc` module supervision rather than an uncoordinated external init script.
+The daemon supervises the process lifecycle, manages graceful drains, reaps
+cgroups on Linux, and injects the ephemeral connection argument `--subc <connection-file>`.
 
-1. Create `~/Library/LaunchAgents/com.cortexkit.uc-discussions.plist`:
+If launching via a process supervisor or user service (e.g. macOS launchd):
+
+1. Configure the argument list to include `--subc`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -97,7 +107,9 @@ For persistent workstation operation on macOS, install a LaunchAgent plist in th
     <string>com.cortexkit.uc-discussions</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Volumes/Topper2TB/.cargo-target/release/ck-uc-discussions</string>
+        <string>/usr/local/bin/ck-uc-discussions</string>
+        <string>--subc</string>
+        <string>/Users/USER/.local/share/cortexkit/run/subc-connection.json</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -107,9 +119,9 @@ For persistent workstation operation on macOS, install a LaunchAgent plist in th
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/brethoffman/.local/share/cortexkit/uc-discussions/stdout.log</string>
+    <string>/Users/USER/.local/share/cortexkit/uc-discussions/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/brethoffman/.local/share/cortexkit/uc-discussions/stderr.log</string>
+    <string>/Users/USER/.local/share/cortexkit/uc-discussions/stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
@@ -118,7 +130,6 @@ For persistent workstation operation on macOS, install a LaunchAgent plist in th
 </dict>
 </plist>
 ```
-
 2. Load and start the service:
 
 ```bash
@@ -151,7 +162,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/Volumes/Topper2TB/.cargo-target/release/ck-uc-discussions
+ExecStart=%h/.local/bin/ck-uc-discussions --subc %h/.local/share/cortexkit/run/subc-connection.json
 Restart=on-failure
 RestartSec=3s
 Environment=RUST_LOG=info,uc_discussions=debug
@@ -161,7 +172,6 @@ StandardError=append:%h/.local/share/cortexkit/uc-discussions/stderr.log
 [Install]
 WantedBy=default.target
 ```
-
 2. Enable and start:
 
 ```bash
@@ -173,15 +183,20 @@ systemctl --user status ck-uc-discussions.service
 
 ### Method D: Standalone Binary Execution
 
-For debugging, performance benchmarking, or test environments, you can run the binary directly in a terminal:
+For local testing, debugging, or validation, run the compiled binary directly.
+Because default connection file discovery is not implemented by `ck-uc-discussions`,
+you must pass the connection file explicitly via `--subc`:
 
 ```bash
-RUST_LOG=debug /Volumes/Topper2TB/.cargo-target/release/ck-uc-discussions
+# Using standard connection file location (with prod_data_home fallback on macOS)
+SUBC_CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
+
+RUST_LOG=debug ck-uc-discussions --subc "$SUBC_CONN"
 ```
 
-The process reads daemon connection tokens from the standard CortexKit connection file (`~/.local/share/cortexkit/subc.json` or `$XDG_DATA_HOME/cortexkit/subc.json`), registers its manifest on channel 0, and begins accepting queries and mutations.
-
----
+The process reads daemon connection tokens from the specified connection file,
+completes the transport handshake, registers its manifest on channel 0, and
+begins accepting requests.
 
 ## 3. How to Use
 
@@ -432,15 +447,14 @@ sqlite3 "$DB" "SELECT council_id, member_name, status, error_text FROM council_m
 
 ### Arcus Release Validation
 
-The package envelope must conform to Arcus distribution specifications before publication. Run the official validator script from the `uc-studio` toolchain:
+The package envelope must conform to Arcus distribution specifications before publication. Run the release validator script:
 
 ```bash
-ENVELOPE="/Volumes/Topper2TB/Git/uc-studio/manifests/v2/uc-discussions/releases/uc-discussions-0.1.0.json"
-TOOLCHAIN="/Volumes/Topper2TB/Git/uc-studio/packages/arcus/toolchain/scripts/validate-arcus.sh"
+ENVELOPE="dist/<sequence>/ck-uc-discussions/<version>/releases/ck-uc-discussions-<version>-<sequence>.json"
+TOOLCHAIN="packages/arcus/toolchain/scripts/validate-arcus.sh"
 
 sh "$TOOLCHAIN" --body-only "$ENVELOPE"
 ```
-
 The validator confirms:
 1. Strict inequality across the distinct digest triples (`archive_sha256 != target_content_source.sha256 != tree_signature.sha256`).
 2. Exact matching between declared archive sizes and compressed assets.

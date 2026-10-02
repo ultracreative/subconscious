@@ -31,7 +31,7 @@ This will:
 
 ## Packaging & Publishing
 
-To package all suite components under `dist/<version>/<sequence>/<component>/`:
+To package all suite components under `dist/<sequence>/<package>/<version>/`:
 
 ```sh
 bun run pack:arcus

@@ -5,6 +5,21 @@ the end-state and narrowed ownership per the program's
 "design room → athena → spec campaign"
 (`docs/designs/module-lifecycle-authority.md`, commit `3386a93`).
 
+Historical record note: Historical claims from 2026-09-23 deliberation design
+are preserved below as dated observations. Upstream wire interactions remain
+unverified, while local storage and lifecycle mechanisms are established.
+
+## Current Local Status
+
+| Subsystem / Capability | Upstream Observed State (Dated) | Current Local Implementation (Repo State) | Authority Boundary / Verification Status |
+|---|---|---|---|
+| Deliberation room state | `rooms.*` observed in `fleet-surface.md` (2026-09-21) | `ck-uc-discussions` durable SQLite storage (schema v2) | Daemon owns room state, ordered posts, membership, and leases. Not host launch or model selection. |
+| Incarnation fence | In-memory registration record fence discussed upstream | Durable schema-2 column on `room_members` table | Implemented in migration 002. Enforced at `rooms.post` (`stale_incarnation`). Local durable fence differs from upstream in-memory idiom. |
+| Member identity & binding | `agent.resolve` to `prefrontal-host:<pid>` | `rooms.join` + `rooms.bind_member` with `project_id`, `session_id`, `incarnation` | Local binding stores explicit session metadata. Upstream registry resolution remains unverified. |
+| Upstream fan-out & wake wire | `wake.*`, `manager.launch`, `run_channel_wake_sweep` | Host-side orchestration via `project-room-host.ts` | Upstream wire signatures, sweep mechanics, and fan-out vs broadcast remain unverified. |
+| Host launch & model selection | `route.select_panel`, `manager.prompt` | Host layer (`project_room` / OpenCode host) | Host layer owns process launch and model assignment. Daemon does not own host launch or model selection. |
+| Concurrency & claims | `peer.claim_undelivered` / `reset_claim` | SQLite `leases` table with WAL mode and TTL renewal | Preserved in local SQLite schema. Leases remain active and tested; not subsumed or removed. |
+
 Evidence base: `docs/evidence/auto-wake-deliberation-evidence-bundle.md`. Every
 claim below marked **[E-n]** cites a finding there; claims without a marker are
 mine and are the ones a review should attack first.
@@ -88,7 +103,9 @@ asymmetric — retiring a departed member MUST NOT delete undelivered messages.
 Plus the house idiom for staleness: the **incarnation fence** [E-6]. Monotonic,
 bumped on every (re)registration; a caller holding N cannot move a record that
 advanced to N+1; an actor that went away and came back is a *different* actor.
-In-memory, admission-and-status only, not a durability change.
+Note on durability: while upstream discussions described an in-memory
+admission-and-status fence, the local implementation binds incarnation directly
+to durable schema-2 storage in `room_members.incarnation`.
 
 ## The ladder
 
@@ -187,10 +204,12 @@ review should rule before any slice is commissioned.
    evidence bundle. The ladder above assumes fan-out. If it is broadcast, rung 3
    changes shape.
 2. **No wake op signatures anywhere in the fleet.** The policy cascade is
-   specified [E-4]; the wire shape of the wake call is not. Two named plan files —
-   `.cortexkit/alfonso/plans/unified-waker-v1.md` and
-   `prefrontal/.cortexkit/alfonso/plans/scheduled-wake-v1.md` — would answer this
-   directly. Searched: all 27 `.cortexkit/` directories across the fleet checkout.
+5. **Whether rung 5 subsumes our `leases` table.** Upstream has
+   `peer.claim_undelivered`/`reset_claim` at op level [E-4c]. In the current
+   local implementation, the SQLite `leases` table is explicitly preserved and
+   maintained alongside schema-2 incarnation fencing, handling speaking floor
+   and concurrency claims with active TTL renewal. The daemon owns this room
+   state directly; host launch and model selection remain outside the daemon.
    Three carry `alfonso/` (`magic-context`, `aft`, `lore-wt/e2e-magic-context`);
    none carries a `plans/` subdirectory, and neither named file exists. This is a
    verified absence, not an unsearched gap.

@@ -382,13 +382,24 @@ with bounded backoff.
 
 ---
 
-## Local backfill implementation evidence
+## Local backfill implementation evidence and current status
 
-The UCS backfill now proves the missing end-to-end behavior without moving
-launcher authority into `uc-discussions`:
+### Current Local Status Table
+
+| Capability | Historical Upstream Finding (Dated 2026-09-22) | Local Backfill State | Authority Boundary & Verification Status |
+|---|---|---|---|
+| Room State & Member Fence | In-memory registration record fence discussed | Schema-2 durable storage (`room_members.incarnation`) | Daemon owns room state, ordered posts, membership, and leases. Stale incarnations rejected at `rooms.post`. |
+| Upstream Fan-Out Wire | `rooms.*` in `fleet-surface.md` (unspecified broadcast vs push) | Host orchestration via `project-room-orchestrator.ts` | Upstream fan-out wire signatures remain explicitly unverified; does not block store or lifecycle fixes. |
+| Wake Wire Signatures | `wake.*` / `agent.wake` referenced in specs | Host process launch (`opencode serve`) via `project-room-host.ts` | Upstream wake wire signatures and registry availability remain unverified. |
+| Registry Module | `agent.resolve` in external module | Local explicit session binding (`rooms.bind_member`) | Upstream registry module is absent locally; local schema binds session metadata directly. |
+| Host Launch & Model Selection | `route.select_panel` / `manager.launch` | Host layer (`project_room` / OpenCode host) | Daemon owns room state; daemon does not own host launch or model selection. |
+| Concurrency & Leases | `peer.claim_undelivered` / `reset_claim` | SQLite `leases` table with WAL mode and TTL renewal | Preserved in local SQLite store; leases remain active and verified by tests. |
+
+The UCS backfill proves end-to-end behavior without moving launcher authority
+or model selection into `uc-discussions`:
 
 - `crates/uc-discussions/tests/auto_wake_acceptance_test.rs` proves durable
-  session binding and rejects a stale pre-wake incarnation.
+  session binding and rejects a stale pre-wake incarnation against schema 2.
 - `packages/omo-opencode/src/features/discussions/project-room-host.ts` owns
   endpoint recovery, `opencode serve` launch, session creation, agent/model
   selection, and interrupt/enqueue/background delivery.
@@ -401,5 +412,6 @@ launcher authority into `uc-discussions`:
   from `offline` to `live` and stored the full room at
   `uc-studio/.omo/evidence/20260923-auto-wake-deliberation/live-run-offline-to-live.json`.
 
-This closes gaps 3 and 5 for the UCS backfill only. It does not claim that the
-unreleased upstream `prefrontal-core` contract has been recovered.
+This closes gaps 3 and 5 for the UCS backfill only. Upstream fan-out, wake wire
+signatures, and registry availability remain explicitly unverified. They do not
+block store and lifecycle repairs in this repository.

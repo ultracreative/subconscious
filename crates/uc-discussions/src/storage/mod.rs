@@ -100,6 +100,8 @@ impl Storage {
         Ok(changed == 1)
     }
 
+    /// Low-level insertion with its own immediate transaction, without service admission checks.
+    /// Service callers must validate and insert within their existing transaction instead.
     pub fn insert_room_post(
         &self,
         room_id: &str,

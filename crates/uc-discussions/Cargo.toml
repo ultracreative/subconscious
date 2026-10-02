@@ -27,3 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+subc-daemon = { path = "../subc-daemon" }
+subc-test-support = { path = "../subc-test-support" }

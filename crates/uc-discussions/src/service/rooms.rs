@@ -228,7 +228,7 @@ impl RoomsService {
         let objection_id = format!("obj-{}", Uuid::new_v4());
         let mut connection = self.storage.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&transaction, &req.room_id)?;
+        require_active_room(&transaction, &req.room_id)?;
         require_post_in_room(&transaction, &req.room_id, &req.post_id)?;
         transaction.execute(
             "INSERT INTO room_objections (
@@ -266,7 +266,7 @@ impl RoomsService {
         let created_at = now_timestamp();
         let mut connection = self.storage.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&transaction, &req.room_id)?;
+        require_active_room(&transaction, &req.room_id)?;
         require_post_in_room(&transaction, &req.room_id, &req.original_post_id)?;
         transaction.execute(
             "INSERT INTO room_revisions (
@@ -343,14 +343,15 @@ impl RoomsService {
         let voted_at = now_timestamp();
         let mut connection = self.storage.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let status = transaction
+        let (room_id, status) = transaction
             .query_row(
-                "SELECT status FROM room_polls WHERE poll_id = ?1",
+                "SELECT room_id, status FROM room_polls WHERE poll_id = ?1",
                 params![req.poll_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .ok_or_else(|| ServiceError::NotFound(format!("poll {}", req.poll_id)))?;
+        require_active_room(&transaction, &room_id)?;
         if status != "active" {
             return Err(ServiceError::InvalidRequest(format!(
                 "poll {} is not active",
@@ -392,7 +393,7 @@ impl RoomsService {
 
         let mut connection = self.storage.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&transaction, &req.room_id)?;
+        require_active_room(&transaction, &req.room_id)?;
         transaction.execute(
             "INSERT INTO room_stage_grants (
                 grant_id, room_id, grantee, granted_by, granted_at, expires_at
@@ -433,7 +434,7 @@ impl RoomsService {
 
         let mut connection = self.storage.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&transaction, &req.room_id)?;
+        require_active_room(&transaction, &req.room_id)?;
         transaction.execute(
             "UPDATE rooms
              SET status = 'closed', closed_at = ?1, outcome_json = ?2
@@ -1010,6 +1011,10 @@ mod tests {
 
     #[test]
     fn closure_and_get_room_preserve_the_complete_timeline_and_outcome() {
+        closed_room_with_history();
+    }
+
+    fn closed_room_with_history() -> (RoomsService, GetRoomResponse) {
         let service = service();
         let room = create_room(&service);
         service
@@ -1102,6 +1107,140 @@ mod tests {
         assert_eq!(fetched.polls[0].votes.len(), 1);
         assert_eq!(fetched.polls[0].votes[0].vote, "accept");
         assert_eq!(fetched.active_grantee.as_deref(), Some("bob"));
+        (service, fetched)
+    }
+
+    fn storage_contents(service: &RoomsService) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        let connection = service.storage.lock_connection().expect("lock storage");
+        let tables = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("prepare tables")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query tables")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read tables");
+        tables
+            .into_iter()
+            .map(|table| {
+                let escaped = table.replace('"', "\"\"");
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM \"{escaped}\" ORDER BY rowid"))
+                    .expect("prepare table contents");
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .expect("query table contents")
+                    .collect::<Result<Vec<Vec<rusqlite::types::Value>>, _>>()
+                    .expect("read table contents");
+                (table, rows)
+            })
+            .collect()
+    }
+
+    fn assert_closed_mutation<T: std::fmt::Debug>(
+        service: &RoomsService,
+        room: &GetRoomResponse,
+        mutate: impl FnOnce() -> Result<T, ServiceError>,
+    ) {
+        let before = storage_contents(service);
+        let result = mutate();
+        assert!(
+            matches!(&result, Err(ServiceError::InvalidRequest(message))
+                if message == &format!("room {} is not active", room.room_id)),
+            "closed-room mutation must reject with the room lifecycle error: {result:?}"
+        );
+        assert_eq!(
+            storage_contents(service),
+            before,
+            "rejected write changed storage"
+        );
+        assert_eq!(
+            service
+                .get_room(GetRoomRequest {
+                    room_id: room.room_id.clone()
+                })
+                .expect("read closed history"),
+            *room,
+            "rejected write changed closed-room readback"
+        );
+    }
+
+    fn assert_closed_writes(service: &RoomsService, room: &GetRoomResponse) {
+        assert_closed_mutation(service, room, || {
+            service.object(ObjectRoomRequest {
+                room_id: room.room_id.clone(),
+                post_id: room.posts[0].post_id.clone(),
+                author: "bob".to_owned(),
+                reason: "late objection".to_owned(),
+            })
+        });
+        assert_closed_mutation(service, room, || {
+            service.revise(ReviseRoomRequest {
+                room_id: room.room_id.clone(),
+                original_post_id: room.posts[0].post_id.clone(),
+                author: "alice".to_owned(),
+                diff_or_content: "late revision".to_owned(),
+            })
+        });
+        assert_closed_mutation(service, room, || {
+            service.grant_stage(GrantStageRequest {
+                room_id: room.room_id.clone(),
+                grantee: "carol".to_owned(),
+                granted_by: "alice".to_owned(),
+                ttl_ms: 60_000,
+            })
+        });
+        for voter in ["bob", "carol"] {
+            assert_closed_mutation(service, room, || {
+                service.vote_poll(VotePollRequest {
+                    poll_id: room.polls[0].poll_id.clone(),
+                    voter: voter.to_owned(),
+                    vote: "reject".to_owned(),
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn closed_room_rejects_objection_revision_grant_and_vote() {
+        let (service, room) = closed_room_with_history();
+        assert_eq!(room.polls[0].status, "active");
+        assert_closed_writes(&service, &room);
+    }
+
+    #[test]
+    fn repeated_close_preserves_original_outcome() {
+        let (service, room) = closed_room_with_history();
+        assert_closed_mutation(&service, &room, || {
+            service.close_room(CloseRoomRequest {
+                room_id: room.room_id.clone(),
+                decisions: vec!["replace original decision".to_owned()],
+                dissent: vec!["replace original dissent".to_owned()],
+                outstanding_actions: vec!["replace original action".to_owned()],
+            })
+        });
+    }
+
+    #[test]
+    fn closed_room_get_preserves_history() {
+        let (service, room) = closed_room_with_history();
+        let before = storage_contents(&service);
+        assert_eq!(
+            service
+                .get_room(GetRoomRequest {
+                    room_id: room.room_id.clone(),
+                })
+                .expect("get complete closed history"),
+            room
+        );
+        assert_eq!(
+            storage_contents(&service),
+            before,
+            "get_room changed storage"
+        );
+        assert_closed_writes(&service, &room);
     }
 
     #[test]

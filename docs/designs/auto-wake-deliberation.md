@@ -204,15 +204,14 @@ review should rule before any slice is commissioned.
    evidence bundle. The ladder above assumes fan-out. If it is broadcast, rung 3
    changes shape.
 2. **No wake op signatures anywhere in the fleet.** The policy cascade is
-5. **Whether rung 5 subsumes our `leases` table.** Upstream has
-   `peer.claim_undelivered`/`reset_claim` at op level [E-4c]. In the current
-   local implementation, the SQLite `leases` table is explicitly preserved and
-   maintained alongside schema-2 incarnation fencing, handling speaking floor
-   and concurrency claims with active TTL renewal. The daemon owns this room
-   state directly; host launch and model selection remain outside the daemon.
+   specified [E-4]; the wire shape of the wake call is not. Two named plan files —
+   `.cortexkit/alfonso/plans/unified-waker-v1.md` and
+   `prefrontal/.cortexkit/alfonso/plans/scheduled-wake-v1.md` — would answer this
+   directly. Searched: all 27 `.cortexkit/` directories across the fleet checkout.
    Three carry `alfonso/` (`magic-context`, `aft`, `lore-wt/e2e-magic-context`);
    none carries a `plans/` subdirectory, and neither named file exists. This is a
-   verified absence, not an unsearched gap.
+   verified absence, not an unsearched gap. For participant admission and colleague
+   policy, see `docs/reference/uc-discussions-participant-policy.md`.
 3. **No registry module exists locally.** Rung 2 delegates to something that is
    not here. Whether we stub it, vendor a minimal one as a *separate* module
    (never inside `uc-discussions` [E-5]), or block until upstream ships, is a
@@ -222,9 +221,14 @@ review should rule before any slice is commissioned.
    the same object, and the difference decides whether a mid-room re-registration
    invalidates queued turns or only in-flight ones.
 5. **Whether rung 5 subsumes our `leases` table.** Upstream has
-   `peer.claim_undelivered`/`reset_claim` at op level [E-4c]. If the incarnation
-   fence covers the same hazard, this change is net-*negative* in surface area —
-   a deletion rather than an addition. Worth checking before adding anything.
+   `peer.claim_undelivered`/`reset_claim` at op level [E-4c]. In the current
+   local implementation, the SQLite `leases` table is explicitly preserved and
+   maintained alongside schema-2 incarnation fencing, handling speaking floor
+   and concurrency claims with active TTL renewal. The daemon owns this room
+   state directly; host launch and model selection remain outside the daemon.
+   If the incarnation fence covers the same hazard, this change is net-*negative*
+   in surface area — a deletion rather than an addition. Worth checking before
+   adding anything.
 
 ## What I expect a review to attack
 

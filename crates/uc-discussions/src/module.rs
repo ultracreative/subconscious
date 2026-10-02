@@ -329,7 +329,7 @@ fn parse_request(body: &[u8]) -> Result<(String, Value), HandlerOutcome> {
     };
     let params = envelope
         .remove("params")
-        .unwrap_or_else(|| Value::Object(envelope));
+        .unwrap_or(Value::Object(envelope));
     Ok((operation, params))
 }
 

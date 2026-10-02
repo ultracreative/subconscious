@@ -314,6 +314,10 @@ await discussions.closeRoom({
 })
 ```
 
+#### Participant and Colleague Security
+
+To prevent workspace write collisions and attribution ambiguity, deliberation room member bindings are subject to participant admission policy. Colleague declarations are restricted to `Council: <name>` read-only members. For full details on validation contracts and the host-dependent enforcement boundary, refer to [`docs/reference/uc-discussions-participant-policy.md`](../reference/uc-discussions-participant-policy.md).
+
 ### Cross-Project Messaging via `project_message`
 
 Agents communicate across project boundaries using the `project_message` tool. The implementation in `packages/omo-opencode/src/features/cross-project-mailbox/send-tool/project-message-tool.ts` uses `SubcDiscussionsAdapter` as a fast delivery path while keeping file mailboxes as a fallback.
@@ -387,7 +391,7 @@ Expected response format:
 }
 ```
 
-If the SQLite database fails to open or initialize migrations during startup, the service sets its status to `degraded` and includes the root cause message in the `detail` property.
+If the SQLite database fails to open or initialize migrations during startup, the service sets its status to `failing` (`HealthStatus::Failing`, matching the Task 2 storage error reporting contract) and includes the root cause message in the `detail` property.
 
 ### SQLite Database Inspection
 

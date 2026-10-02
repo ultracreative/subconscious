@@ -223,18 +223,16 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         XCTAssertLessThan(size, Self.storedSizeBound, "database plus -wal: \(size) bytes")
     }
 
-    /// A phone migrating from the file store imports its whole history, about
-    /// 3 MB. Once the first settled change prunes it, the file must shrink
-    /// back rather than keep the imported size. Measured at about 310 KB after
-    /// 20 changes; without incremental vacuum and the -wal size limit it was 3.8 MB.
-    func testStoredSizeShrinksOnceAnImportedHistoryIsPruned() async throws {
+    /// A large settled history must shrink after pruning rather than keeping
+    /// its peak size. The fixture bypasses normal pruning to represent old history.
+    func testStoredSizeShrinksOnceALargeHistoryIsPruned() async throws {
         let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let body = Data(repeating: 0x61, count: 4_096)
-        try await seedSettledJSONDocument(in: dir, records: 540, body: body)
+        try await seedSettledSQLiteDocument(in: dir, records: 540, body: body)
         let store = FedSQLiteStateStore(directoryURL: dir)
         _ = try await store.open(localPublicKey: localKey)
-        let imported = try storedBytes(dir)
-        XCTAssertGreaterThan(imported, 2_000_000, "control: the import holds the whole history")
+        let seeded = try storedBytes(dir)
+        XCTAssertGreaterThan(seeded, 2_000_000, "control: the database holds the whole history")
 
         let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
         for _ in 0..<20 {
@@ -261,11 +259,14 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         }
     }
 
-    /// Writes a file-store JSON document holding `records` recorded, settled
-    /// changes of the local incarnation, as a phone with that much history has.
-    private func seedSettledJSONDocument(in dir: URL, records: UInt64, body: Data) async throws {
-        let bootstrap = FedAtomicFileStateStore(directoryURL: dir)
-        var document = try await bootstrap.open(localPublicKey: localKey).document
+    /// Seeds a database with `records` settled changes.
+    private func seedSettledSQLiteDocument(in dir: URL, records: UInt64, body: Data) async throws {
+        var document = FedStateDocument(
+            localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localKey),
+            localPublicKey: localKey,
+            revision: 1,
+            global: .mintFresh()
+        )
         let incarnation = document.global.localIncarnation
         var destination = FedDestinationState(
             responderStaticPublicKey: responder,
@@ -286,10 +287,7 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         document.global.nextEffectSequence = records + 1
         document.global.effectSequenceHighWater = records + FedGlobalReservationState.reservationBlockSize
         document.revision += 1
-        try JSONEncoder().encode(document).write(
-            to: dir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
-            options: .atomic
-        )
+        try FedSQLiteTestSeed.write(document, in: dir)
     }
 
     // MARK: - A failed open
@@ -333,37 +331,34 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: leftover.path))
     }
 
-    // MARK: - Same behaviour as the file store
+    // MARK: - Memory oracle
 
-    /// Random operation sequences give the same documents, and the same
-    /// failures, in the SQLite store as in the file store. Both start from one
-    /// document: the SQLite store imports the file store's fresh JSON, so the
-    /// incarnation and every counter agree from the first step.
-    func testAgreesWithTheFileStoreOnRandomOperationSequences() async throws {
+    /// The memory store's initial snapshot is seeded into SQLite so both
+    /// execute identical operations with the same incarnation and counters.
+    /// Compare all state except revision: memory bumps it on sent/settlement
+    /// updates, while SQLite bumps it once per committed write. SQLite's own
+    /// revision progression is asserted separately.
+    func testAgreesWithTheMemoryStoreOnRandomOperationSequences() async throws {
         for seed: UInt64 in [1, 2, 3, 4, 5] {
             try await compareStores(seed: seed, steps: 60)
         }
     }
 
     private func compareStores(seed: UInt64, steps: Int) async throws {
-        let fileDir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let sqliteDir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
-        let file = FedAtomicFileStateStore(directoryURL: fileDir)
-        _ = try await file.open(localPublicKey: localKey)
-        try FileManager.default.copyItem(
-            at: fileDir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
-            to: sqliteDir.appendingPathComponent(FedAtomicFileStateStore.documentFileName)
-        )
+        let memory = FedMemoryStateStore()
+        _ = try await memory.open(localPublicKey: localKey)
+        try FedSQLiteTestSeed.write(try await memory.snapshot(), in: sqliteDir)
         let sqlite = FedSQLiteStateStore(directoryURL: sqliteDir)
         _ = try await sqlite.open(localPublicKey: localKey)
-        let fileStart = try await file.snapshot()
+        let memoryStart = try await memory.snapshot()
         let sqliteStart = try await sqlite.snapshot()
-        XCTAssertEqual(sqliteStart, fileStart, "seed \(seed): stores start apart")
+        XCTAssertEqual(sqliteStart, memoryStart, "seed \(seed): stores start apart")
 
         var random = SplitMix64(seed: seed)
         let responders = [responder, Data(repeating: 0x33, count: 32)]
         let epochs = ["epoch-a", "epoch-b"]
-        let incarnation = fileStart.global.localIncarnation
+        let incarnation = memoryStart.global.localIncarnation
         var minted: [(FedEffectID, Data)] = []
 
         for step in 0..<steps {
@@ -429,17 +424,28 @@ final class FedSQLiteStateStoreTests: XCTestCase {
                 }
             }
 
-            let fileOutcome = await outcome(of: operation, on: file)
+            let revisionBefore = try await sqlite.snapshot().revision
+            let memoryOutcome = await outcome(of: operation, on: memory)
             let sqliteOutcome = await outcome(of: operation, on: sqlite)
-            XCTAssertEqual(sqliteOutcome, fileOutcome, "seed \(seed) step \(step)")
-            if case .success(let label) = fileOutcome, label.hasPrefix("intent ") {
+            XCTAssertEqual(sqliteOutcome, memoryOutcome, "seed \(seed) step \(step)")
+            if case .success(let label) = memoryOutcome, label.hasPrefix("intent ") {
                 let seq = UInt64(label.dropFirst("intent ".count))!
                 minted.append((FedEffectID(incarnation: incarnation, seq: seq), target))
             }
-            let fileDocument = try await file.snapshot()
+            var memoryDocument = try await memory.snapshot()
             let sqliteDocument = try await sqlite.snapshot()
-            XCTAssertEqual(sqliteDocument, fileDocument, "seed \(seed) step \(step): \(fileOutcome)")
-            if sqliteDocument != fileDocument { return }
+            let committedWrites: UInt64
+            if case .success(let label) = sqliteOutcome {
+                // This oracle test uses separate reservation and intent calls,
+                // rather than the production combined transaction.
+                committedWrites = label.hasPrefix("intent ") ? 2 : (label == "no effect" || label.hasPrefix("sent ") ? 0 : 1)
+            } else {
+                committedWrites = 0
+            }
+            XCTAssertEqual(sqliteDocument.revision, revisionBefore + committedWrites, "seed \(seed) step \(step): revision")
+            memoryDocument.revision = sqliteDocument.revision
+            XCTAssertEqual(sqliteDocument, memoryDocument, "seed \(seed) step \(step): \(memoryOutcome)")
+            if sqliteDocument != memoryDocument { return }
         }
         XCTAssertGreaterThan(minted.count, 3, "seed \(seed): the sequence minted too few effects to compare")
     }

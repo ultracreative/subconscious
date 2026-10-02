@@ -39,6 +39,25 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     for (name, push) in client_control_pushes() {
         assert_golden(name, &push);
     }
+    for name in [
+        "client_control_push_route_closing_legacy",
+        "client_control_push_route_closed_legacy",
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(format!("{name}.json"));
+        let wire: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(wire.get("channels").is_none());
+        let decoded: ClientControlPush = serde_json::from_value(wire).unwrap();
+        match &decoded {
+            ClientControlPush::RouteClosing { channels, .. }
+            | ClientControlPush::RouteClosed { channels, .. } => assert!(channels.is_empty()),
+        }
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["channels"],
+            serde_json::json!([])
+        );
+    }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
         "catalog_entry_with_self_signals",
@@ -204,6 +223,24 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+fn route_open_role_versions(with_role_versions: bool) -> ClientControlRequest {
+    ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: bind_identity(),
+        consumer_identity: None,
+        consumer_capabilities: None,
+        role_versions: with_role_versions.then(|| {
+            [("tool-provider".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect()
+        }),
+        admission_facts: None,
+        scope: None,
+    }
+}
+
 fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
     vec![
         (
@@ -229,6 +266,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
+                role_versions: None,
                 admission_facts: Some(
                     serde_json::json!({"schema": 1, "verified_class": "service"}),
                 ),
@@ -248,9 +286,21 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: None,
             },
+        ),
+        // A consumer declaring the role versions it speaks, and the same open
+        // without them: the member is a plain object of strings when present
+        // and absent, not null, otherwise.
+        (
+            "client_control_request_route_open_with_role_versions",
+            route_open_role_versions(true),
+        ),
+        (
+            "client_control_request_route_open_without_role_versions",
+            route_open_role_versions(false),
         ),
         (
             "client_control_request_route_open_with_scope",
@@ -264,6 +314,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: Some(subc_protocol::scope::ScopeSelector {
                     owner: subc_protocol::Principal::Reserved {
@@ -759,6 +810,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closing",
             ClientControlPush::RouteClosing {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Reload,
             },
         ),
@@ -768,6 +820,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closing_disable",
             ClientControlPush::RouteClosing {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Disable,
             },
         ),
@@ -775,6 +828,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_drained",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Restart,
                 drained: true,
                 abandoned: 0,
@@ -790,6 +844,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_abandoned",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Reload,
                 drained: false,
                 abandoned: 3,
@@ -803,6 +858,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_disable",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Disable,
                 drained: true,
                 abandoned: 0,
@@ -816,6 +872,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_capability_denied",
             ClientControlPush::RouteClosed {
                 module_id: "credentials-provider".to_string(),
+                channels: vec![7],
                 reason: RouteCloseReason::CapabilityDenied,
                 drained: false,
                 abandoned: 0,
@@ -830,6 +887,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_crash",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,
@@ -843,6 +901,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_crash_terminal",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,

@@ -26,7 +26,6 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .storeUnavailable,
             .storeMigrationFailed,
             .storeLocked,
-            .storeMigrationVerificationFailed,
             .reservationFailed,
             .persistenceFailed,
             .cancelled,
@@ -38,7 +37,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .noEligibleCandidates([]),
             .allCandidatesFailed([]),
         ]
-        XCTAssertEqual(failures.count, 30)
+        XCTAssertEqual(failures.count, 29)
         XCTAssertEqual(Self.candidateStages.count, 5)
         XCTAssertEqual(Self.rejectionReasons.count, 6)
     }
@@ -197,7 +196,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let localPublicKey = try FedPublicTestSupport.localPublicKey()
-        let stateStore = FedAtomicFileStateStore(directoryURL: directory)
+        let stateStore = FedSQLiteStateStore(directoryURL: directory)
         let dialCounter = DialCounter()
         let client = SubcFedClient(
             profile: try FedPublicTestSupport.humanProfile(),
@@ -215,7 +214,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
 
         try await client.acknowledgeReenrollment(enrollmentID: "enroll-2026-08")
 
-        let reopened = FedAtomicFileStateStore(directoryURL: directory)
+        let reopened = FedSQLiteStateStore(directoryURL: directory)
         let reopenedDocument = try await reopened.open(localPublicKey: localPublicKey).document
         let marker = try XCTUnwrap(reopenedDocument.reenrollmentAcknowledgment)
         XCTAssertEqual(marker.enrollmentID, "enroll-2026-08")

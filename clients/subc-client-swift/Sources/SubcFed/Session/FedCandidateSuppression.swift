@@ -3,7 +3,20 @@ import CryptoKit
 
 public enum FedCandidateClass: String, Sendable, Equatable, Codable {
     case lanDirect
+    /// Direct TCP to a globally routable IP literal the embedding supplies
+    /// (for example a UPnP-published address it has already probed).
+    case publicDirect
     case relay
+
+    /// The dial-ladder rung a session connected through a candidate of this
+    /// class is reported on.
+    public var connectedRung: FedConnectedRung {
+        switch self {
+        case .lanDirect: return .lanDirect
+        case .publicDirect: return .publicDirect
+        case .relay: return .relay
+        }
+    }
 }
 
 /// Digest of only the facts relevant to a suppression decision. Secret bytes are
@@ -106,10 +119,14 @@ public struct FedCandidateSuppressionTable: Sendable {
         }
     }
 
-    /// A changed observed-network snapshot re-enables only affected LAN records.
+    /// A changed observed-network snapshot re-enables only affected direct
+    /// (LAN-direct and public-direct) records; relay records do not depend on
+    /// the local network.
     public mutating func applyNetworkSnapshotChange(newDigest: Data) {
         for (id, record) in records {
-            guard record.candidateClass == .lanDirect else { continue }
+            guard record.candidateClass == .lanDirect || record.candidateClass == .publicDirect else {
+                continue
+            }
             if record.facts.networkSnapshotDigest != newDigest {
                 records.removeValue(forKey: id)
             }

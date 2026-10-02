@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
     future::Future,
@@ -297,8 +297,7 @@ fn reverse_request_registries() -> &'static Mutex<HashMap<u64, ReverseRequestReg
 }
 
 pub(crate) fn install_reverse_request_registry(registry: ReverseRequestRegistry) -> u64 {
-    let id = NEXT_REVERSE_REQUEST_REGISTRY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    let id = crate::checked_increment(&NEXT_REVERSE_REQUEST_REGISTRY_ID)
         .expect("reverse-request route registry id exhausted");
     reverse_request_registries()
         .lock()
@@ -402,6 +401,9 @@ pub struct CloseRouteOptions {
     pub consumer_identity: Option<ConsumerIdentity>,
     /// The registry whose derived capability set identifies the route being closed.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The role versions the route being closed was opened with (see
+    /// [`CallOptions::role_versions`]); part of the route's identity.
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for CloseRouteOptions {
@@ -411,6 +413,7 @@ impl Default for CloseRouteOptions {
             drain_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -431,6 +434,20 @@ pub struct CallOptions {
     /// Reverse-request handlers for this route. consumer_capabilities is derived
     /// from the registered method families and omitted when this registry is empty.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The versions of provider roles this consumer speaks on the route, role
+    /// name to version (`{"tool-provider": "v1"}`), sent on `route.open` and
+    /// forwarded by the daemon to the provider's bind. An unverified
+    /// declaration that grants nothing. Routes that differ only here are
+    /// separate routes, so a legacy route and a versioned one to the same
+    /// target are never shared; an empty map is the same as `None`.
+    ///
+    /// A daemon that does not advertise `route-role-versions/v1`
+    /// ([`subc_protocol::scope::CAP_ROUTE_ROLE_VERSIONS_V1`]) drops the field
+    /// without telling the provider, so check the capability before relying
+    /// on it. A malformed map (see
+    /// [`subc_protocol::session::validate_role_versions`]) is refused by the
+    /// daemon as `invalid_request` and the call fails as not sent.
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for CallOptions {
@@ -443,6 +460,7 @@ impl Default for CallOptions {
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -468,6 +486,9 @@ pub struct SubscribeOptions {
     /// Reverse-request handlers for this route. consumer_capabilities is derived
     /// from the registered method families and omitted when this registry is empty.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The role versions declared on the subscription's route; see
+    /// [`CallOptions::role_versions`].
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for SubscribeOptions {
@@ -481,6 +502,7 @@ impl Default for SubscribeOptions {
             route_open_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -552,8 +574,35 @@ pub enum RouteCloseReason {
     Disable,
     Crash,
     CapabilityDenied,
+    ScopeEnded,
+    ScopeCarrierRemoved,
+    ScopeDelegationChanged,
+    ScopeParentEnded,
     Unknown(String),
 }
+
+/// Why a route ended. Even a planned closure can leave a call's outcome unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RouteEndReason {
+    Daemon(RouteCloseReason),
+    ClosedByCaller,
+    ConnectionLost,
+    Unknown,
+}
+
+#[derive(Debug)]
+struct RouteEnded {
+    message: String,
+    reason: RouteEndReason,
+}
+
+impl fmt::Display for RouteEnded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl Error for RouteEnded {}
 
 /// Whether a closed route may be reopened automatically from its reason alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +620,10 @@ impl RouteCloseReason {
             "disable" => Self::Disable,
             "crash" => Self::Crash,
             "capability_denied" => Self::CapabilityDenied,
+            "scope_ended" => Self::ScopeEnded,
+            "scope_carrier_removed" => Self::ScopeCarrierRemoved,
+            "scope_delegation_changed" => Self::ScopeDelegationChanged,
+            "scope_parent_ended" => Self::ScopeParentEnded,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -579,9 +632,14 @@ impl RouteCloseReason {
     pub fn disposition(&self) -> RouteCloseDisposition {
         match self {
             Self::Reload | Self::Restart => RouteCloseDisposition::MayReopen,
-            Self::Disable | Self::Crash | Self::CapabilityDenied | Self::Unknown(_) => {
-                RouteCloseDisposition::MustNotReopen
-            }
+            Self::Disable
+            | Self::Crash
+            | Self::CapabilityDenied
+            | Self::ScopeEnded
+            | Self::ScopeCarrierRemoved
+            | Self::ScopeDelegationChanged
+            | Self::ScopeParentEnded
+            | Self::Unknown(_) => RouteCloseDisposition::MustNotReopen,
         }
     }
 }
@@ -824,6 +882,7 @@ impl Future for SubscriptionClosed {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             Poll::Ready(Err(_)) => Poll::Ready(Err(CallError::outcome_unknown(
                 "subscription closed result channel dropped",
+                OutcomeUnknownCause::CompletionFailed,
             ))),
             Poll::Pending => Poll::Pending,
         }
@@ -893,17 +952,20 @@ impl SubcConsumer {
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
         let params = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -954,18 +1016,21 @@ impl SubcConsumer {
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
         )
+        .with_role_versions(role_versions.as_ref())
         .with_scope(Some(&scope));
         let params = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: Some(&scope),
         };
@@ -1059,6 +1124,7 @@ impl SubcConsumer {
             identity,
             consumer_identity: route_open_consumer_identity(opts),
             consumer_capabilities,
+            role_versions: route_open_role_versions(opts.role_versions.as_ref()),
             admission_facts: Some(facts),
             scope: None,
         })
@@ -1516,18 +1582,21 @@ impl SubcConsumer {
         let mut retried_unknown_channel = false;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let route_key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -1542,7 +1611,7 @@ impl SubcConsumer {
                 match timeout_at(call_deadline, Arc::clone(&route.sem).acquire_owned()).await {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
-                        return Err(CallError::not_sent("route flow-control semaphore closed"));
+                        return Err(self.shared.route_not_sent_error(route.handle));
                     }
                     Err(_) => {
                         return Err(CallError::not_sent(
@@ -1610,7 +1679,7 @@ impl SubcConsumer {
 
     /// Open a held-open subscription on a managed route.
     ///
-    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities)` route as
+    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities, role_versions)` route as
     /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
     /// returns a [`Subscription`] whose event receiver yields each matching
     /// `StreamData` payload. The request holds one route flow-control permit until
@@ -1634,21 +1703,25 @@ impl SubcConsumer {
             route_retry_deadline: opts.route_retry_deadline,
             consumer_identity: opts.consumer_identity.clone(),
             reverse_requests: opts.reverse_requests.clone(),
+            role_versions: opts.role_versions.clone(),
         };
         let consumer_identity = route_open_consumer_identity(&route_opts);
         let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
+        let role_versions = route_open_role_versions(route_opts.role_versions.as_ref());
         let route_key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -1663,7 +1736,7 @@ impl SubcConsumer {
                 match timeout_at(open_deadline, Arc::clone(&route.sem).acquire_owned()).await {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
-                        return Err(CallError::not_sent("route flow-control semaphore closed"));
+                        return Err(self.shared.route_not_sent_error(route.handle));
                     }
                     Err(_) => {
                         return Err(CallError::not_sent(
@@ -1730,7 +1803,8 @@ impl SubcConsumer {
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(route_open_role_versions(opts.role_versions.as_ref()).as_ref());
         self.shared.close_route(&key, &opts).await;
     }
 
@@ -1846,6 +1920,38 @@ impl Error for ConsumerError {
     }
 }
 
+/// Why a sent request has no observed terminal response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutcomeUnknownCause {
+    /// The reply deadline elapsed after the request was sent.
+    Deadline,
+    /// The connection's writer closed or failed after send.
+    WriterClosed,
+    /// The caller closed the consumer while a request was pending.
+    ConsumerClosed,
+    /// The daemon connection failed or dropped.
+    ConnectionFailed,
+    /// The route ended; [`CallError::close_reason`] gives its reason.
+    RouteEnded,
+    /// An internal completion channel dropped or an unexpected completion arrived.
+    CompletionFailed,
+}
+
+#[derive(Debug, Clone)]
+struct OutcomeUnknownSource {
+    message: String,
+    cause: OutcomeUnknownCause,
+    route_reason: Option<RouteEndReason>,
+}
+
+impl fmt::Display for OutcomeUnknownSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl Error for OutcomeUnknownSource {}
+
 /// Managed call or subscription failure.
 #[derive(Debug)]
 pub enum CallError {
@@ -1875,6 +1981,34 @@ pub enum CallError {
 }
 
 impl CallError {
+    /// Why the route ended. The error remains `NotSent` or `OutcomeUnknown`:
+    /// this reason never makes a sent call safe to resend.
+    pub fn close_reason(&self) -> Option<&RouteEndReason> {
+        match self {
+            Self::NotSent(source) | Self::OutcomeUnknown(source) => source
+                .downcast_ref::<RouteEnded>()
+                .map(|ended| &ended.reason)
+                .or_else(|| {
+                    source
+                        .downcast_ref::<OutcomeUnknownSource>()?
+                        .route_reason
+                        .as_ref()
+                }),
+            _ => None,
+        }
+    }
+
+    /// Why the outcome is unknown, without parsing the error's message.
+    /// Errors constructed outside this crate with an untyped source return `None`.
+    pub fn outcome_cause(&self) -> Option<OutcomeUnknownCause> {
+        match self {
+            Self::OutcomeUnknown(source) => source
+                .downcast_ref::<OutcomeUnknownSource>()
+                .map(|source| source.cause),
+            _ => None,
+        }
+    }
+
     /// Return the stable machine-readable code for typed errors.
     pub fn code(&self) -> Option<&str> {
         match self {
@@ -1893,8 +2027,16 @@ impl CallError {
         Self::NotSent(Box::new(SimpleError(reason.into())))
     }
 
-    fn outcome_unknown(reason: impl Into<String>) -> Self {
-        Self::OutcomeUnknown(Box::new(SimpleError(reason.into())))
+    fn outcome_unknown(reason: impl Into<String>, cause: OutcomeUnknownCause) -> Self {
+        Self::outcome_unknown_source(OutcomeUnknownSource {
+            message: reason.into(),
+            cause,
+            route_reason: None,
+        })
+    }
+
+    fn outcome_unknown_source(source: OutcomeUnknownSource) -> Self {
+        Self::OutcomeUnknown(Box::new(source))
     }
 
     fn is_not_sent(&self) -> bool {
@@ -2190,6 +2332,9 @@ struct Inner {
     route_by_channel: HashMap<u16, RouteKey>,
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
+    route_modules: HashMap<u16, String>,
+    route_end_reasons: HashMap<u16, (RouteEndReason, bool)>,
+    legacy_channel_reasons: HashMap<u16, RouteCloseReason>,
     push_event_receivers: HashMap<RouteHandle, mpsc::Sender<PushEvent>>,
     /// Consumer-level receiver for daemon-originated channel-0 control pushes
     /// (`route.closing`, `route.closed`, future ops). Connection-independent:
@@ -2207,6 +2352,52 @@ struct Inner {
 }
 
 impl Inner {
+    fn record_route_end(&mut self, push: &ControlPush) {
+        let Some(reason) = push.route_close_reason() else {
+            return;
+        };
+        if let Some(channels) = push.body.get("channels") {
+            if let Some(channels) = channels.as_array() {
+                for channel in channels
+                    .iter()
+                    .filter_map(|v| v.as_u64().and_then(|v| u16::try_from(v).ok()))
+                {
+                    let final_reason = push.op == "route.closed";
+                    if final_reason
+                        || !self
+                            .route_end_reasons
+                            .get(&channel)
+                            .is_some_and(|(_, final_reason)| *final_reason)
+                    {
+                        self.route_end_reasons.insert(
+                            channel,
+                            (RouteEndReason::Daemon(reason.clone()), final_reason),
+                        );
+                    }
+                }
+            }
+        } else if let Some(module) = push.body.get("module_id").and_then(|v| v.as_str()) {
+            for (&channel, target) in &self.route_modules {
+                if target == module {
+                    self.legacy_channel_reasons.insert(channel, reason.clone());
+                }
+            }
+        }
+    }
+
+    fn route_end_reason(&self, channel: u16) -> RouteEndReason {
+        self.route_end_reasons
+            .get(&channel)
+            .map(|(reason, _)| reason.clone())
+            .or_else(|| {
+                self.legacy_channel_reasons
+                    .get(&channel)
+                    .cloned()
+                    .map(RouteEndReason::Daemon)
+            })
+            .unwrap_or(RouteEndReason::Unknown)
+    }
+
     fn cache_route(&mut self, key: RouteKey, route: RouteState) -> RouteState {
         let cached = self.routes.entry(key.clone()).or_insert(route).clone();
         let previous = self
@@ -2286,6 +2477,9 @@ impl Shared {
                 route_by_channel: HashMap::new(),
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
+                route_modules: HashMap::new(),
+                route_end_reasons: HashMap::new(),
+                legacy_channel_reasons: HashMap::new(),
                 push_event_receivers: HashMap::new(),
                 control_push_receiver: None,
                 dropped_route_frames: 0,
@@ -2396,6 +2590,9 @@ impl Shared {
             };
             inner.close_routes();
             inner.route_epochs.clear();
+            inner.route_modules.clear();
+            inner.route_end_reasons.clear();
+            inner.legacy_channel_reasons.clear();
             inner.next_corr = Some(1);
             inner.writer = Some(tx);
             self.last_inbound_ms.store(0, Ordering::Release);
@@ -2805,6 +3002,7 @@ impl Shared {
                 identity: route_open.identity.clone(),
                 consumer_identity: route_open.consumer_identity.clone(),
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
+                role_versions: route_open.role_versions.clone(),
                 admission_facts: None,
                 scope: route_open.scope.cloned(),
             })
@@ -3062,6 +3260,17 @@ impl Shared {
                     route_open_reverse_requests,
                 ),
             );
+            if retain_late_route_open {
+                inner.pending.get_mut(&key).unwrap().route_open_module =
+                    serde_json::from_slice::<serde_json::Value>(&frame.body)
+                        .ok()
+                        .and_then(|body| {
+                            body.get("target")?
+                                .get("module_id")?
+                                .as_str()
+                                .map(str::to_string)
+                        });
+            }
         }
         let mut registration =
             PendingRegistration::new(Arc::clone(self), key, retain_late_route_open);
@@ -3081,6 +3290,7 @@ impl Shared {
                 return Err(classify_failure(
                     accepted,
                     "writer task closed before accepting request",
+                    OutcomeUnknownCause::WriterClosed,
                 ));
             }
             Err(_) => {
@@ -3114,12 +3324,13 @@ impl Shared {
                     Err(classify_failure(
                         accepted,
                         format!("request on channel {channel} timed out at its deadline"),
+                        OutcomeUnknownCause::Deadline,
                     ))
                 }
             },
             () = self.close_token.cancelled() => {
                 let accepted = registration.remove_pending().unwrap_or(false);
-                Err(classify_failure(accepted, "consumer closed while request was pending"))
+                Err(classify_failure(accepted, "consumer closed while request was pending", OutcomeUnknownCause::ConsumerClosed))
             }
         }
     }
@@ -3348,6 +3559,7 @@ impl Shared {
                 return Err(classify_failure(
                     accepted,
                     "writer task closed before accepting subscription request",
+                    OutcomeUnknownCause::WriterClosed,
                 ));
             }
             Err(_) => {
@@ -3504,6 +3716,7 @@ impl Shared {
             None => false,
             Some(push) => {
                 let mut inner = self.lock_inner();
+                inner.record_route_end(&push);
                 match inner.control_push_receiver.as_ref() {
                     None => false,
                     Some(sender) => match sender.try_send(push) {
@@ -3594,6 +3807,19 @@ impl Shared {
     }
 
     fn handle_generation_drop(self: &Arc<Self>, generation: u64, reason: String) {
+        self.handle_generation_drop_with_cause(
+            generation,
+            reason,
+            OutcomeUnknownCause::ConnectionFailed,
+        );
+    }
+
+    fn handle_generation_drop_with_cause(
+        self: &Arc<Self>,
+        generation: u64,
+        reason: String,
+        cause: OutcomeUnknownCause,
+    ) {
         let (should_emit, pending, openings, callbacks) = {
             let mut inner = self.lock_inner();
             if inner.closed || inner.generation != generation || inner.writer.is_none() {
@@ -3603,6 +3829,9 @@ impl Shared {
             inner.restored_token = inner.restored_token.saturating_add(1);
             inner.close_routes();
             inner.route_epochs.clear();
+            inner.route_modules.clear();
+            inner.route_end_reasons.clear();
+            inner.legacy_channel_reasons.clear();
             let pending = drain_pending_generation(&mut inner.pending, generation);
             let openings = drain_openings(&mut inner.openings);
             let callbacks = inner.callbacks.clone();
@@ -3610,7 +3839,12 @@ impl Shared {
         };
 
         if should_emit {
-            settle_pending_entries(pending, reason.clone());
+            settle_route_pending_entries_with_cause(
+                pending,
+                reason.clone(),
+                RouteEndReason::ConnectionLost,
+                cause,
+            );
             fail_openings(openings, SharedCallFailure::not_sent(reason.clone()));
             emit_callbacks(callbacks, ConnectionState::Dropped);
             self.notify.notify_waiters();
@@ -3627,6 +3861,9 @@ impl Shared {
             inner.closed = true;
             inner.writer = None;
             inner.route_epochs.clear();
+            inner.route_modules.clear();
+            inner.route_end_reasons.clear();
+            inner.legacy_channel_reasons.clear();
             inner.push_event_receivers.clear();
             self.close_token.cancel();
             let reconnect = match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
@@ -3753,6 +3990,9 @@ impl Shared {
         let routes = {
             let mut inner = self.lock_inner();
             inner
+                .route_end_reasons
+                .insert(handle.channel, (RouteEndReason::ClosedByCaller, true));
+            inner
                 .remove_route_by_handle(handle)
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -3763,7 +4003,11 @@ impl Shared {
         for route in routes {
             route.sem.close();
         }
-        self.fail_channel_pending(handle, "route closed by close_handle");
+        self.fail_channel_pending(
+            handle,
+            "route closed by close_handle",
+            RouteEndReason::ClosedByCaller,
+        );
         self.send_route_goodbye(handle, false);
         self.uninstall_route_handle(handle);
         Ok(())
@@ -3779,7 +4023,13 @@ impl Shared {
             if let Some(opening) = inner.openings.get_mut(key) {
                 opening.closed = true;
             }
-            inner.remove_route(key)
+            let route = inner.remove_route(key);
+            if let Some(route) = &route {
+                inner
+                    .route_end_reasons
+                    .insert(route.handle.channel, (RouteEndReason::ClosedByCaller, true));
+            }
+            route
         };
 
         // Nothing cached: either never opened (idempotent no-op) or still opening (the
@@ -3798,7 +4048,11 @@ impl Shared {
         // caller classifies it NotSent. Already-sent pending requests are settled
         // at-most-once (OutcomeUnknown if the writer accepted their bytes).
         route.sem.close();
-        self.fail_channel_pending(route.handle, "route closed by close_route");
+        self.fail_channel_pending(
+            route.handle,
+            "route closed by close_route",
+            RouteEndReason::ClosedByCaller,
+        );
 
         // Best-effort route GOODBYE: the daemon releases the route + relays the module
         // route-gone GOODBYE the module's reaper consumes. One-way, no ack.
@@ -3815,15 +4069,35 @@ impl Shared {
         }
     }
 
-    /// Settle every in-flight pending request on `channel` (this generation) as an
-    /// at-most-once failure: OutcomeUnknown if the writer already accepted its bytes,
-    /// NotSent otherwise. Mirrors the connection-drop path, scoped to one channel.
-    fn fail_channel_pending(&self, handle: RouteHandle, reason: &str) {
+    fn route_not_sent_error(&self, handle: RouteHandle) -> CallError {
+        let inner = self.lock_inner();
+        let reason = if inner.generation != handle.connection_token() || inner.writer.is_none() {
+            RouteEndReason::ConnectionLost
+        } else {
+            inner.route_end_reason(handle.channel)
+        };
+        CallError::NotSent(Box::new(RouteEnded {
+            message: "route flow-control semaphore closed".into(),
+            reason,
+        }))
+    }
+
+    /// Settle every pending request on this handle as OutcomeUnknown if the writer
+    /// accepted its bytes, or NotSent otherwise, preserving the route ending cause.
+    fn fail_channel_pending(
+        &self,
+        handle: RouteHandle,
+        reason: &str,
+        close_reason: RouteEndReason,
+    ) {
         let entries = {
             let mut inner = self.lock_inner();
+            inner
+                .route_end_reasons
+                .insert(handle.channel, (close_reason.clone(), true));
             drain_pending_handle(&mut inner.pending, handle, true)
         };
-        settle_pending_entries(entries, reason.to_string());
+        settle_route_pending_entries(entries, reason.to_string(), close_reason);
     }
 
     /// Resolve once every in-flight unary pending on `channel` has settled, or the
@@ -3947,6 +4221,8 @@ struct RouteOpenParams<'a> {
     identity: &'a BindIdentity,
     consumer_identity: &'a Option<ConsumerIdentity>,
     consumer_capabilities: &'a Option<Vec<String>>,
+    /// Already normalized: an empty map is `None` here, as in the route key.
+    role_versions: &'a Option<BTreeMap<String, String>>,
     reverse_requests: &'a ReverseRequestRegistry,
     /// The scope every route.open for this key asks to be admitted under, so a
     /// reopen after the route drops carries the same selector as the first open.
@@ -4054,6 +4330,11 @@ struct RouteKey {
     session: String,
     consumer_identity: Option<ConsumerIdentityKey>,
     consumer_capabilities: Option<ConsumerCapabilitiesKey>,
+    /// The role versions the route was opened with; `None` for a route that
+    /// declared none. Part of the key so a legacy route and a versioned one to
+    /// the same target are never shared: the provider chose its wire shape
+    /// from these at bind. A `BTreeMap` is already in canonical order.
+    role_versions: Option<BTreeMap<String, String>>,
     /// The scope the route was admitted under; `None` for an unscoped route.
     /// Part of the key so a route bound to one session's scope (or one epoch
     /// of it) is never reused for another, nor for an unscoped caller.
@@ -4074,8 +4355,14 @@ impl RouteKey {
             session: identity.session.clone(),
             consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
             consumer_capabilities: consumer_capabilities.map(ConsumerCapabilitiesKey::from_slice),
+            role_versions: None,
             scope: None,
         }
+    }
+
+    fn with_role_versions(mut self, role_versions: Option<&BTreeMap<String, String>>) -> Self {
+        self.role_versions = role_versions.cloned();
+        self
     }
 
     fn with_scope(mut self, scope: Option<&ScopeSelector>) -> Self {
@@ -4221,7 +4508,7 @@ impl SharedCallFailure {
         match (self.kind, self.refusal) {
             (FailureKind::NotSent, Some(refused)) => CallError::NotSent(Box::new(refused)),
             (FailureKind::NotSent, None) => CallError::not_sent(self.message),
-            (FailureKind::OutcomeUnknown, _) => CallError::outcome_unknown(self.message),
+            (FailureKind::OutcomeUnknown(source), _) => CallError::outcome_unknown_source(source),
         }
     }
 }
@@ -4235,12 +4522,27 @@ impl From<CallError> for SharedCallFailure {
                 refusal: err.downcast_ref::<RouteOpenRefused>().cloned(),
             },
             CallError::OutcomeUnknown(err) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(
+                    err.downcast_ref::<OutcomeUnknownSource>()
+                        .cloned()
+                        .unwrap_or_else(|| OutcomeUnknownSource {
+                            message: err.to_string(),
+                            cause: OutcomeUnknownCause::CompletionFailed,
+                            route_reason: None,
+                        }),
+                ),
                 message: err.to_string(),
                 refusal: None,
             },
             CallError::Module(body) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
+                    message: format!(
+                        "unexpected module error during route.open: {} ({})",
+                        body.code, body.message
+                    ),
+                    cause: OutcomeUnknownCause::CompletionFailed,
+                    route_reason: None,
+                }),
                 message: format!(
                     "unexpected module error during route.open: {} ({})",
                     body.code, body.message
@@ -4248,7 +4550,11 @@ impl From<CallError> for SharedCallFailure {
                 refusal: None,
             },
             CallError::SubscriptionBackpressure(err) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
+                    message: err.to_string(),
+                    cause: OutcomeUnknownCause::CompletionFailed,
+                    route_reason: None,
+                }),
                 message: err.to_string(),
                 refusal: None,
             },
@@ -4268,10 +4574,10 @@ impl From<CallError> for SharedCallFailure {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum FailureKind {
     NotSent,
-    OutcomeUnknown,
+    OutcomeUnknown(OutcomeUnknownSource),
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -4287,6 +4593,7 @@ struct PendingEntry {
     retain_late_route_open: bool,
     expected_control_handle: Option<RouteHandle>,
     route_open_reverse_requests: Option<ReverseRequestRegistry>,
+    route_open_module: Option<String>,
     completion: PendingCompletion,
 }
 
@@ -4318,6 +4625,7 @@ impl PendingEntry {
             retain_late_route_open,
             expected_control_handle,
             route_open_reverse_requests,
+            route_open_module: None,
             completion: PendingCompletion::Unary(tx),
         }
     }
@@ -4333,6 +4641,7 @@ impl PendingEntry {
             retain_late_route_open: false,
             expected_control_handle: None,
             route_open_reverse_requests: None,
+            route_open_module: None,
             completion: PendingCompletion::Subscription {
                 events,
                 closed,
@@ -4387,16 +4696,17 @@ impl PendingEntry {
 
     fn settle_failure(self, reason: String) {
         let accepted = self.accepted;
-        self.settle_call_error(classify_failure(accepted, reason));
+        self.settle_call_error(classify_failure(
+            accepted,
+            reason,
+            OutcomeUnknownCause::ConsumerClosed,
+        ));
     }
 
     fn settle_call_error(self, err: CallError) {
         match self.completion {
             PendingCompletion::Unary(tx) => {
-                let _ = tx.send(PendingResult::Failure {
-                    accepted: self.accepted,
-                    reason: err.to_string(),
-                });
+                let _ = tx.send(PendingResult::CallError(err));
             }
             PendingCompletion::Subscription { closed, .. } => {
                 let _ = closed.send(Err(err));
@@ -4465,6 +4775,7 @@ impl Drop for PendingRegistration {
 
 enum PendingResult {
     Terminal(PendingTerminal),
+    CallError(CallError),
     Failure { accepted: bool, reason: String },
 }
 
@@ -4472,7 +4783,12 @@ impl PendingResult {
     fn into_call_result(self) -> Result<TerminalFrame, CallError> {
         match self {
             Self::Terminal(terminal) => Ok(terminal.into_terminal_frame()),
-            Self::Failure { accepted, reason } => Err(classify_failure(accepted, reason)),
+            Self::CallError(err) => Err(err),
+            Self::Failure { accepted, reason } => Err(classify_failure(
+                accepted,
+                reason,
+                OutcomeUnknownCause::CompletionFailed,
+            )),
         }
     }
 }
@@ -4729,12 +5045,23 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             let reverse_requests = shared
                 .pending_route_open_reverse_requests(key)
                 .unwrap_or_default();
+            let module = shared
+                .lock_inner()
+                .pending
+                .get(&key)
+                .and_then(|entry| entry.route_open_module.clone());
             shared.install_ingress_handle(RouteHandle::new_consumer(
                 route_channel,
                 route_epoch,
                 generation,
                 reverse_requests,
             ));
+            if let Some(module) = module {
+                shared
+                    .lock_inner()
+                    .route_modules
+                    .insert(route_channel, module);
+            }
         }
     }
 
@@ -4776,12 +5103,13 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         }
         FrameType::Goodbye => {
             let handle = RouteHandle::new(frame.header.channel, frame.header.epoch, generation);
+            let close_reason = shared.lock_inner().route_end_reason(handle.channel);
             shared.invalidate_routes_for_handle(handle);
             let pending = {
                 let mut inner = shared.lock_inner();
                 drain_pending_handle(&mut inner.pending, handle, true)
             };
-            settle_pending_entries(pending, "route closed by subc".to_string());
+            settle_route_pending_entries(pending, "route closed by subc".to_string(), close_reason);
         }
         FrameType::Ping if frame.header.channel == 0 => {
             if let Ok(pong) = Frame::build_with_version(
@@ -4885,6 +5213,9 @@ impl Shared {
         let mut inner = self.lock_inner();
         if !inner.closed && inner.generation == handle.connection_token() && inner.writer.is_some()
         {
+            inner.route_end_reasons.remove(&handle.channel);
+            inner.legacy_channel_reasons.remove(&handle.channel);
+            inner.route_modules.remove(&handle.channel);
             if let Some(previous) = inner.route_epochs.insert(handle.channel, handle) {
                 if previous.reverse_request_registry_id() != handle.reverse_request_registry_id() {
                     release_reverse_request_registry(previous);
@@ -4928,7 +5259,11 @@ async fn writer_loop<W>(
             }
         }
         if let Err(err) = write_frame(&mut writer, &command.frame).await {
-            shared.handle_generation_drop(generation, err.to_string());
+            shared.handle_generation_drop_with_cause(
+                generation,
+                err.to_string(),
+                OutcomeUnknownCause::WriterClosed,
+            );
             return;
         }
         while let Ok(command) = rx.try_recv() {
@@ -4938,12 +5273,20 @@ async fn writer_loop<W>(
                 }
             }
             if let Err(err) = write_frame(&mut writer, &command.frame).await {
-                shared.handle_generation_drop(generation, err.to_string());
+                shared.handle_generation_drop_with_cause(
+                    generation,
+                    err.to_string(),
+                    OutcomeUnknownCause::WriterClosed,
+                );
                 return;
             }
         }
         if let Err(err) = writer.flush().await.map_err(FrameIoError::Io) {
-            shared.handle_generation_drop(generation, err.to_string());
+            shared.handle_generation_drop_with_cause(
+                generation,
+                err.to_string(),
+                OutcomeUnknownCause::WriterClosed,
+            );
             return;
         }
     }
@@ -4965,6 +5308,18 @@ fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {
     opts.reverse_requests.seal();
     let capabilities = opts.reverse_requests.capabilities();
     (!capabilities.is_empty()).then_some(capabilities)
+}
+
+/// The role versions a route is opened and keyed with. An empty map declares
+/// nothing, and the daemon forwards it as no field at all, so it is folded
+/// into `None` here: otherwise `Some({})` and `None` would key two routes the
+/// provider cannot tell apart.
+fn route_open_role_versions(
+    role_versions: Option<&BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    role_versions
+        .filter(|role_versions| !role_versions.is_empty())
+        .cloned()
 }
 
 fn close_route_consumer_capabilities(opts: &CloseRouteOptions) -> Option<Vec<String>> {
@@ -5063,11 +5418,52 @@ fn request_not_sent_after_route_open_failure(err: CallError) -> CallError {
     }
 }
 
-fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {
+fn classify_failure(
+    accepted: bool,
+    reason: impl Into<String>,
+    cause: OutcomeUnknownCause,
+) -> CallError {
     if accepted {
-        CallError::outcome_unknown(reason)
+        CallError::outcome_unknown(reason, cause)
     } else {
         CallError::not_sent(reason)
+    }
+}
+
+fn settle_route_pending_entries(
+    entries: Vec<PendingEntry>,
+    message: String,
+    reason: RouteEndReason,
+) {
+    let cause = if reason == RouteEndReason::ConnectionLost {
+        OutcomeUnknownCause::ConnectionFailed
+    } else {
+        OutcomeUnknownCause::RouteEnded
+    };
+    settle_route_pending_entries_with_cause(entries, message, reason, cause);
+}
+
+fn settle_route_pending_entries_with_cause(
+    entries: Vec<PendingEntry>,
+    message: String,
+    reason: RouteEndReason,
+    cause: OutcomeUnknownCause,
+) {
+    for entry in entries {
+        let source = Box::new(RouteEnded {
+            message: message.clone(),
+            reason: reason.clone(),
+        });
+        let err = if entry.accepted {
+            CallError::outcome_unknown_source(OutcomeUnknownSource {
+                message: source.message.clone(),
+                cause,
+                route_reason: Some(reason.clone()),
+            })
+        } else {
+            CallError::NotSent(source)
+        };
+        entry.settle_call_error(err);
     }
 }
 
@@ -5714,13 +6110,62 @@ mod tests {
             .into_call_result()
             .unwrap_err();
         assert!(matches!(accepted_error, CallError::OutcomeUnknown(_)));
+        assert_eq!(
+            accepted_error.outcome_cause(),
+            Some(OutcomeUnknownCause::WriterClosed)
+        );
         let not_sent_error = not_sent_rx
             .await
             .expect("the unwritten request should be settled")
             .into_call_result()
             .unwrap_err();
         assert!(matches!(not_sent_error, CallError::NotSent(_)));
+        assert_eq!(not_sent_error.outcome_cause(), None);
         shared.close_sync("test complete");
+    }
+
+    #[tokio::test]
+    async fn consumer_close_attaches_outcome_cause_to_pending_call() {
+        let shared = writer_test_shared();
+        let (writer, _writer_rx) = mpsc::channel(1);
+        shared.lock_inner().writer = Some(writer);
+        let (tx, rx) = oneshot::channel();
+        let mut entry = PendingEntry::unary(tx, false, None, None);
+        entry.accepted = true;
+        shared.lock_inner().pending.insert(
+            PendingKey {
+                generation: 1,
+                channel: 3,
+                epoch: 1,
+                corr: 1,
+            },
+            entry,
+        );
+        let consumer = SubcConsumer { shared };
+        consumer.close().await;
+        let err = rx.await.unwrap().into_call_result().unwrap_err();
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::ConsumerClosed)
+        );
+        assert_eq!(err.to_string(), "request outcome unknown: consumer closed");
+        assert_eq!(err.close_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn subscription_completion_drop_attaches_outcome_cause() {
+        let (tx, rx) = oneshot::channel();
+        let closed = SubscriptionClosed { rx };
+        drop(tx);
+        let err = closed.await.unwrap_err();
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::CompletionFailed)
+        );
+        assert_eq!(
+            err.to_string(),
+            "request outcome unknown: subscription closed result channel dropped"
+        );
     }
 
     #[test]
@@ -5804,6 +6249,147 @@ mod tests {
             !is_retryable_route_open_code("capability_forbidden"),
             "a capability policy refusal must not enter the route.open retry set"
         );
+    }
+
+    #[test]
+    fn two_routes_record_distinct_reasons_and_reuse_clears_channel() {
+        let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
+        let (writer, _rx) = mpsc::channel(8);
+        shared.lock_inner().writer = Some(writer);
+        shared.install_ingress_handle(RouteHandle::new(7, 1, 1));
+        shared.install_ingress_handle(RouteHandle::new(9, 1, 1));
+        {
+            let mut inner = shared.lock_inner();
+            inner.route_modules.insert(7, "provider".into());
+            inner.route_modules.insert(9, "provider".into());
+        }
+        shared.control_push(br#"{"op":"route.closed","module_id":"provider","channels":[7],"reason":"scope_ended"}"#);
+        shared.control_push(
+            br#"{"op":"route.closing","module_id":"provider","channels":[9],"reason":"restart"}"#,
+        );
+        shared.control_push(
+            br#"{"op":"route.closing","module_id":"provider","channels":[7],"reason":"crash"}"#,
+        );
+        assert_eq!(
+            shared.lock_inner().route_end_reason(7),
+            RouteEndReason::Daemon(RouteCloseReason::ScopeEnded)
+        );
+        assert_eq!(
+            shared.lock_inner().route_end_reason(9),
+            RouteEndReason::Daemon(RouteCloseReason::Restart)
+        );
+        shared.control_push(
+            br#"{"op":"route.closed","module_id":"provider","channels":[9],"reason":"crash"}"#,
+        );
+        assert_eq!(
+            shared.lock_inner().route_end_reason(9),
+            RouteEndReason::Daemon(RouteCloseReason::Crash)
+        );
+        shared.control_push(br#"{"op":"route.closed","module_id":"provider","reason":"disable"}"#);
+        shared.install_ingress_handle(RouteHandle::new(7, 2, 1));
+        assert_eq!(
+            shared.lock_inner().route_end_reason(7),
+            RouteEndReason::Unknown
+        );
+    }
+
+    #[test]
+    fn legacy_route_push_falls_back_only_when_channels_are_absent() {
+        let shared = Shared::new(PathBuf::new(), ConsumerOptions::default());
+        shared
+            .lock_inner()
+            .route_modules
+            .insert(7, "provider".into());
+        shared.control_push(
+            br#"{"op":"route.closed","module_id":"provider","channels":[],"reason":"crash"}"#,
+        );
+        assert_eq!(
+            shared.lock_inner().route_end_reason(7),
+            RouteEndReason::Unknown
+        );
+        shared.control_push(br#"{"op":"route.closing","module_id":"provider","reason":"restart"}"#);
+        assert_eq!(
+            shared.lock_inner().route_end_reason(7),
+            RouteEndReason::Daemon(RouteCloseReason::Restart)
+        );
+        shared.control_push(br#"{"op":"route.closed","module_id":"provider","reason":"crash"}"#);
+        assert_eq!(
+            shared.lock_inner().route_end_reason(7),
+            RouteEndReason::Daemon(RouteCloseReason::Crash)
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_teardown_paths_attach_caller_and_connection_loss_reasons() {
+        for local in [true, false] {
+            let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
+            let (writer, _writer_rx) = mpsc::channel(8);
+            shared.lock_inner().writer = Some(writer);
+            let handle = RouteHandle::new(7, 1, 1);
+            shared.install_ingress_handle(handle);
+            let (tx, rx) = oneshot::channel();
+            let mut entry = PendingEntry::unary(tx, false, None, None);
+            entry.accepted = true;
+            shared.lock_inner().pending.insert(
+                PendingKey {
+                    generation: 1,
+                    channel: 7,
+                    epoch: 1,
+                    corr: 1,
+                },
+                entry,
+            );
+            if local {
+                shared
+                    .close_handle(handle, &CloseRouteOptions::default())
+                    .await
+                    .unwrap();
+            } else {
+                shared.handle_generation_drop(1, "connection gone".into());
+            }
+            let err = rx.await.unwrap().into_call_result().err().unwrap();
+            assert!(matches!(err, CallError::OutcomeUnknown(_)));
+            assert_eq!(
+                err.outcome_cause(),
+                Some(if local {
+                    OutcomeUnknownCause::RouteEnded
+                } else {
+                    OutcomeUnknownCause::ConnectionFailed
+                })
+            );
+            let shared_failure = SharedCallFailure::from(err);
+            let err = shared_failure.into_call_error();
+            assert_eq!(
+                err.close_reason(),
+                Some(&if local {
+                    RouteEndReason::ClosedByCaller
+                } else {
+                    RouteEndReason::ConnectionLost
+                })
+            );
+            shared.close_sync("test complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_end_reasons_preserve_pending_retry_classes() {
+        for reason in [
+            RouteEndReason::ClosedByCaller,
+            RouteEndReason::ConnectionLost,
+            RouteEndReason::Daemon(RouteCloseReason::ScopeEnded),
+            RouteEndReason::Unknown,
+        ] {
+            for accepted in [false, true] {
+                let (tx, rx) = oneshot::channel();
+                let mut entry = PendingEntry::unary(tx, false, None, None);
+                entry.accepted = accepted;
+                settle_route_pending_entries(vec![entry], "route ended".into(), reason.clone());
+                let err = rx.await.unwrap().into_call_result().err().unwrap();
+                assert_eq!(err.close_reason(), Some(&reason));
+                assert_eq!(matches!(err, CallError::OutcomeUnknown(_)), accepted);
+                assert_eq!(matches!(err, CallError::NotSent(_)), !accepted);
+            }
+        }
     }
 
     #[test]
@@ -6404,6 +6990,9 @@ mod tests {
             inner.generation = 2;
             inner.close_routes();
             inner.route_epochs.clear();
+            inner.route_modules.clear();
+            inner.route_end_reasons.clear();
+            inner.legacy_channel_reasons.clear();
         }
         shared.route_push(old_handle, b"stale".to_vec());
 
@@ -6533,6 +7122,122 @@ mod tests {
         assert!(dispatch_frame(shared, 1, route_open_answer(corr, channel, None)).await);
         let handle = task.await.unwrap().expect("the stand-in accepted the open");
         (request, handle)
+    }
+
+    /// Open an unscoped `plexus` route with `opts` through the stand-in
+    /// daemon, accept its route.open on `channel`, and return the open's body
+    /// and handle.
+    async fn open_answered_with(
+        shared: &Arc<Shared>,
+        consumer: &Arc<SubcConsumer>,
+        receiver: &mut mpsc::Receiver<WriteCommand>,
+        opts: CallOptions,
+        channel: u16,
+        why: &str,
+    ) -> (serde_json::Value, RouteHandle) {
+        let consumer = Arc::clone(consumer);
+        let task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("plexus"), restart_identity(), opts)
+                .await
+        });
+        let (corr, request) = next_route_open(receiver, why).await;
+        assert!(dispatch_frame(shared, 1, route_open_answer(corr, channel, None)).await);
+        let handle = task.await.unwrap().expect("the stand-in accepted the open");
+        (request, handle)
+    }
+
+    fn with_role_versions(entries: &[(&str, &str)]) -> CallOptions {
+        CallOptions {
+            role_versions: Some(
+                entries
+                    .iter()
+                    .map(|(role, version)| (role.to_string(), version.to_string()))
+                    .collect(),
+            ),
+            ..CallOptions::default()
+        }
+    }
+
+    /// A provider picks its wire shape from the role versions at bind, so a
+    /// legacy route and a versioned one to the same target must never be
+    /// shared, while the same declaration again (and an empty map, which
+    /// declares nothing) reuses the route it matches.
+    #[tokio::test]
+    async fn routes_differing_only_in_role_versions_are_kept_apart() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(9));
+        let (legacy_request, legacy) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            CallOptions::default(),
+            71,
+            "first, legacy open",
+        )
+        .await;
+        assert!(
+            legacy_request.get("role_versions").is_none(),
+            "{legacy_request}"
+        );
+
+        let (v1_request, v1) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            with_role_versions(&[("tool-provider", "v1")]),
+            72,
+            "a v1 open must not reuse the legacy route",
+        )
+        .await;
+        assert_eq!(
+            v1_request["role_versions"],
+            serde_json::json!({ "tool-provider": "v1" })
+        );
+        assert_ne!(legacy, v1);
+
+        let (v2_request, v2) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            with_role_versions(&[("tool-provider", "v2")]),
+            73,
+            "a v2 open must not reuse the v1 route",
+        )
+        .await;
+        assert_eq!(
+            v2_request["role_versions"],
+            serde_json::json!({ "tool-provider": "v2" })
+        );
+        assert!(![legacy, v1].contains(&v2));
+
+        let open = |opts: CallOptions| {
+            let consumer = Arc::clone(&consumer);
+            async move {
+                consumer
+                    .open_route(restart_target("plexus"), restart_identity(), opts)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            open(with_role_versions(&[("tool-provider", "v1")])).await,
+            v1
+        );
+        assert_eq!(open(CallOptions::default()).await, legacy);
+        assert_eq!(
+            open(CallOptions {
+                role_versions: Some(BTreeMap::new()),
+                ..CallOptions::default()
+            })
+            .await,
+            legacy,
+            "an empty map declares nothing and reuses the legacy route"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a cache hit must not send a route.open"
+        );
+        shared.close_sync("test complete");
     }
 
     #[tokio::test]

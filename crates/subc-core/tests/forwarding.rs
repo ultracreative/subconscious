@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::Shutdown,
     ops::Deref,
@@ -321,7 +321,7 @@ async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
+async fn health_prober_failing_restart_exhausts_budget_to_failed() {
     let server = TestServer::start().await;
     let supervisor =
         supervisor(&server, 1, Duration::from_millis(10)).with_health_config(health_config(
@@ -345,22 +345,27 @@ async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
     )
     .await;
 
-    // Health fields ride the same poll predicate: Disabled and the health
+    // Health fields ride the same poll predicate: Failed and the health
     // stamp are separate writes, so asserting them after a state-only wait
     // reads a mid-transition snapshot (flaked once in CI on ubuntu).
+    //
+    // Exhaustion leaves the module Failed and still enabled, not Disabled: the
+    // operator did not stop it, so `ck module start` must be able to revive it
+    // and the configured `enabled` must keep saying what the operator chose.
     //
     // The terminal health status is deliberately NOT pinned to Failing: with the
     // injected 20ms probe deadline, a loaded runner can time the probe out before
     // even this always-failing stub replies, so the budget-exhausting probe may
     // classify as Unresponsive instead of the domain-reported Failing. Both are
     // failing-class triggers; the mechanism under test is budget exhaustion to
-    // Disabled, not which trigger class fired last.
+    // Failed, not which trigger class fired last.
     wait_for_status(&module, SETUP_TIMEOUT, |status| {
-        status.state == ModuleState::Disabled
+        status.state == ModuleState::Failed
+            && status.enabled
             && status.restart_count == 1
             && !status.live
             && status.health.status != SupervisorHealthStatus::Ok
-            && status.health.last_action.as_deref() == Some("disabled")
+            && status.health.last_action.as_deref() == Some("failed")
     })
     .await;
 }
@@ -982,6 +987,171 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     assert_eq!(response.header.channel, ack.route_channel);
     assert_eq!(response.header.corr, 202);
     assert_eq!(response.body, payload);
+
+    module.stop().await.unwrap();
+}
+
+fn role_versions_open(
+    project: &TestProject,
+    session: &str,
+    module_id: &str,
+    role_versions: Option<BTreeMap<String, String>>,
+) -> ClientControlRequest {
+    let ClientControlRequest::RouteOpen {
+        target,
+        identity,
+        consumer_identity,
+        consumer_capabilities,
+        admission_facts,
+        scope,
+        ..
+    } = attach_request(project, session, module_id)
+    else {
+        unreachable!("attach_request builds a route.open");
+    };
+    ClientControlRequest::RouteOpen {
+        target,
+        identity,
+        consumer_identity,
+        consumer_capabilities,
+        role_versions,
+        admission_facts,
+        scope,
+    }
+}
+
+fn role_versions_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(role, version)| (role.to_string(), version.to_string()))
+        .collect()
+}
+
+/// The daemon advertises the field and forwards a consumer's role versions to
+/// the module's bind unchanged, as the module itself records them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_role_versions_reach_the_module_bind_verbatim() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-role-versions";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "role-versions").await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    write_frame(
+        &mut client,
+        &control_request_frame(511, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let described = read_frame_timeout(&mut client).await;
+    let ClientControlResponse::ServerDescribe { capabilities, .. } =
+        serde_json::from_slice(&described.body).unwrap()
+    else {
+        panic!("not a server.describe reply");
+    };
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability == "route-role-versions/v1"),
+        "{capabilities:?}"
+    );
+
+    let project = TestProject::new();
+    let sent = role_versions_map(&[("tool-provider", "v1"), ("management-surface", "v3")]);
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            512,
+            role_versions_open(&project, "ses-role-versions", module_id, Some(sent.clone())),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let ack = read_frame_timeout(&mut client).await;
+    assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+    assert_eq!(ack.header.corr, 512);
+
+    let attach_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(
+        attach_event["role_versions"],
+        serde_json::to_value(&sent).unwrap(),
+        "{attach_event}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+/// A malformed declaration is refused as a terminal `invalid_request` naming
+/// `role_versions`, before the module is asked to bind anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_malformed_role_versions_are_refused_without_a_bind() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-role-versions-malformed";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "role-versions-malformed")
+            .await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let project = TestProject::new();
+
+    let nine: BTreeMap<String, String> = (0..9)
+        .map(|index| (format!("role-{index}"), "v1".to_string()))
+        .collect();
+    for (corr, label, malformed) in [
+        (
+            521,
+            "invalid role name",
+            role_versions_map(&[("tool provider", "v1")]),
+        ),
+        (
+            522,
+            "invalid version",
+            role_versions_map(&[("tool-provider", "1")]),
+        ),
+        (523, "nine entries", nine),
+    ] {
+        write_frame(
+            &mut client,
+            &control_request_frame(
+                corr,
+                role_versions_open(&project, "ses-malformed", module_id, Some(malformed)),
+            ),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        let error = read_control_error_on_stream(&mut client, corr, "invalid_request").await;
+        assert_eq!(
+            error.detail,
+            Some(serde_json::json!({ "field": "role_versions" })),
+            "{label}: {error:?}"
+        );
+    }
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
+    let events = stub_events(&events_path);
+    assert!(
+        events.iter().all(|event| event["kind"] != "attach"),
+        "a malformed role_versions must be refused before route.bind; events: {events:?}"
+    );
+
+    // CONTROL: the same module records a bind for a well-formed open, so the
+    // absence above is the refusal, not a stub that records nothing.
+    let ack = attach_on_stream(&mut client, &project, 524, "ses-well-formed", module_id).await;
+    assert!(ack.route_channel > 0);
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
 
     module.stop().await.unwrap();
 }
@@ -2368,6 +2538,8 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
     let mut closing_count = 0;
     let mut closed_count = 0;
     let mut goodbye_channels = BTreeSet::new();
+    let mut expected_channels = vec![first.route_channel, second.route_channel];
+    expected_channels.sort_unstable();
     for _ in 0..4 {
         let frame = read_frame_timeout(&mut route_client).await;
         match frame.header.ty {
@@ -2383,6 +2555,10 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             None,
                             None,
                         );
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&frame.body).unwrap()["channels"],
+                            serde_json::json!(expected_channels)
+                        );
                         closing_count += 1;
                     }
                     Some("route.closed") => {
@@ -2394,6 +2570,10 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             Some(true),
                             Some(0),
                             Some(false),
+                        );
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&frame.body).unwrap()["channels"],
+                            serde_json::json!(expected_channels)
                         );
                         closed_count += 1;
                     }
@@ -3026,7 +3206,13 @@ async fn bit_set_subscription_is_excluded_and_reported_by_route_closed() {
         None,
     );
     let closed = read_frame_timeout(&mut route_client).await;
-    assert_route_closed_with_excluded_subscriptions(&closed, module_id, true, 1);
+    assert_route_closed_with_excluded_subscriptions(
+        &closed,
+        module_id,
+        &[ack.route_channel],
+        true,
+        1,
+    );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);
@@ -3826,6 +4012,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         ),
         consumer_identity: None,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };
@@ -3886,6 +4073,7 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         ),
         consumer_identity: None,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };
@@ -7164,6 +7352,7 @@ fn attach_request_with_consumer_identity(
         ),
         consumer_identity,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     }
@@ -7488,15 +7677,33 @@ fn assert_route_lifecycle_push(
     if let Some(terminal) = terminal {
         expected["terminal"] = Value::Bool(terminal);
     }
-    assert_eq!(
-        serde_json::from_slice::<Value>(&frame.body).unwrap(),
-        expected
+    let mut actual = serde_json::from_slice::<Value>(&frame.body).unwrap();
+    let channels = actual
+        .as_object_mut()
+        .unwrap()
+        .remove("channels")
+        .expect("lifecycle pushes always include channels");
+    let channels = channels.as_array().expect("channels is an array");
+    assert!(
+        !channels.is_empty(),
+        "a route recipient must have a covered channel"
     );
+    assert!(channels.iter().all(|channel| channel
+        .as_u64()
+        .is_some_and(|channel| channel > 0 && channel <= u16::MAX as u64)));
+    assert!(
+        channels
+            .windows(2)
+            .all(|pair| pair[0].as_u64() < pair[1].as_u64()),
+        "channels are unique and sorted"
+    );
+    assert_eq!(actual, expected);
 }
 
 fn assert_route_closed_with_excluded_subscriptions(
     frame: &Frame,
     module_id: &str,
+    channels: &[u16],
     drained: bool,
     excluded_subscriptions: u32,
 ) {
@@ -7507,6 +7714,7 @@ fn assert_route_closed_with_excluded_subscriptions(
         serde_json::json!({
             "op": "route.closed",
             "module_id": module_id,
+            "channels": channels,
             "reason": "reload",
             "drained": drained,
             "abandoned": 0,
@@ -8090,7 +8298,6 @@ fn never_connecting_spec(
 
     (
         ModuleSpec {
-            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -8141,7 +8348,6 @@ where
     );
 
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),

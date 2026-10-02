@@ -7,7 +7,7 @@
 //! none (it opens no Claustrum or Callosum route).
 //!
 //! From an empty broker store and a vault holding only the roots, a supervised ck-bus
-//! issues its own system and box users, creates the census bucket and the five streams
+//! issues its own system and box users, creates the census bucket and the six streams
 //! with their literal bindings, and publishes on its sentinel subject. A restart writes
 //! a new `own_users.json` and revokes the previous incarnation's box user: the claims
 //! read back carry its key, and a client presenting a JWT for it is refused as revoked.
@@ -343,12 +343,24 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
     let mut sentinel = subscribe_confirmed(&client, &names.sentinel_ping()).await;
     bus::restart_ckbus(&plane.run.connection_file).await;
     let second = ready(&plane, 2).await;
-    let published = tokio::time::timeout(Duration::from_secs(10), sentinel.next())
-        .await
-        .expect("ck-bus publishes on its sentinel subject")
-        .unwrap();
-    let body: Value = serde_json::from_slice(&published.payload).unwrap();
-    assert_eq!(body["incarnation"], second["incarnation"]);
+    // The subscription opens before the restart, so the outgoing process's own
+    // sentinel pings can arrive first. Skip those (each must name the first
+    // incarnation, nothing else) until the new process's ping arrives.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let published = tokio::time::timeout_at(deadline, sentinel.next())
+            .await
+            .expect("the restarted ck-bus publishes on its sentinel subject")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&published.payload).unwrap();
+        if body["incarnation"] == second["incarnation"] {
+            break;
+        }
+        assert_eq!(
+            body["incarnation"], first["incarnation"],
+            "a sentinel ping names neither the outgoing nor the restarted ck-bus"
+        );
+    }
     // The restarted process overwrites its own key at its own, higher generation.
     assert!(own_census(&js, &names, plane.run.root.path(), &second).await > first_generation);
     let recapped = js

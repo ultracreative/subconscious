@@ -16,19 +16,22 @@ use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
-    ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler,
-    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef,
-    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeSelector, SubcConsumer,
-    SubcModuleError, Subject, SubscribeOptions,
+    async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
+    CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
+    ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver, PolicyResolverConfig,
+    PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError,
+    RouteBindRequest, RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle,
+    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
+    SubscribeOptions,
 };
-use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
         IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
         Tool,
     },
+    scope::{ScopeKind, ScopeStamp, ScopeStatus},
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Principal, Priority, RouteTarget,
 };
@@ -805,6 +808,7 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
                     "env": env,
                     "enabled": true,
                     "reserved": true,
+                    "launch_nonce_env": true,
                 }
             }
         }))
@@ -812,7 +816,7 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     )
     .unwrap();
 
-    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let expected_source = if cfg!(unix) { "fd" } else { "env" };
     let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
@@ -820,6 +824,8 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     })
     .await;
     assert_eq!(started["source"], expected_source, "{started}");
+    assert_eq!(started["env_present"], !cfg!(unix), "{started}");
+    assert_eq!(started["fd_env_present"], cfg!(unix), "{started}");
     wait_for_catalog_module(&daemon.connection_file, MODULE_ID, START_TIMEOUT).await;
 
     let mut client = connect_authed_client(&daemon.connection_file)
@@ -838,6 +844,29 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     assert_eq!(
         modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
         "{response}"
+    );
+    daemon.kill_and_wait();
+    // The warning goes to the daemon's own log (the file an operator reads), not
+    // to stderr, which launchd and systemd usually discard. spawn_daemon_child
+    // puts the data home at <temp>/data, so the log is under its run/logs.
+    let logs_dir = temp_dir
+        .join("data")
+        .join("cortexkit")
+        .join("run")
+        .join("logs");
+    let log = fs::read_dir(&logs_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", logs_dir.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("subc."))
+        .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+        .collect::<String>();
+    assert!(
+        log.lines().any(
+            |line| line.contains("launch_nonce_env is deprecated and ignored")
+                && line.contains(MODULE_ID)
+        ),
+        "missing module-named deprecation warning in {}: {log}",
+        logs_dir.display()
     );
 }
 
@@ -2201,12 +2230,21 @@ async fn wait_for_connection_file(path: &Path, wait: Duration) {
 async fn wait_for_catalog_module(path: &Path, module_id: &str, wait: Duration) {
     let deadline = Instant::now() + wait;
     let mut corr = 1_000;
+    let mut last_error = None;
     loop {
-        if catalog_modules(path, Some(module_id), corr).await.len() == 1 {
-            return;
+        // A daemon that has just restarted can publish its connection file before
+        // it answers the handshake promptly (a 2 s ServerProof timeout on a loaded
+        // Windows runner), so a failed connect means "not yet", like an empty
+        // catalog, until the deadline.
+        match try_catalog_modules(path, Some(module_id), corr).await {
+            Ok(modules) if modules.len() == 1 => return,
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
         }
         if Instant::now() >= deadline {
-            panic!("module {module_id} did not register in catalog within {wait:?}");
+            panic!(
+                "module {module_id} did not register in catalog within {wait:?}; last connect error: {last_error:?}"
+            );
         }
         corr += 1;
         sleep(Duration::from_millis(50)).await;
@@ -2241,7 +2279,17 @@ fn read_events(path: &Path) -> Vec<Value> {
 }
 
 async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec<Value> {
-    let mut client = connect_authed_client(path).await.unwrap();
+    try_catalog_modules(path, module_id, corr).await.unwrap()
+}
+
+async fn try_catalog_modules(
+    path: &Path,
+    module_id: Option<&str>,
+    corr: u64,
+) -> Result<Vec<Value>, String> {
+    let mut client = connect_authed_client(path)
+        .await
+        .map_err(|error| error.to_string())?;
     let response = control_rpc_on_stream(
         &mut client,
         corr,
@@ -2252,7 +2300,7 @@ async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec
     )
     .await;
     assert_eq!(response["op"], "catalog.list");
-    response["modules"].as_array().cloned().unwrap_or_default()
+    Ok(response["modules"].as_array().cloned().unwrap_or_default())
 }
 
 async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> (u16, u32)
@@ -2293,7 +2341,15 @@ where
         .unwrap();
     stream.flush().await.unwrap();
     let response = read_frame_timeout(stream).await;
-    assert_eq!(response.header.ty, FrameType::Response);
+    // Show the daemon's error body on a mismatch: a bare "left: Error, right:
+    // Response" says a control call failed but not which check refused it.
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "control request {request} answered {:?}: {}",
+        response.header.ty,
+        String::from_utf8_lossy(&response.body)
+    );
     assert_eq!(response.header.channel, 0);
     assert_eq!(response.header.corr, corr);
     serde_json::from_slice(&response.body).unwrap()
@@ -3691,6 +3747,121 @@ async fn scoped_opens_under_other_refs_or_epochs_and_unscoped_opens_get_their_ow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_route_close_names_only_its_channel_and_restart_names_all_remaining_routes() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = Arc::new(harness.connect().await);
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("two-route-reasons");
+    let scoped = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let unscoped = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let pending = {
+        let consumer = Arc::clone(&consumer);
+        tokio::spawn(async move {
+            consumer
+                .request(
+                    &scoped,
+                    serde_json::to_vec(&json!({"name":"hold", "arguments":{"delay_ms":30_000}}))
+                        .unwrap(),
+                    CallOptions {
+                        timeout: Duration::from_secs(60),
+                        ..fast_call_options()
+                    },
+                )
+                .await
+        })
+    };
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "request_received" && event["body_json"]["name"] == "hold"
+    })
+    .await;
+    harness.sync(json!([])).await;
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    assert_eq!(closed.body["channels"], json!([scoped.channel]));
+    assert_eq!(closed.body["reason"], "scope_ended");
+    let err = timeout(EVENT_TIMEOUT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, CallError::OutcomeUnknown(_)), "{err}");
+    assert_eq!(err.outcome_cause(), Some(OutcomeUnknownCause::RouteEnded));
+    assert_eq!(
+        err.close_reason(),
+        Some(&RouteEndReason::Daemon(RouteCloseReason::ScopeEnded))
+    );
+    consumer
+        .request(&unscoped, b"{}".to_vec(), fast_call_options())
+        .await
+        .expect("the unscoped route remains usable");
+
+    let other = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            consumer_identity("restart-second-route"),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let mut client = connect_authed_client(&harness.daemon.connection_file)
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
+        module_id: SCOPE_PROVIDER.to_string(),
+        drain_timeout_ms: Some(100),
+    })
+    .unwrap();
+    write_frame(&mut client, &control_request_frame(77, body))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = timeout(EVENT_TIMEOUT, read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.header.ty, FrameType::Response);
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    let mut expected = vec![unscoped.channel, other.channel];
+    expected.sort_unstable();
+    assert_eq!(closed.body["channels"], json!(expected));
+    assert_eq!(closed.body["reason"], "restart");
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ending_the_scope_closes_the_route_with_scope_ended_and_it_is_not_reopened() {
     let mut harness = start_scope_harness().await;
     harness.sync(json!([scope_record("session-a", 1)])).await;
@@ -4069,4 +4240,604 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
         closed.body
     );
     daemon.kill_and_wait();
+}
+
+// scope.sync and scope.describe through the SDK's ModuleHandle, against a
+// real daemon.
+//
+// The daemon gives sync authority only to a module it launched itself, so the
+// owner is the `scope-owner` example (crates/subc-client-rs/examples), run
+// under the daemon's supervision: it calls `ModuleHandle::scope_sync` and
+// `scope_describe` for each step of a script and records each reply, or the
+// daemon's refusal code read from `ScopeCallError::Refused`, as a JSON line.
+// The second module, which reads the owner's scopes, is served from this
+// process, so its replies are checked here as typed values.
+
+const SDK_SCOPE_OWNER: &str = "subc-client-rs-sdk-scope-owner";
+const SDK_SCOPE_READER: &str = "subc-client-rs-sdk-scope-reader";
+
+struct ScopeOwnerRun {
+    daemon: LiveDaemon,
+    _temp_dir: TestTempDir,
+    /// One entry per script step, in order: `{"ok": reply}`,
+    /// `{"refused": {"code", "message"}}`, or `{"other": error}`.
+    results: Vec<Value>,
+}
+
+impl ScopeOwnerRun {
+    /// A module served from this test process, which never holds sync
+    /// authority.
+    async fn reader(
+        &self,
+    ) -> (
+        ModuleHandle,
+        tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+    ) {
+        let reader = spawn_inline_module(
+            &self.daemon.connection_file,
+            inline_module_manifest(SDK_SCOPE_READER, &["a"]),
+        )
+        .await;
+        wait_for_catalog_module(
+            &self.daemon.connection_file,
+            SDK_SCOPE_READER,
+            START_TIMEOUT,
+        )
+        .await;
+        reader
+    }
+}
+
+/// Start a daemon that supervises the `scope-owner` example with `steps` as
+/// its script, and wait until it has run every step.
+async fn run_scope_owner(steps: Value) -> ScopeOwnerRun {
+    run_scope_owner_with_config(steps, json!({})).await
+}
+
+/// [`run_scope_owner`], with the top-level members of `extra_config` added to
+/// the daemon's `subc.jsonc`.
+async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> ScopeOwnerRun {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let owner_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "scope-owner"),
+        &["build", "-p", "subc-client-rs", "--example", "scope-owner"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-sdk-scopes");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let script_path = temp_dir.join("owner-script.json");
+    let results_path = temp_dir.join("owner-results.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    fs::write(&script_path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    let env = BTreeMap::from([
+        (
+            "SUBC_SCOPE_OWNER_SCRIPT".to_string(),
+            script_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "SUBC_SCOPE_OWNER_RESULTS".to_string(),
+            results_path.to_string_lossy().into_owned(),
+        ),
+    ]);
+    let mut config = json!({
+        "version": 1,
+        "modules": {
+            SDK_SCOPE_OWNER: {
+                "program": owner_bin.to_string_lossy(),
+                "args": [],
+                "env": env,
+                "enabled": true,
+                "reserved": true,
+            }
+        }
+    });
+    for (key, value) in extra_config.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_event(&results_path, START_TIMEOUT, |event| event["done"] == true).await;
+    let mut results = vec![Value::Null; steps.as_array().unwrap().len()];
+    for event in read_events(&results_path) {
+        if let Some(step) = event["step"].as_u64() {
+            let slot = &mut results[usize::try_from(step).unwrap()];
+            // The first run of the script is the one that counts; a restarted
+            // owner would run it again under a new connection.
+            if slot.is_null() {
+                *slot = event["result"].clone();
+            }
+        }
+    }
+    ScopeOwnerRun {
+        daemon,
+        _temp_dir: temp_dir,
+        results,
+    }
+}
+
+fn sdk_scope_owner() -> Principal {
+    Principal::Reserved {
+        module_id: SDK_SCOPE_OWNER.to_string(),
+    }
+}
+
+fn sync_step(generation: u64, scopes: Value) -> Value {
+    json!({ "op": "sync", "generation": generation, "scopes": scopes })
+}
+
+fn describe_step(owner: &Principal, scope_ref: &str) -> Value {
+    json!({ "op": "describe", "owner": owner, "ref": scope_ref })
+}
+
+fn head_scope(scope_ref: &str, scope_epoch: u64) -> Value {
+    json!({ "ref": scope_ref, "scope_epoch": scope_epoch, "kind": "head" })
+}
+
+/// The JSON the `scope-owner` example records for a describe reply, so a
+/// reply read here can be compared with one the owner read.
+fn describe_reply_json(reply: &ScopeDescribeReply) -> Value {
+    json!({
+        "status": reply.status,
+        "scope_epoch": reply.scope_epoch,
+        "daemon_incarnation": reply.daemon_incarnation,
+        "owner_synced": reply.owner_synced,
+        "owner_configured": reply.owner_configured,
+        "scope": reply.scope,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_syncs_a_scope_and_both_it_and_another_module_describe_it_live() {
+    let mut run = run_scope_owner(json!([
+        sync_step(1, json!([head_scope("session-a", 3)])),
+        describe_step(&sdk_scope_owner(), "session-a"),
+    ]))
+    .await;
+
+    let sync = &run.results[0]["ok"];
+    assert_eq!(sync["generation"], 1, "{:?}", run.results);
+    assert_eq!(sync["results"].as_array().unwrap().len(), 1, "{sync}");
+    assert_eq!(sync["results"][0]["ref"], "session-a");
+    assert_eq!(sync["results"][0]["scope_epoch"], 3);
+    assert_eq!(sync["results"][0]["outcome"], "created");
+    assert_eq!(sync["ended"], json!([]));
+
+    let owner_view = &run.results[1]["ok"];
+    assert_eq!(owner_view["status"], "live", "{:?}", run.results);
+    assert_eq!(owner_view["scope_epoch"], 3);
+    assert_eq!(owner_view["owner_synced"], true);
+    assert_eq!(owner_view["owner_configured"], true);
+    assert_eq!(owner_view["scope"]["owner"], json!(sdk_scope_owner()));
+    assert_eq!(owner_view["scope"]["ref"], "session-a");
+    assert_eq!(owner_view["scope"]["scope_epoch"], 3);
+    assert_eq!(owner_view["scope"]["kind"], "head");
+
+    let (reader, serve_task) = run.reader().await;
+    let reader_view = reader
+        .scope_describe(sdk_scope_owner(), "session-a".to_string())
+        .await
+        .unwrap();
+    assert_eq!(reader_view.status, ScopeStatus::Live);
+    assert_eq!(reader_view.scope_epoch, Some(3));
+    assert_eq!(
+        reader_view.scope.as_ref().map(|stamp| stamp.scope_epoch),
+        Some(3)
+    );
+    assert_eq!(
+        &describe_reply_json(&reader_view),
+        owner_view,
+        "a module that is not the owner reads the same answer"
+    );
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_scope_sync_carries_the_daemons_typed_code() {
+    let mut run = run_scope_owner(json!([
+        sync_step(5, json!([head_scope("session-a", 1)])),
+        // Generation 5 again, not larger than the last accepted one: refused.
+        sync_step(5, json!([head_scope("session-a", 2)])),
+        // Generation 4 is smaller still. Had it applied, its empty set would
+        // have ended session-a.
+        sync_step(4, json!([])),
+        describe_step(&sdk_scope_owner(), "session-a"),
+    ]))
+    .await;
+
+    assert_eq!(run.results[0]["ok"]["generation"], 5, "{:?}", run.results);
+    for step in [1, 2] {
+        assert_eq!(
+            run.results[step]["refused"]["code"],
+            subc_protocol::error_codes::SCOPE_SYNC_STALE,
+            "step {step}: {:?}",
+            run.results
+        );
+    }
+    let after = &run.results[3]["ok"];
+    assert_eq!(after["status"], "live", "a refused sync changes nothing");
+    assert_eq!(after["scope_epoch"], 1);
+
+    // A module the daemon did not launch has no sync authority; the refusal
+    // reaches this caller with the code as the typed value.
+    let (reader, serve_task) = run.reader().await;
+    let error = reader
+        .scope_sync(1, vec![serde_json::from_value(head_scope("x", 1)).unwrap()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ScopeCallError::Refused { code, .. }
+                if code == subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY)
+    );
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+const SDK_SCOPE_PROVIDER: &str = "subc-client-rs-sdk-scope-provider";
+
+/// A module's own tests build the `RouteBindRequest` its `on_bind` receives
+/// through the public constructor and setters, from outside this crate.
+#[test]
+fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
+    let handle = RouteHandle::detached(7, 2);
+    let target = RouteTarget::ToolProvider {
+        module_id: "aft".to_string(),
+    };
+    let identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
+
+    let bare = RouteBindRequest::new(handle, target.clone(), identity.clone());
+    assert_eq!(bare.handle, handle);
+    assert_eq!((bare.handle.channel, bare.handle.epoch), (7, 2));
+    assert_eq!(bare.target, target);
+    assert_eq!(bare.identity, identity);
+    assert_eq!(bare.principal, None);
+    assert_eq!(bare.consumer_capabilities, None);
+    assert_eq!(bare.role_versions, None);
+    assert_eq!(bare.admission_facts, None);
+    assert_eq!(bare.scope, None);
+
+    let stamp: ScopeStamp = serde_json::from_value(json!({
+        "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+        "ref": "session-a",
+        "scope_epoch": 3,
+        "kind": "head",
+        "attributes": { "agent_id": "agent-7" },
+        "owner_authorized": true,
+    }))
+    .unwrap();
+    let principal = Principal::Reserved {
+        module_id: "broca".to_string(),
+    };
+    let role_versions = BTreeMap::from([("tool-provider".to_string(), "v1".to_string())]);
+    let full = RouteBindRequest::new(handle, target, identity)
+        .with_principal(principal.clone())
+        .with_consumer_capabilities(vec!["elicitation".to_string()])
+        .with_role_versions(role_versions.clone())
+        .with_admission_facts(json!({ "schema": 1 }))
+        .with_scope(stamp.clone());
+    assert_eq!(full.principal, Some(principal));
+    assert_eq!(
+        full.consumer_capabilities,
+        Some(vec!["elicitation".to_string()])
+    );
+    assert_eq!(full.role_versions, Some(role_versions));
+    assert_eq!(full.admission_facts, Some(json!({ "schema": 1 })));
+    assert_eq!(full.scope, Some(stamp));
+}
+
+/// A detached handle belongs to no connection: every operation that would
+/// reach one fails with the stale-route error and sends nothing, even against
+/// a live daemon with a live module and consumer on the other end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-detached-handle");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let module_id = "subc-client-rs-detached-handle";
+    let (module, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+
+    // Channel 1, epoch 1 is the first route either side would be given, so a
+    // check that compared only the wire pair could mistake this for a live one.
+    let detached = RouteHandle::detached(1, 1);
+    // A real route on the same consumer, so the connection under test is live.
+    let live = consumer
+        .open_route(
+            RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            BindIdentity::new(temp_dir.join("project"), "test", "detached"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(live, detached);
+
+    let stale = |label: &str, error: CallError| {
+        assert!(
+            matches!(error, CallError::StaleRouteHandle(handle) if handle == detached),
+            "{label}: {error:?}"
+        );
+    };
+    stale(
+        "request",
+        consumer
+            .request(&detached, b"{}".to_vec(), fast_call_options())
+            .await
+            .unwrap_err(),
+    );
+    stale(
+        "subscribe_route",
+        consumer
+            .subscribe_route(&detached, b"{}".to_vec(), SubscribeOptions::default())
+            .await
+            .err()
+            .expect("subscribe_route on a detached handle fails"),
+    );
+    stale(
+        "poll_route",
+        consumer
+            .poll_route(&detached, PollKind::Status, Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+    );
+    stale(
+        "push_events",
+        consumer
+            .push_events(&detached)
+            .expect_err("push_events on a detached handle fails"),
+    );
+    stale(
+        "close_handle",
+        consumer
+            .close_handle(&detached, CloseRouteOptions::default())
+            .await
+            .unwrap_err(),
+    );
+
+    let push = module
+        .push(&detached, b"{}".to_vec(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(push, SubcModuleError::StaleRouteHandle(handle) if handle == detached),
+        "push: {push:?}"
+    );
+
+    assert!(matches!(
+        detached.on_request("elicitation", |_body, _ctx| async { Vec::new() }),
+        Err(ReverseRequestRegistrationError::NotConsumerRoute)
+    ));
+    assert!(matches!(
+        detached.on_request_fallible("elicitation", |_body, _ctx| async { Ok(Vec::new()) }),
+        Err(ReverseRequestRegistrationError::NotConsumerRoute)
+    ));
+
+    // The live route still works, so the refusals above were about the
+    // handle, not a dead connection.
+    let echoed = consumer
+        .request(&live, b"still-live".to_vec(), fast_call_options())
+        .await
+        .unwrap();
+    assert_eq!(echoed, b"still-live");
+
+    drop(consumer);
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+/// One bind's session and the scope stamp it carried.
+type RecordedBind = (String, Option<ScopeStamp>);
+
+/// Records the scope stamp each bind carried, keyed by the bind's session.
+#[derive(Clone, Default)]
+struct ScopeRecordingHandler {
+    binds: Arc<Mutex<Vec<RecordedBind>>>,
+}
+
+impl ScopeRecordingHandler {
+    fn stamp_for(&self, session: &str) -> Option<Option<ScopeStamp>> {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(bound_session, _)| bound_session == session)
+            .map(|(_, stamp)| stamp.clone())
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for ScopeRecordingHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((req.identity.session.clone(), req.scope.clone()));
+        BindDecision::accept()
+    }
+}
+
+/// A module served through the SDK sees the daemon's scope stamp in `on_bind`,
+/// exactly as the daemon stamped it, and sees none on an unscoped route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
+    // The owner sets `agent_id`, which the daemon accepts only from an owner
+    // listed in its `scope_authority_owners` config, hence the extra config.
+    // It lists the `direct` principal as a carrier: this test process connects
+    // with the daemon's key and no launch nonce, so the daemon stamps it
+    // `direct`, and only the owner or a listed carrier may open a scoped route.
+    let mut run = run_scope_owner_with_config(
+        json!([
+            sync_step(
+                1,
+                json!([{
+                    "ref": "session-a",
+                    "scope_epoch": 3,
+                    "kind": "head",
+                    "carriers": [{ "principal": { "kind": "direct" } }],
+                    "attributes": { "agent_id": "agent-7" },
+                }])
+            ),
+            describe_step(&sdk_scope_owner(), "session-a"),
+        ]),
+        json!({ "scope_authority_owners": [SDK_SCOPE_OWNER] }),
+    )
+    .await;
+    assert_eq!(
+        run.results[0]["ok"]["results"][0]["outcome"], "created",
+        "{:?}",
+        run.results
+    );
+    let described: ScopeStamp =
+        serde_json::from_value(run.results[1]["ok"]["scope"].clone()).unwrap();
+
+    let handler = ScopeRecordingHandler::default();
+    let (_provider, serve_task) = spawn_inline_module_with_handler(
+        &run.daemon.connection_file,
+        inline_module_manifest(SDK_SCOPE_PROVIDER, &["a"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(
+        &run.daemon.connection_file,
+        SDK_SCOPE_PROVIDER,
+        START_TIMEOUT,
+    )
+    .await;
+
+    let consumer = SubcConsumer::connect(&run.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let target = RouteTarget::ToolProvider {
+        module_id: SDK_SCOPE_PROVIDER.to_string(),
+    };
+    let identity =
+        |session: &str| BindIdentity::new(run._temp_dir.join("project"), "test", session);
+    fs::create_dir_all(run._temp_dir.join("project")).unwrap();
+    consumer
+        .open_route_scoped(
+            target.clone(),
+            identity("scoped"),
+            ScopeSelector {
+                owner: sdk_scope_owner(),
+                scope_ref: "session-a".to_string(),
+                scope_epoch: Some(3),
+            },
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    consumer
+        .open_route(target, identity("unscoped"), fast_call_options())
+        .await
+        .unwrap();
+
+    let stamp = handler
+        .stamp_for("scoped")
+        .expect("the scoped route was bound")
+        .expect("on_bind must receive the daemon's scope stamp");
+    assert_eq!(stamp.owner, sdk_scope_owner());
+    assert_eq!(stamp.scope_ref, "session-a");
+    assert_eq!(stamp.scope_epoch, 3);
+    assert_eq!(stamp.kind, ScopeKind::Head);
+    assert_eq!(stamp.attributes.agent_id.as_deref(), Some("agent-7"));
+    assert!(stamp.owner_authorized);
+    assert_eq!(
+        stamp, described,
+        "the bind carries the daemon's stamp unchanged"
+    );
+    assert_eq!(
+        handler.stamp_for("unscoped"),
+        Some(None),
+        "an unscoped route is bound with no stamp"
+    );
+
+    drop(consumer);
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
+    let mut run = run_scope_owner(json!([
+        sync_step(1, json!([head_scope("session-a", 1)])),
+        describe_step(&sdk_scope_owner(), "never-synced"),
+    ]))
+    .await;
+
+    // The owner has synced in this daemon incarnation and is configured, so a
+    // ref it never synced is `not_live` with both flags set: a reader treats it
+    // as gone, not as waiting for the owner to re-sync after a restart.
+    let owner_view = &run.results[1]["ok"];
+    assert_eq!(owner_view["status"], "not_live", "{:?}", run.results);
+    assert_eq!(owner_view["scope_epoch"], Value::Null);
+    assert_eq!(owner_view["owner_synced"], true);
+    assert_eq!(owner_view["owner_configured"], true);
+    assert_eq!(owner_view["scope"], Value::Null);
+
+    // An owner the daemon does not supervise has neither synced nor ever will.
+    let (reader, serve_task) = run.reader().await;
+    let unknown_owner = reader
+        .scope_describe(
+            Principal::Reserved {
+                module_id: "subc-client-rs-no-such-owner".to_string(),
+            },
+            "session-a".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_owner.status, ScopeStatus::NotLive);
+    assert_eq!(unknown_owner.scope_epoch, None);
+    assert!(!unknown_owner.owner_synced);
+    assert!(!unknown_owner.owner_configured);
+    assert_eq!(unknown_owner.scope, None);
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
 }

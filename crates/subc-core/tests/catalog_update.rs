@@ -399,7 +399,6 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
     let absent_ready = server.temp_dir.join("supervised-absent-ready");
     let absent = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: absent_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -960,6 +959,7 @@ fn route_open_frame(project: &TestProject, module_id: &str, corr: u64) -> Frame 
             ),
             consumer_identity: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         },
@@ -1130,6 +1130,7 @@ async fn open_route(
                 ),
                 consumer_identity: None,
                 consumer_capabilities: None,
+                role_versions: None,
 
                 admission_facts: None,
                 scope: None,
@@ -1311,7 +1312,6 @@ async fn spawn_ready_stub(
     }
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1346,6 +1346,7 @@ async fn route_open_terminal(
                 ),
                 consumer_identity: None,
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: None,
             },

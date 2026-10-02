@@ -19,6 +19,64 @@ use tokio::process::Command;
 const MODULE_ID: &str = "ckbus";
 const DECLARED_DRAIN_TIMEOUT_MS: u64 = 2_000;
 
+/// The operator data-home guard compares the live module's files by presence
+/// or by content according to `data_home`'s lists. A state file ck-bus starts
+/// writing that is in neither list would be compared by content, so the live
+/// module rewriting it during a run would fail an unrelated test. This reads
+/// every `pub const *_FILE` / `*_DIR` string in ck-bus's own source and
+/// requires each to be classified.
+#[test]
+fn every_ckbus_state_file_is_classified() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = BTreeSet::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("pub const ") else {
+                    continue;
+                };
+                let Some((name, value)) = rest.split_once(": &str = \"") else {
+                    continue;
+                };
+                if !(name.ends_with("_FILE") || name.ends_with("_DIR")) {
+                    continue;
+                }
+                let value = value.trim_end_matches("\";");
+                found.insert((value.to_string(), format!("{}:{name}", path.display())));
+            }
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "the scan found no state-file constants, so it is reading the wrong place"
+    );
+    let classified: BTreeSet<&str> = data_home::LIVE_REWRITTEN
+        .iter()
+        .chain(data_home::LIVE_SUBTREES.iter())
+        .chain(data_home::CONTENT_COMPARED.iter())
+        .copied()
+        .collect();
+    let unclassified: Vec<_> = found
+        .iter()
+        .filter(|(value, _)| !classified.contains(value.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "ck-bus state files missing from the operator data-home guard's lists in \
+         tests/harness/data_home.rs: {unclassified:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_declaration_and_registration_names_every_observable() {
     let _gate = harness::acceptance_gate().await;
@@ -399,6 +457,7 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
         identity: BindIdentity::new(&*run.root, "ck-bus-acceptance", "principal-control"),
         consumer_identity,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };
@@ -446,6 +505,11 @@ async fn assert_hand_started_copy_refused(run: &AcceptanceRun, binary: &Path, no
         .arg(&run.connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
         .env("XDG_DATA_HOME", run.root.join("data"))
+        .env("XDG_RUNTIME_DIR", run.root.join("run"))
+        .env("XDG_CONFIG_HOME", run.root.join("config"))
+        // This is a manual negative control, not a supervised spawn. The SDK
+        // still accepts an environment nonce when no descriptor is named.
+        .env_remove("SUBC_LAUNCH_NONCE_FD")
         .env_remove("SUBC_LAUNCH_NONCE");
     if let Some(nonce) = nonce {
         command.env("SUBC_LAUNCH_NONCE", nonce);
@@ -543,4 +607,24 @@ fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource 
     } else {
         subc_protocol::manifest::LaunchNonceSource::Fd
     }
+}
+
+/// Another process can see the descriptor name, but not the secret it carries.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervised_nonce_cannot_be_scraped_from_the_process_environment() {
+    let _gate = harness::acceptance_gate().await;
+    let run = AcceptanceRun::start(Path::new(env!("CARGO_BIN_EXE_ck-bus"))).await;
+    let pid = wait_for_narrowed_provenance_pid(&run).await;
+    let environment = harness::signer::seeds::process_environment(pid);
+    assert!(
+        harness::signer::seeds::environment_value(&environment, "SUBC_LAUNCH_NONCE_FD")
+            .is_some_and(|value| value.starts_with("3:")),
+        "missing descriptor name: {environment}"
+    );
+    assert!(
+        harness::signer::seeds::environment_value(&environment, "SUBC_LAUNCH_NONCE").is_none(),
+        "a process-environment scrape must not reveal the launch secret"
+    );
+    run.shutdown().await;
 }

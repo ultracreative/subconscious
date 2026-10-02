@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.25.1 — 2026-10-02
+
+- Add non-exhaustive `OutcomeUnknownCause` and `CallError::outcome_cause()` through typed error sources. Reply deadlines, writer failures, consumer closure, connection loss, route ends, and internal completion failures can be distinguished without matching `OutcomeUnknown` error message text. Existing error variants, message text, retry classes, and route-end reasons are preserved.
+
+## 0.25.0 — 2026-10-02
+
+- Add non-exhaustive `RouteEndReason` and `CallError::close_reason()` without changing existing error variants or retry classes. Reasons follow named channels, with module fallback only for legacy pushes lacking channels; reused channels clear their history.
+- Breaking: `RouteCloseReason` gains the four scope variants, and the public control dependency moves to 0.27. Exhaustive reason matches must be updated. The error getter itself is additive.
+
+## 0.24.0 — 2026-10-01
+
+- Minor bump because this crate's public types come from `subc-protocol`, which moves to 0.28.0 (its `ToolCallRequest` gains an `origin` field; see that crate's changelog). A consumer that also depends on `subc-protocol` directly must move both together, or two incompatible copies of the protocol types would meet. Also takes `subc-control` 0.26 and `subc-transport` 0.9, which moved for the same reason.
+- Breaking: `CallOptions`, `SubscribeOptions` and `CloseRouteOptions` gain `role_versions: Option<BTreeMap<String, String>>` (default `None`), sent on `route.open`, including admitted routes opened with options. It is part of the route cache key, so a legacy route and a versioned one to the same target are never shared. An empty map is treated as `None`. A daemon without `route-role-versions/v1` drops the field, and a malformed map fails the call as not sent with `invalid_request`.
+- Breaking: `RouteBindRequest` gains `role_versions`, so a module built on this SDK sees the consumer's declaration in `on_bind`.
+- Breaking: `RouteBindRequest` gains `scope: Option<ScopeStamp>`, the daemon's scope stamp copied from the bind unchanged, so a module served through `serve` can tell which session a route belongs to. Until now the SDK dropped it. `None` means an unscoped route or a daemon that predates scopes.
+- Breaking: `RouteBindRequest` is now `#[non_exhaustive]`, so a later field is additive. Code outside this crate builds one with `RouteBindRequest::new(handle, target, identity)` and the `with_principal`, `with_consumer_capabilities`, `with_role_versions`, `with_admission_facts` and `with_scope` setters.
+- New `RouteHandle::detached(channel, epoch)`: a handle that belongs to no connection, for building a `RouteBindRequest` in a module's own tests. Every operation on it that would reach a connection fails with the stale-route error (`SubcModuleError::StaleRouteHandle`, `CallError::StaleRouteHandle`, or `ReverseRequestRegistrationError::NotConsumerRoute`) and sends nothing.
+
+## 0.23.7 — 2026-10-01
+
+- Builds again on toolchains older than Rust 1.99. 0.23.6 replaced the deprecated
+  `AtomicU64::fetch_update` with `try_update` and declared `rust-version = "1.99"`, because
+  `try_update` does not exist before 1.99. The two counters now use a compare-exchange loop, which
+  builds on every toolchain and is warning-free on 1.99, and the `rust-version` declaration is gone.
+
+## 0.23.6 — 2026-10-01
+
+- Builds warning-free on Rust 1.99, where `AtomicU64::fetch_update` is deprecated: the two counters
+  use `try_update` instead. This release requires Rust 1.99 (`rust-version = "1.99"`); 0.23.7 lifts
+  that requirement.
+
+## 0.23.5 — 2026-10-01
+
+- `ModuleHandle::scope_sync(generation, scopes)` registers the module's full scope set
+  (`scope.sync`) and returns a `ScopeSyncReply` (`generation`, per-record `results` in request
+  order, `ended`). `ModuleHandle::scope_describe(owner, scope_ref)` reads one scope's state
+  (`scope.describe`) and returns a `ScopeDescribeReply` with every field of the daemon's answer
+  (`status`, `scope_epoch`, `daemon_incarnation`, `owner_synced`, `owner_configured`, `scope`).
+  Both reply structs are `#[non_exhaustive]`. Each call is gated on its own op in the
+  HELLO_ACK's `subc_ops` and fails with `ScopeCallError::NotSupported` without sending anything
+  when the daemon does not list it.
+- New `ScopeCallError`. A daemon refusal is `Refused { code, message }` with the code exactly as
+  sent, so callers match it against `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
+  `SCOPE_SYNC_NOT_AUTHORITY`, ...); `ScopeCallError::code()` returns it. A reply for a different
+  op is `Protocol`. `ScopeCallError` is `#[non_exhaustive]`, so a later failure kind is additive.
+- New `scope-owner` example: a supervised module that runs scope syncs and describes from a
+  script, used by the real-daemon tests because only a daemon-launched module holds sync
+  authority.
+
 ## 0.23.4 — 2026-09-30
 
 - `ModuleHandler::on_draining(reason, deadline)` delivers the daemon's `module.draining` notice,

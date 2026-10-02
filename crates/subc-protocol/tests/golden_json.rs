@@ -65,6 +65,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            origin: None,
         },
     );
     assert_golden(
@@ -76,7 +77,24 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: Some(serde_json::json!("pt-7")),
             call_key: None,
             schema_pin: None,
+            origin: None,
         },
+    );
+    // A call relayed for another caller: the relay's own key, and the caller
+    // behind it with the carrier as a tagged principal object.
+    assert_golden("tool_call_request_with_origin", &relayed_tool_call(true));
+    // The same call with no origin: the member must be absent, not null.
+    assert_golden(
+        "tool_call_request_without_origin",
+        &relayed_tool_call(false),
+    );
+    let without_origin: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("tool_call_request_without_origin")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        without_origin.get("origin").is_none(),
+        "an absent origin is omitted: {without_origin}"
     );
     assert_golden("error_body", &error_body());
     assert_golden("error_body_with_detail", &error_body_with_detail());
@@ -118,6 +136,14 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "module_control_request_route_bind_with_scope",
         &module_control_request_with_scope(),
+    );
+    assert_golden(
+        "module_control_request_route_bind_with_role_versions",
+        &module_control_request_role_versions(true),
+    );
+    assert_golden(
+        "module_control_request_route_bind_without_role_versions",
+        &module_control_request_role_versions(false),
     );
     assert_golden(
         "module_control_response_route_bind_ack",
@@ -862,6 +888,25 @@ fn error_body_capability_forbidden() -> ErrorBody {
     )
 }
 
+fn relayed_tool_call(with_origin: bool) -> subc_protocol::tool_call::ToolCallRequest {
+    subc_protocol::tool_call::ToolCallRequest {
+        name: "edit".to_string(),
+        arguments: serde_json::json!({ "path": "a.rs" }),
+        tool_call_id: None,
+        progress_token: None,
+        call_key: Some("pf:relay/991".to_string()),
+        schema_pin: None,
+        origin: with_origin.then(|| {
+            subc_protocol::tool_call::CallOrigin::new(
+                Principal::Reserved {
+                    module_id: "broca".to_string(),
+                },
+                "broca:run-7/call-3",
+            )
+        }),
+    }
+}
+
 fn principal_reserved() -> Principal {
     Principal::Reserved {
         module_id: "subc-mcp".to_string(),
@@ -926,7 +971,40 @@ fn module_control_request(
         identity: bind_identity(),
         principal: Some(Principal::Direct),
         consumer_capabilities,
+        role_versions: None,
         admission_facts,
+        scope: None,
+    }
+}
+
+/// A bind for a consumer that declared role versions, or the same bind
+/// without them. The pair pins that the member travels as a plain object of
+/// strings when present and is absent, not null, otherwise.
+fn module_control_request_role_versions(with_role_versions: bool) -> ModuleControlRequest {
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        principal,
+        ..
+    } = module_control_request(None, None)
+    else {
+        unreachable!("the helper builds a route.bind");
+    };
+    ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        principal,
+        consumer_capabilities: Some(vec!["elicitation".to_string()]),
+        role_versions: with_role_versions.then(|| {
+            [("tool-provider".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect()
+        }),
+        admission_facts: None,
         scope: None,
     }
 }
@@ -956,6 +1034,7 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
             module_id: "broca".to_string(),
         }),
         consumer_capabilities,
+        role_versions: None,
         admission_facts,
         scope: Some(ScopeStamp {
             owner: Principal::Reserved {

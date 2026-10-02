@@ -4,13 +4,13 @@ pub mod consumer;
 pub mod policy_cache;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
-    ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RoutePollResult,
-    ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions,
-    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
-    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
-    SPAWN_SUBSCRIBER_LAGGED,
+    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
+    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
+    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
+    RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
+    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
+    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
@@ -43,6 +43,10 @@ pub use subc_control::{CatalogEntry, ConsumerIdentity};
 pub use subc_os::launch_nonce;
 use subc_protocol::{
     manifest::ModuleManifest,
+    scope::{
+        ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus, SCOPE_DESCRIBE_OP,
+        SCOPE_SYNC_OP,
+    },
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -93,6 +97,10 @@ const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 /// blocks its thread must not hold the shutdown up that long.
 const DRAINING_HOOK_START_LIMIT: Duration = Duration::from_secs(2);
 static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// The connection token of a [`RouteHandle::detached`] handle. Module
+/// connection tokens start at 1 (above) and a consumer's generation starts at
+/// 1 and only grows, so no live connection ever has this token.
+const DETACHED_CONNECTION_TOKEN: u64 = 0;
 
 type RequestKey = (u16, u32, u64);
 type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
@@ -111,6 +119,23 @@ pub struct RouteHandle {
 }
 
 impl RouteHandle {
+    /// A handle for `channel` and `epoch` that belongs to no connection, for
+    /// building values in tests, such as a [`RouteBindRequest`] passed to a
+    /// module's own `on_bind`. It is never bound to a connection and cannot
+    /// become one.
+    ///
+    /// Every operation that would reach a connection fails with the error
+    /// it returns for a closed or stale route, and sends nothing:
+    /// [`ModuleHandle::push`] returns [`SubcModuleError::StaleRouteHandle`];
+    /// [`SubcConsumer::request`], [`SubcConsumer::subscribe_route`],
+    /// [`SubcConsumer::poll_route`], [`SubcConsumer::push_events`] and
+    /// [`SubcConsumer::close_handle`] return [`CallError::StaleRouteHandle`];
+    /// [`Self::on_request`] and [`Self::on_request_fallible`] return
+    /// [`ReverseRequestRegistrationError::NotConsumerRoute`].
+    pub fn detached(channel: u16, epoch: u32) -> Self {
+        Self::new(channel, epoch, DETACHED_CONNECTION_TOKEN)
+    }
+
     pub(crate) fn new(channel: u16, epoch: u32, connection_token: u64) -> Self {
         Self {
             channel,
@@ -206,6 +231,43 @@ pub struct LiveRootsSnapshot {
     pub total_bindings: u64,
 }
 
+/// The daemon's answer to an accepted [`ModuleHandle::scope_sync`].
+///
+/// A refusal of the whole sync is never a reply: it is
+/// [`ScopeCallError::Refused`], and the daemon changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScopeSyncReply {
+    /// The generation the daemon accepted, echoed from the request.
+    pub generation: u64,
+    /// One result per record sent, in request order. A record refused on its
+    /// own merits is here with outcome `refused` and its code; the rest of the
+    /// sync still applied.
+    pub results: Vec<ScopeRecordResult>,
+    /// Scopes of this owner that the sync ended, by leaving them out or by
+    /// sending a higher epoch for the same ref.
+    pub ended: Vec<ScopeEnded>,
+}
+
+/// The daemon's answer to [`ModuleHandle::scope_describe`] about one
+/// `(owner, ref)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScopeDescribeReply {
+    pub status: ScopeStatus,
+    /// The live epoch, or for `ended` the most recent epoch that ended.
+    pub scope_epoch: Option<u64>,
+    /// Identifies the daemon process that answered. A different value means
+    /// the daemon restarted, and owners re-sync after a restart.
+    pub daemon_incarnation: String,
+    /// Whether the owner has synced since this daemon incarnation started.
+    pub owner_synced: bool,
+    /// Whether the owner is a module in the daemon's supervised roster.
+    pub owner_configured: bool,
+    /// The stamped fields, present only when `status` is `live`.
+    pub scope: Option<ScopeStamp>,
+}
+
 type CatalogUpdateReply =
     oneshot::Sender<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
 type CatalogUpdateWaiter =
@@ -289,6 +351,8 @@ struct ModuleHandleShared {
     negotiated_ver: u8,
     supports_catalog_update: bool,
     supports_live_roots: bool,
+    supports_scope_sync: bool,
+    supports_scope_describe: bool,
     connection_token: u64,
     machine_id: Option<MachineId>,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
@@ -319,6 +383,8 @@ impl ModuleHandle {
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
+                supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
+                supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
                 connection_token,
                 // A value that does not parse is treated like an absent one:
                 // the module learns nothing rather than a name that is wrong.
@@ -484,6 +550,124 @@ impl ModuleHandle {
             Err(_) => {
                 self.shared.remove_pending_catalog_update(corr);
                 Err(CatalogUpdateError::Timeout)
+            }
+        }
+    }
+
+    /// Register this module's full scope set with the daemon (`scope.sync`).
+    ///
+    /// The owner is this module; nothing in the request names it. `scopes` is
+    /// the whole set: a live scope left out ends. `generation` must be larger
+    /// than the last one the daemon accepted from this owner's sync authority,
+    /// or the sync is refused with `scope_sync_stale`.
+    ///
+    /// A refusal of the whole sync comes back as [`ScopeCallError::Refused`]
+    /// carrying the daemon's code (see `subc_protocol::error_codes`, e.g.
+    /// `SCOPE_SYNC_STALE`, `SCOPE_SYNC_NOT_AUTHORITY`), and nothing changed.
+    /// Only a module the daemon itself launched can hold sync authority.
+    pub async fn scope_sync(
+        &self,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+    ) -> Result<ScopeSyncReply, ScopeCallError> {
+        if !self.shared.supports_scope_sync {
+            return Err(ScopeCallError::NotSupported { op: SCOPE_SYNC_OP });
+        }
+        let request = ModuleControlRequestFromModule::ScopeSync { generation, scopes };
+        match self.scope_call(SCOPE_SYNC_OP, &request).await? {
+            ModuleControlResponseToModule::ScopeSync {
+                generation,
+                results,
+                ended,
+            } => Ok(ScopeSyncReply {
+                generation,
+                results,
+                ended,
+            }),
+            other => Err(ScopeCallError::Protocol(format!(
+                "unexpected {SCOPE_SYNC_OP} response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Read one scope's current state (`scope.describe`). Any registered
+    /// module may read any owner's scope.
+    ///
+    /// An unknown ref is not an error: the daemon answers it with status
+    /// `not_live`. `owner_synced` says whether the owner has synced since this
+    /// daemon started (if so, the scope is gone), and `owner_configured` whether
+    /// the owner is a module the daemon supervises (if not, it never will sync).
+    pub async fn scope_describe(
+        &self,
+        owner: Principal,
+        scope_ref: String,
+    ) -> Result<ScopeDescribeReply, ScopeCallError> {
+        if !self.shared.supports_scope_describe {
+            return Err(ScopeCallError::NotSupported {
+                op: SCOPE_DESCRIBE_OP,
+            });
+        }
+        let request = ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref };
+        match self.scope_call(SCOPE_DESCRIBE_OP, &request).await? {
+            ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                scope_epoch,
+                daemon_incarnation,
+                owner_synced,
+                owner_configured,
+                scope,
+            } => Ok(ScopeDescribeReply {
+                status,
+                scope_epoch,
+                daemon_incarnation,
+                owner_synced,
+                owner_configured,
+                scope,
+            }),
+            other => Err(ScopeCallError::Protocol(format!(
+                "unexpected {SCOPE_DESCRIBE_OP} response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Send one channel-0 control request and wait for its reply, through the
+    /// same correlation table, writer and timeout as `catalog_update` and
+    /// `live_roots`. The caller checks that the reply is the right variant.
+    async fn scope_call(
+        &self,
+        op: &'static str,
+        request: &ModuleControlRequestFromModule,
+    ) -> Result<ModuleControlResponseToModule, ScopeCallError> {
+        let body = serde_json::to_vec(request).map_err(|err| {
+            ScopeCallError::Protocol(format!("failed to encode {op} request body: {err}"))
+        })?;
+        let (corr, writer, rx) = self
+            .shared
+            .begin_catalog_update()
+            .map_err(ScopeCallError::from_control_error)?;
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| {
+            self.shared.remove_pending_catalog_update(corr);
+            ScopeCallError::Protocol(format!("failed to build {op} request frame: {err}"))
+        })?;
+        if writer.send(frame).await.is_err() {
+            self.shared.remove_pending_catalog_update(corr);
+            return Err(ScopeCallError::ConnectionClosed);
+        }
+        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => reply.map_err(ScopeCallError::from_control_error),
+            Ok(Err(_)) => Err(ScopeCallError::ConnectionClosed),
+            Err(_) => {
+                self.shared.remove_pending_catalog_update(corr);
+                Err(ScopeCallError::Timeout)
             }
         }
     }
@@ -748,6 +932,84 @@ impl fmt::Display for CatalogUpdateError {
 }
 
 impl Error for CatalogUpdateError {}
+
+/// Errors returned by [`ModuleHandle::scope_sync`] and
+/// [`ModuleHandle::scope_describe`].
+///
+/// Non-exhaustive so a later failure kind can be added without breaking
+/// callers' matches; match the variants you handle and treat the rest as an
+/// unverifiable answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeCallError {
+    /// The daemon's HELLO_ACK did not list `op` in `subc_ops`, so nothing was
+    /// sent.
+    NotSupported { op: &'static str },
+    /// The daemon refused the request with a channel-0 Error frame. `code` is
+    /// the daemon's code as sent, to compare against the constants in
+    /// `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
+    /// `SCOPE_SYNC_NOT_AUTHORITY`, `SCOPE_LIVE_LIMIT_EXCEEDED`, ...).
+    Refused { code: String, message: String },
+    /// No reply arrived in time. The daemon may still have applied a sync.
+    Timeout,
+    /// The connection closed before a reply arrived.
+    ConnectionClosed,
+    /// The reply could not be read, or was a reply to a different op.
+    Protocol(String),
+}
+
+impl ScopeCallError {
+    /// The daemon's error code, when the daemon refused the request.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Refused { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// Convert an error from the pending-reply handling that scope calls share
+    /// with `catalog_update`, which reports failures as `CatalogUpdateError`.
+    /// For a daemon Error frame, keep the daemon's code and message whatever
+    /// the code is.
+    fn from_control_error(err: CatalogUpdateError) -> Self {
+        match err {
+            CatalogUpdateError::FrozenField(body)
+            | CatalogUpdateError::NotRegistered(body)
+            | CatalogUpdateError::Rejected(body) => Self::Refused {
+                code: body.code,
+                message: body.message,
+            },
+            CatalogUpdateError::Timeout => Self::Timeout,
+            CatalogUpdateError::ConnectionClosed => Self::ConnectionClosed,
+            CatalogUpdateError::Protocol(message) => Self::Protocol(message),
+            // The shared reply handling never returns this: whether the
+            // daemon supports an op is checked before the request is sent.
+            CatalogUpdateError::NotSupported => {
+                Self::Protocol("unexpected NotSupported from the control reply table".into())
+            }
+        }
+    }
+}
+
+impl fmt::Display for ScopeCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSupported { op } => {
+                write!(f, "daemon HELLO_ACK did not advertise {op} support")
+            }
+            Self::Refused { code, message } => {
+                write!(f, "subc refused the request: {code} ({message})")
+            }
+            Self::Timeout => write!(f, "timed out waiting for the daemon's reply"),
+            Self::ConnectionClosed => {
+                write!(f, "subc connection closed before the daemon replied")
+            }
+            Self::Protocol(message) => write!(f, "scope call protocol error: {message}"),
+        }
+    }
+}
+
+impl Error for ScopeCallError {}
 
 /// Trait implemented by a module for its business logic. The serve functions in
 /// this crate own all wire-protocol plumbing.
@@ -1018,8 +1280,29 @@ impl RequestCtx {
     }
 }
 
+/// Adds one to `counter` and returns the value it held before, or `None` once
+/// the counter is at `u64::MAX`. Written as a compare-exchange loop rather than
+/// with `fetch_update` (deprecated in Rust 1.99) or its replacement
+/// `try_update` (absent before 1.99), so it builds on both toolchains.
+fn checked_increment(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Route-bind request delivered on channel 0.
+///
+/// `#[non_exhaustive]` so it can gain fields in a later release without
+/// breaking the handlers that read it. The SDK builds it from the daemon's
+/// bind; code outside this crate (a module's own tests of its `on_bind`)
+/// builds one with [`RouteBindRequest::new`] and the `with_*` setters.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RouteBindRequest {
     pub handle: RouteHandle,
     pub target: RouteTarget,
@@ -1030,8 +1313,73 @@ pub struct RouteBindRequest {
     /// no reverse-request capability. Known MCP method-family values today are
     /// "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
+    /// The versions of provider roles the consumer declared it speaks on this
+    /// route, role name to version (`{"tool-provider": "v1"}`), as the daemon
+    /// forwarded them. A declaration, not a verified privilege: use it to pick
+    /// which version of a role's wire shape to speak. `None` means the consumer
+    /// declared none (a legacy consumer, or a daemon that predates the field);
+    /// it is never an empty map.
+    pub role_versions: Option<std::collections::BTreeMap<String, String>>,
     /// Opaque admission facts relayed by subc from its configured carrier.
     pub admission_facts: Option<serde_json::Value>,
+    /// The daemon's stamp of the scope the route was admitted under (owner,
+    /// ref, epoch, kind, attributes), copied from the bind unchanged. It is
+    /// the daemon's, never the opener's, so a provider may act on it, and it
+    /// is fixed for the route's life: a change that revokes authority closes
+    /// the route. `None` means the route was opened without a scope, or by a
+    /// daemon that predates scopes.
+    pub scope: Option<ScopeStamp>,
+}
+
+impl RouteBindRequest {
+    /// A bind with the members every bind has and every optional one absent:
+    /// no principal, no consumer capabilities, no role versions, no admission
+    /// facts and no scope. Set those with the `with_*` methods.
+    pub fn new(handle: RouteHandle, target: RouteTarget, identity: BindIdentity) -> Self {
+        Self {
+            handle,
+            target,
+            identity,
+            principal: None,
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope: None,
+        }
+    }
+
+    /// Set [`Self::principal`].
+    pub fn with_principal(mut self, principal: Principal) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    /// Set [`Self::consumer_capabilities`].
+    pub fn with_consumer_capabilities(mut self, consumer_capabilities: Vec<String>) -> Self {
+        self.consumer_capabilities = Some(consumer_capabilities);
+        self
+    }
+
+    /// Set [`Self::role_versions`].
+    pub fn with_role_versions(
+        mut self,
+        role_versions: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.role_versions = Some(role_versions);
+        self
+    }
+
+    /// Set [`Self::admission_facts`].
+    pub fn with_admission_facts(mut self, admission_facts: serde_json::Value) -> Self {
+        self.admission_facts = Some(admission_facts);
+        self
+    }
+
+    /// Set [`Self::scope`].
+    pub fn with_scope(mut self, scope: ScopeStamp) -> Self {
+        self.scope = Some(scope);
+        self
+    }
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].
@@ -1115,11 +1463,8 @@ where
     let ack = expect_hello_ack(&mut read_half).await?;
     handler.on_hello_ack(&ack).await;
 
-    let connection_token = NEXT_MODULE_CONNECTION_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-            token.checked_add(1)
-        })
-        .map_err(|_| SubcModuleError::ConnectionTokenExhausted)?;
+    let connection_token = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN)
+        .ok_or(SubcModuleError::ConnectionTokenExhausted)?;
     let close_token = CancellationToken::new();
     let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
     let serve_handle = handle.clone();
@@ -1598,11 +1943,9 @@ where
             identity,
             principal,
             consumer_capabilities,
+            role_versions,
             admission_facts,
-            // This SDK does not pass the scope stamp to handlers, so a provider
-            // built on it cannot act on it; ignoring the field is also exactly
-            // what builds that predate the field do.
-            scope: _,
+            scope,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -1645,7 +1988,9 @@ where
                 identity,
                 principal,
                 consumer_capabilities,
+                role_versions,
                 admission_facts,
+                scope,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {
@@ -2169,6 +2514,150 @@ mod tests {
         assert!(second.await.unwrap().is_ok());
     }
 
+    fn control_reply(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(ty, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    fn owner() -> Principal {
+        Principal::Reserved {
+            module_id: "owner".to_string(),
+        }
+    }
+
+    /// Each scope op is gated on its own `subc_ops` entry: a daemon that
+    /// lists one but not the other gets only the one it listed, and a gated
+    /// call sends nothing.
+    #[tokio::test]
+    async fn scope_ops_fail_fast_when_hello_ack_does_not_advertise_them() {
+        let (handle, mut rx) = test_module_handle(&[]);
+        assert_eq!(
+            handle.scope_sync(1, Vec::new()).await.unwrap_err(),
+            ScopeCallError::NotSupported { op: SCOPE_SYNC_OP }
+        );
+        assert_eq!(
+            handle
+                .scope_describe(owner(), "s".to_string())
+                .await
+                .unwrap_err(),
+            ScopeCallError::NotSupported {
+                op: SCOPE_DESCRIBE_OP
+            }
+        );
+        assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+
+        let (describe_only, mut rx) = test_module_handle(&[SCOPE_DESCRIBE_OP]);
+        assert_eq!(
+            describe_only.scope_sync(1, Vec::new()).await.unwrap_err(),
+            ScopeCallError::NotSupported { op: SCOPE_SYNC_OP }
+        );
+        assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+
+        let (sync_only, mut rx) = test_module_handle(&[SCOPE_SYNC_OP]);
+        assert_eq!(
+            sync_only
+                .scope_describe(owner(), "s".to_string())
+                .await
+                .unwrap_err(),
+            ScopeCallError::NotSupported {
+                op: SCOPE_DESCRIBE_OP
+            }
+        );
+        assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+    }
+
+    /// A reply carrying another op's body is not taken as an answer.
+    #[tokio::test]
+    async fn a_scope_reply_of_another_op_is_a_protocol_error() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_SYNC_OP, SCOPE_DESCRIBE_OP]);
+        let sync = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.scope_sync(1, Vec::new()).await }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let describe_body = serde_json::to_vec(&ModuleControlResponseToModule::ScopeDescribe {
+            status: ScopeStatus::NotLive,
+            scope_epoch: None,
+            daemon_incarnation: "i".to_string(),
+            owner_synced: false,
+            owner_configured: false,
+            scope: None,
+        })
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            describe_body
+        )));
+        assert!(matches!(
+            sync.await.unwrap(),
+            Err(ScopeCallError::Protocol(_))
+        ));
+
+        let describe = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.scope_describe(owner(), "s".to_string()).await }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let sync_body = serde_json::to_vec(&ModuleControlResponseToModule::ScopeSync {
+            generation: 1,
+            results: Vec::new(),
+            ended: Vec::new(),
+        })
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            sync_body
+        )));
+        assert!(matches!(
+            describe.await.unwrap(),
+            Err(ScopeCallError::Protocol(_))
+        ));
+    }
+
+    /// Every Error-frame code reaches the caller as sent, including codes the
+    /// reply handling shared with `catalog_update` sorts into its own
+    /// `CatalogUpdateError` variants (`not_registered`).
+    #[tokio::test]
+    async fn a_scope_error_frame_keeps_the_daemons_code_and_message() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_SYNC_OP]);
+        for code in [
+            subc_protocol::error_codes::SCOPE_SYNC_STALE,
+            subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY,
+            "not_registered",
+        ] {
+            let sync = tokio::spawn({
+                let handle = handle.clone();
+                async move { handle.scope_sync(1, Vec::new()).await }
+            });
+            let request = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body = serde_json::to_vec(&ErrorBody::new(code, "why")).unwrap();
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Error,
+                request.header.corr,
+                body
+            )));
+            let error = sync.await.unwrap().unwrap_err();
+            assert_eq!(
+                error,
+                ScopeCallError::Refused {
+                    code: code.to_string(),
+                    message: "why".to_string()
+                }
+            );
+            assert_eq!(error.code(), Some(code));
+        }
+    }
+
     #[tokio::test]
     async fn default_health_check_answers_ok() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -2508,6 +2997,7 @@ mod tests {
             ),
             principal: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         })
@@ -2879,6 +3369,7 @@ mod module_close_tests {
             ),
             principal: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         })
@@ -3302,5 +3793,26 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }
+    }
+}
+
+#[cfg(test)]
+mod checked_increment_tests {
+    use super::checked_increment;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn returns_the_previous_value_and_stops_at_the_maximum() {
+        let counter = AtomicU64::new(7);
+        assert_eq!(checked_increment(&counter), Some(7));
+        assert_eq!(counter.load(Ordering::Relaxed), 8);
+
+        let full = AtomicU64::new(u64::MAX);
+        assert_eq!(checked_increment(&full), None);
+        assert_eq!(
+            full.load(Ordering::Relaxed),
+            u64::MAX,
+            "an exhausted counter is left unchanged"
+        );
     }
 }

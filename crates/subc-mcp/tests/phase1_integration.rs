@@ -60,9 +60,10 @@ use tokio::{
 };
 
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
-// The module refuses to serve without daemon spawn attestation (SUBC_MODULE_ID +
-// SUBC_LAUNCH_NONCE), so the tests spawn it exactly as the daemon would: env
-// injected, nonce seeded into the supervisor handle for route.open verification.
+// These manual launches exercise the SDK's environment fallback (no nonce
+// descriptor is named). Record TEST_MCP_MODULE_ID and TEST_MCP_LAUNCH_NONCE in
+// the test supervisor so route.open can attest the manually launched module.
+// Unix daemon spawns instead use the pipe handoff.
 const TEST_MCP_MODULE_ID: &str = "subc-mcp";
 const TEST_MCP_LAUNCH_NONCE: &str = "test-mcp-launch-nonce";
 // 30s, raised from 10s (2026-08-14): each test in the reverse-elicitation
@@ -1216,8 +1217,26 @@ async fn mcp_reverse_elicitation_shim_death_settles_pending_with_error() {
         .await;
     harness.client_handler.wait_for_prompts(1).await;
     harness.stop_client().await;
-    let error = harness.provider.wait_reverse_error(905).await;
+    let terminal = harness
+        .provider
+        .wait_for_event("reverse error before route goodbye", |event| {
+            matches!(
+                event,
+                ScriptedProviderEvent::ReverseError { corr: 905, .. }
+                    | ScriptedProviderEvent::RouteGoodbye
+            )
+        })
+        .await;
+    let ScriptedProviderEvent::ReverseError { body: error, .. } = terminal else {
+        panic!("route GOODBYE arrived before the pending reverse request's ERROR");
+    };
     assert_eq!(error.get("code"), Some(&json!(-32603)));
+    harness
+        .provider
+        .wait_for_event("route goodbye after reverse error", |event| {
+            matches!(event, ScriptedProviderEvent::RouteGoodbye)
+        })
+        .await;
 
     harness.shutdown().await;
 }
@@ -3835,6 +3854,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
             identity: route_identity("mcp", 2_001),
             consumer_identity: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         },
@@ -4281,7 +4301,6 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
     );
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_owned(),
         program,
         args,
@@ -4299,7 +4318,6 @@ fn mcp_module_spec(
     xdg_config_home: &Path,
 ) -> ModuleSpec {
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_owned(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_ck-subc-mcp")),
         args: vec![
@@ -4587,6 +4605,7 @@ where
             identity: route_identity(module_id, corr),
             consumer_identity: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         },

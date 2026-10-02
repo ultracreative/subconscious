@@ -87,6 +87,8 @@
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
 #                   [--no-restart]
+#   place-module.sh --module <id> --staged <path> [--dest <path>] --marker <string> --install
+#                   (a module's FIRST install: no running binary, never restarts)
 #
 # Refuses (exit 2) before touching the destination if any pre-arm fails.
 #
@@ -98,7 +100,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; INSTALL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -128,6 +130,15 @@ while (($# > 0)); do
     --migrates) MIGRATES="$2"; shift 2 ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
+    # A FIRST INSTALL has no running binary to compare against, so the arms that
+    # read the live image (signing posture against running, marker staged/live,
+    # control, rollback snapshot) cannot run. --install replaces them with checks
+    # that need no live image: the destination must NOT exist yet, the staged
+    # binary must be hardened with no get-task-allow, its identifier must be the
+    # destination's name, it must be ad-hoc or signed by the daemon's own team,
+    # and the marker must read in it. It never restarts: the module starts when
+    # its subc.jsonc entry exists and a rescan or daemon cut picks it up.
+    --install) INSTALL=1; RESTART=0; shift ;;
     *) echo "REFUSED: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -178,7 +189,13 @@ if [ "$RESTART" -eq 1 ] && ! ck module status "$MODULE" >/dev/null 2>&1; then
 fi
 DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
 [ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
-[ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
+if [ "$INSTALL" -eq 1 ]; then
+  [ ! -e "$DEST" ] || { echo "REFUSED: --install but $DEST already exists, so this is a placement; drop --install" >&2; exit 2; }
+  [ -z "$MIGRATES" ] || { echo "REFUSED: --migrates with --install: a module installed for the first time has no store to snapshot" >&2; exit 2; }
+  [ "$MARKER" != "none" ] || { echo "REFUSED: --install needs a real --marker: with no running image, a string found in the staged binary is the check that the instrument read this build" >&2; exit 2; }
+else
+  [ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement (pass --install for a module's first install): $DEST" >&2; exit 2; }
+fi
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
@@ -234,13 +251,17 @@ done
 # codesign absent, or a running binary that is itself unsigned, the text file
 # sails through.
 staged_kind=$(file -b "$STAGED" 2>/dev/null | cut -d, -f1)
-live_kind=$(file -b "$DEST" 2>/dev/null | cut -d, -f1)
+kind_ref="$DEST"
+# A first install has no running binary, so the daemon's own binary stands in:
+# a module must be the same kind of executable the host already runs.
+[ "$INSTALL" -eq 1 ] && kind_ref="$BIN_DIR/ck-subc"
+live_kind=$(file -b "$kind_ref" 2>/dev/null | cut -d, -f1)
 case "$staged_kind" in
   *"Mach-O"*|*"ELF"*|*"PE32"*) : ;;
   *) refuse "staged artifact is not an executable image: $STAGED reads as \"$staged_kind\". strings and nm answer for text files too, so the marker and control arms below would be satisfied by a file that cannot run; nothing has been placed" ;;
 esac
 [ "$staged_kind" = "$live_kind" ] || refuse "staged and running artifacts are DIFFERENT KINDS: staged \"$staged_kind\" vs running \"$live_kind\"; nothing has been placed"
-say "kind: $staged_kind (matches running)"
+say "kind: $staged_kind (matches $( [ "$INSTALL" -eq 1 ] && echo "the daemon's binary" || echo running))"
 say "staged sidecar $sidecar: OK"
 
 # ---- CURRENCY: is this the artifact its OWNER says is live? ----
@@ -325,6 +346,13 @@ staged_base=$(basename "$STAGED")
 if [ -n "$root_manifest" ]; then
   want_stage=$(awk -F= '$1=="stage"{print $2}' "$root_manifest")
   want_rev=$(awk -F= '$1=="revision"{print $2}' "$root_manifest")
+  # A relative `stage=` (a bare stage name, as some seats write it) names a path
+  # beside the manifest. Resolve it there; comparing it literally against an
+  # absolute path refused a correct card.
+  case "$want_stage" in
+    /*) ;;
+    *) want_stage="$(cd "$(dirname "$root_manifest")" && pwd)/$want_stage" ;;
+  esac
   # `stage` names a DIRECTORY under the per-stage layout and the ARTIFACT itself
   # under the flat one. Accept either rather than forcing a seat to restructure:
   # what the declaration is FOR is naming which thing is live, and both spellings
@@ -434,11 +462,74 @@ posture_without_runtime() {
   bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //')
   if [ -n "$f" ]; then printf '%sflags-sans-runtime=0x%x ' "$bare" $(( f & ~0x10000 )); else printf '%s' "$bare"; fi
 }
-if command -v codesign >/dev/null; then
+# A LINKER-SIGNED running image (flag 0x20000) was signed by `ld` at link time, not
+# by codesign. Its identifier is a per-build hash (`ck_astrocyte-<16 hex>`), so it
+# differs between any two builds, and any codesign re-sign clears the 0x20000 bit,
+# which adding hardened runtime requires. Its designated requirement is a cdhash,
+# so no privacy grant can survive a rebuild of it anyway. Comparing those two
+# fields refused every first hardened build of a linker-signed module. When the
+# running image is linker-signed, drop the identifier and the linker-signed bit
+# from both sides; ad-hoc-ness, team and every other flag still have to match.
+is_linker_signed() {
+  local f; f=$(cd_flags "$1")
+  [ -n "$f" ] && [ $(( f & 0x20000 )) -ne 0 ]
+}
+# An ad-hoc image that a bare `codesign --force --sign -` re-signed after linking
+# has lost the linker-signed bit but keeps the linker's per-build identifier
+# (`<name>-<hex hash>`), which no later build can reproduce. Its designated
+# requirement is a cdhash, so the identifier carries no grant. Treat it like a
+# linker-signed image for the identifier only; its flags are compared normally.
+has_linker_identifier() {
+  local id
+  id=$(codesign -dvv "$1" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+  [ "$(codesign -dvv "$1" 2>&1 | grep -c '^Signature=adhoc')" -gt 0 ] \
+    && printf '%s' "$id" | grep -qE -- '-[0-9a-f]{16,}$'
+}
+posture_for_linker_signed() {
+  local f bare
+  f=$(cd_flags "$1")
+  bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //; s/Identifier=[^ ]+ //')
+  if [ -n "$f" ]; then printf '%sflags-sans-runtime-linker=0x%x ' "$bare" $(( f & ~0x30000 )); else printf '%s' "$bare"; fi
+}
+if [ "$INSTALL" -eq 1 ] && command -v codesign >/dev/null; then
+  # No running binary to match, so the posture is checked against fleet rules.
+  staged_sig=$(signing_posture "$STAGED")
+  staged_cd=$(codesign -dvv "$STAGED" 2>&1 || true)
+  staged_id=$(printf '%s\n' "$staged_cd" | sed -n 's/^Identifier=//p' | head -1)
+  [ "$staged_id" = "$(basename "$DEST")" ] \
+    || refuse "staged identifier is [$staged_id], not the destination's name [$(basename "$DEST")]; sign with --identifier $(basename "$DEST")"
+  has_runtime "$STAGED" || refuse "a first install must be hardened (codesign --options runtime): without it any same-user process can attach and read the module's launch nonce"
+  ents=$(codesign -d --entitlements - "$STAGED" 2>/dev/null || true)
+  if [ "$(printf '%s' "$ents" | grep -c 'get-task-allow')" -gt 0 ]; then
+    refuse "staged binary carries com.apple.security.get-task-allow, which lets any same-user process attach and read its launch nonce"
+  fi
+  staged_team=$(printf '%s\n' "$staged_cd" | sed -n 's/^TeamIdentifier=//p' | head -1)
+  if [ "$(printf '%s\n' "$staged_cd" | grep -c '^Signature=adhoc')" -gt 0 ]; then
+    say "signing posture: $staged_sig(first install: ad-hoc, hardened)"
+  else
+    # Signed by an identity: it must be the team that signs the daemon itself,
+    # so a binary signed by some other developer cannot enter the fleet.
+    daemon_team=$(codesign -dvv "$BIN_DIR/ck-subc" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+    [ -n "$daemon_team" ] && [ "$daemon_team" != "not set" ] && [ "$staged_team" = "$daemon_team" ] \
+      || refuse "staged binary is signed by team [$staged_team], but a first install must be ad-hoc or signed by the daemon's own team [$daemon_team]"
+    say "signing posture: $staged_sig(first install: the daemon's team $daemon_team, hardened)"
+  fi
+  exceptions=$(printf '%s' "$ents" | grep -oE 'com\.apple\.security\.cs\.[a-z-]+' | sort -u | paste -sd ' ' - || true)
+  say "hardened runtime: yes; exceptions: ${exceptions:-none} (each needs the card's smoke test to exercise it)"
+elif command -v codesign >/dev/null; then
   staged_sig=$(signing_posture "$STAGED")
   live_sig=$(signing_posture "$DEST")
   staged_sig_cmp=$(posture_without_runtime "$STAGED")
   live_sig_cmp=$(posture_without_runtime "$DEST")
+  if is_linker_signed "$DEST"; then
+    staged_sig_cmp=$(posture_for_linker_signed "$STAGED")
+    live_sig_cmp=$(posture_for_linker_signed "$DEST")
+    say "signing posture: running image is linker-signed; its per-build identifier and the linker-signed bit are not compared"
+  elif has_linker_identifier "$DEST"; then
+    staged_sig_cmp=$(printf '%s' "$staged_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
+    live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
+    say "signing posture: running image is ad-hoc with a linker per-build identifier; the identifier is not compared"
+  fi
   if [ -n "$NEW_REQUIREMENT" ]; then
     # A requested requirement change may rename the identifier; every other
     # posture field (signer, team, ad-hoc-ness, flags) must still match.
@@ -542,7 +633,18 @@ count_in() {  # count_in <table> <file> <needle>
 # images. Refusing only when NO such table exists keeps the arm as strict as it
 # was without failing valid cards (PLEX, 190406a, first card to hit it).
 marker_table=""
-if [ "$MARKER" = "none" ]; then
+if [ "$INSTALL" -eq 1 ]; then
+  # Nothing is running, so there is no staged/live differential and no control to
+  # read on both images. What remains is that the marker reads in the staged
+  # binary, which shows the counting instrument read this build.
+  install_seen=0
+  for t in strings nm; do
+    ms=$(count_in "$t" "$STAGED" "$MARKER")
+    say "marker $t:\"$MARKER\" staged $ms (first install: no running image to compare)"
+    [ "$ms" -gt 0 ] && install_seen=1
+  done
+  [ "$install_seen" = "1" ] || refuse "marker reads in neither table of the staged binary, so nothing shows the instrument read this build"
+elif [ "$MARKER" = "none" ]; then
   # No literal to compare. Substitute the strongest available discriminator:
   # a rebuild always moves LC_UUID, and two files sharing one are the same build.
   staged_uuid=$(dwarfdump --uuid "$STAGED" 2>/dev/null | awk '{print $2}')
@@ -641,7 +743,7 @@ fi
 # (a needle known present reading >0 in strings on each), not that a marker's
 # table is readable. Without this arm `--marker none --control X` accepted X
 # unread, which is a control that proves nothing (found on ENGRAM c5a4c94).
-if [ -n "$CONTROL" ]; then
+if [ -n "$CONTROL" ] && [ "$INSTALL" -eq 0 ]; then
   control_table="${marker_table:-strings}"
   c_staged=$(count_in "$control_table" "$STAGED" "$CONTROL")
   c_live=$(count_in "$control_table" "$DEST" "$CONTROL")
@@ -689,6 +791,10 @@ if [ "$PLACE" != "1" ]; then
   exit 0
 fi
 
+if [ "$INSTALL" -eq 1 ]; then
+  say "=== rollback"
+  say "first install: no previous binary; rolling back means removing $DEST and the module's subc.jsonc entry"
+else
 say "=== rollback"
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 # Named for the binary, like the currency pointer: two binaries of one module
@@ -779,6 +885,7 @@ if [ -n "$MIGRATES" ]; then
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
   say "ROLLBACK IS BINARY + STORE: this card migrates, so restoring the binary alone would meet a newer schema and refuse"
 fi
+fi
 
 say "=== place"
 cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
@@ -839,6 +946,14 @@ if [ -n "$PATH_FACE" ]; then
     say "         An operator invoking it by name runs something other than what was verified."
     say "         Place it there too, or say why the divergence is intended."
   fi
+fi
+
+if [ "$INSTALL" -eq 1 ]; then
+  say "=== next: start it"
+  say "  installed, not started. Add the module's entry to subc.jsonc (back the file up first),"
+  say "  then 'ck module rescan --dry-run' must list '$MODULE' as added and nothing else changed,"
+  say "  then 'ck module rescan' (or the next daemon cut) starts it. A helper binary the module"
+  say "  runs itself as a child needs no entry."
 fi
 
 if [ "$RESTART" -eq 1 ]; then

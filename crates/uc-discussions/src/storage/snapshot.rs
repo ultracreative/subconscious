@@ -44,6 +44,18 @@ pub struct RoomMemberRecord {
     pub member_id: String,
     pub role: String,
     pub joined_at: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub delivery_mode: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +221,8 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut room_members_stmt = connection.prepare(
-            "SELECT room_id, member_id, role, joined_at
+            "SELECT room_id, member_id, role, joined_at,
+                    project_id, session_id, agent, model, delivery_mode, incarnation
              FROM room_members ORDER BY room_id ASC, member_id ASC",
         )?;
         let room_members = room_members_stmt
@@ -219,6 +232,12 @@ impl Storage {
                     member_id: row.get(1)?,
                     role: row.get(2)?,
                     joined_at: row.get(3)?,
+                    project_id: row.get(4)?,
+                    session_id: row.get(5)?,
+                    agent: row.get(6)?,
+                    model: row.get(7)?,
+                    delivery_mode: row.get(8)?,
+                    incarnation: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -442,14 +461,26 @@ impl Storage {
 
         {
             let mut stmt = transaction.prepare(
-                "INSERT OR REPLACE INTO room_members (room_id, member_id, role, joined_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO room_members (
+                    room_id, member_id, role, joined_at,
+                    project_id, session_id, agent, model, delivery_mode, incarnation
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for r in &snapshot.room_members {
-                stmt.execute(params![r.room_id, r.member_id, r.role, r.joined_at])?;
+                stmt.execute(params![
+                    r.room_id,
+                    r.member_id,
+                    r.role,
+                    r.joined_at,
+                    r.project_id,
+                    r.session_id,
+                    r.agent,
+                    r.model,
+                    r.delivery_mode,
+                    r.incarnation,
+                ])?;
             }
         }
-
         {
             let mut stmt = transaction.prepare(
                 "INSERT OR REPLACE INTO room_posts (

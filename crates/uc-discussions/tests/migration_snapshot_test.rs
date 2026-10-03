@@ -178,6 +178,26 @@ fn zero_loss_export_import_migration_snapshot_proof() {
     ));
     assert!(join_bob.ok);
 
+    let bind_bob: JoinRoomResponse = response(dispatch(
+        &handler1,
+        json!({
+            "op": "rooms.bind_member",
+            "params": {
+                "room_id": &room_id,
+                "member_id": "bob",
+                "project_id": "project-bob",
+                "session_id": "session-bob-001",
+                "agent": "reviewer-agent",
+                "model": "model-pro",
+                "delivery_mode": "interrupt",
+                "incarnation": 42
+            }
+        }),
+    ));
+    assert!(bind_bob.ok);
+    assert_eq!(bind_bob.member.incarnation, Some(42));
+    assert_eq!(bind_bob.member.session_id.as_deref(), Some("session-bob-001"));
+
     let join_carol: JoinRoomResponse = response(dispatch(
         &handler1,
         json!({
@@ -190,7 +210,6 @@ fn zero_loss_export_import_migration_snapshot_proof() {
         }),
     ));
     assert!(join_carol.ok);
-
     let post1: PostRoomResponse = response(dispatch(
         &handler1,
         json!({
@@ -213,6 +232,7 @@ fn zero_loss_export_import_migration_snapshot_proof() {
             "params": {
                 "room_id": &room_id,
                 "author": "bob",
+                "incarnation": 42,
                 "post_type": "critique",
                 "content": "Critique: Must run inside an immediate transaction for atomicity.",
                 "reply_to_post_id": &post1_id
@@ -466,6 +486,18 @@ fn zero_loss_export_import_migration_snapshot_proof() {
     assert_eq!(room_get.posts[3].seq, 4);
     assert_eq!(room_get.posts[3].content, "Fourth post proving sequence continuation post-migration");
 
+    // Verify v2 member identity bindings survived snapshot round-trip
+    let bob_member_db2 = room_get
+        .members
+        .iter()
+        .find(|m| m.member_id == "bob")
+        .expect("bob must exist in room on db2");
+    assert_eq!(bob_member_db2.project_id.as_deref(), Some("project-bob"));
+    assert_eq!(bob_member_db2.session_id.as_deref(), Some("session-bob-001"));
+    assert_eq!(bob_member_db2.agent.as_deref(), Some("reviewer-agent"));
+    assert_eq!(bob_member_db2.model.as_deref(), Some("model-pro"));
+    assert_eq!(bob_member_db2.delivery_mode.as_deref(), Some("interrupt"));
+    assert_eq!(bob_member_db2.incarnation, Some(42));
     // C. Verify council member states and all_members_terminal function identically on Database 2
     let declared = ["alice", "bob"];
     let is_terminal = storage2

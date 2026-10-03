@@ -102,7 +102,12 @@ impl CouncilService {
         };
         let declared_members: Vec<String> = serde_json::from_str(&members_json)
             .map_err(|error| invalid_json("stored council members", error))?;
-
+        if !declared_members.iter().any(|m| m == &req.member_name) {
+            return Err(ServiceError::InvalidRequest(format!(
+                "member '{}' is not part of council '{}'",
+                req.member_name, req.council_id
+            )));
+        }
         self.storage.record_member_state(
             &req.council_id,
             &req.member_name,
@@ -132,13 +137,39 @@ impl CouncilService {
         req: ReconcileCouncilRequest,
     ) -> Result<ReconcileCouncilResponse, ServiceError> {
         require_non_empty("council_id", &req.council_id)?;
-        {
+        let declared_members = {
             let connection = self.storage.lock_connection()?;
             require_council(&connection, &req.council_id)?;
+            let members_json = connection
+                .query_row(
+                    "SELECT members_json FROM council_runs WHERE council_id = ?1",
+                    params![req.council_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| ServiceError::NotFound(format!("council {}", req.council_id)))?;
+            serde_json::from_str::<Vec<String>>(&members_json)
+                .map_err(|error| invalid_json("stored council members", error))?
+        };
+
+        if !req.declared_members.is_empty() {
+            for declared in &req.declared_members {
+                if !declared_members.contains(declared) {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "Cannot reconcile: declared member '{declared}' is not in council roster"
+                    )));
+                }
+            }
+            for roster_member in &declared_members {
+                if !req.declared_members.contains(roster_member) {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "Cannot reconcile: declared members list is missing council roster member '{roster_member}'"
+                    )));
+                }
+            }
         }
 
-        let member_refs = req
-            .declared_members
+        let member_refs = declared_members
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
@@ -148,7 +179,7 @@ impl CouncilService {
         {
             let connection = self.storage.lock_connection()?;
             if let Some((member, status)) =
-                first_non_terminal_member(&connection, &req.council_id, &req.declared_members)?
+                first_non_terminal_member(&connection, &req.council_id, &declared_members)?
             {
                 return Err(non_terminal_error(&member, &status));
             }
@@ -164,7 +195,7 @@ impl CouncilService {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_council(&transaction, &req.council_id)?;
         if let Some((member, status)) =
-            first_non_terminal_member(&transaction, &req.council_id, &req.declared_members)?
+            first_non_terminal_member(&transaction, &req.council_id, &declared_members)?
         {
             return Err(non_terminal_error(&member, &status));
         }
@@ -502,6 +533,73 @@ mod tests {
         assert_eq!(run, ("staged".to_owned(), None, None));
     }
 
+    #[test]
+    fn evaluate_rejects_non_roster_member() {
+        let service = service();
+        service
+            .stage(stage_request("council-non-roster"))
+            .expect("stage council");
+        let err = service
+            .evaluate(EvaluateCouncilRequest {
+                council_id: "council-non-roster".to_owned(),
+                member_name: "intruder".to_owned(),
+                status: "completed".to_owned(),
+                response_block: Some("Infiltrator response".to_owned()),
+                error: None,
+                token_cost_nanodollars: None,
+            })
+            .expect_err("non-roster member evaluation must be rejected");
+        assert!(matches!(
+            err,
+            ServiceError::InvalidRequest(ref msg) if msg == "member 'intruder' is not part of council 'council-non-roster'"
+        ));
+    }
+
+    #[test]
+    fn reconcile_rejects_empty_or_subset_declared_members_when_roster_members_not_terminal() {
+        let service = service();
+        service
+            .stage(stage_request("council-subset"))
+            .expect("stage council");
+        evaluate(
+            &service,
+            "council-subset",
+            "alpha",
+            "completed",
+            Some("Approve"),
+            None,
+        );
+
+        // If declared_members is empty, it must check the full stored roster and reject staged beta
+        let empty_error = service
+            .reconcile(ReconcileCouncilRequest {
+                council_id: "council-subset".to_owned(),
+                declared_members: vec![],
+                synthesis: "Early reconcile".to_owned(),
+                agreement_level: None,
+            })
+            .expect_err("empty declared_members must check stored roster and fail on non-terminal");
+        assert!(matches!(
+            empty_error,
+            ServiceError::InvalidRequest(ref msg)
+                if msg == "Cannot reconcile: member 'beta' has non-terminal status 'staged'"
+        ));
+
+        // If declared_members is a subset, it must reject because it doesn't match stored roster
+        let subset_error = service
+            .reconcile(ReconcileCouncilRequest {
+                council_id: "council-subset".to_owned(),
+                declared_members: vec!["alpha".to_owned()],
+                synthesis: "Subset reconcile".to_owned(),
+                agreement_level: None,
+            })
+            .expect_err("subset declared_members must be rejected");
+        assert!(matches!(
+            subset_error,
+            ServiceError::InvalidRequest(ref msg)
+                if msg.contains("missing council roster member")
+        ));
+    }
     #[test]
     fn reconcile_completes_after_all_members_are_terminal_and_persists_synthesis() {
         let service = service();

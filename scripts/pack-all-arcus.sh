@@ -75,11 +75,12 @@ if [ -z "$SEQUENCE" ]; then
       MAX_SEQ="$s"
     fi
   done
-  SEQUENCE=$((MAX_SEQ + 1))
-  # Enforce minimum sequence of 3 to guarantee monotonicity over past releases
-  if [ "$SEQUENCE" -lt 3 ]; then
-    SEQUENCE=3
+  if [ "$MAX_SEQ" -le 0 ]; then
+    echo "Error: Could not observe any catalog sequence from Arcus gateway or local packages." >&2
+    echo "Pass explicit --sequence <N> with N > max observed sequence." >&2
+    exit 1
   fi
+  SEQUENCE=$((MAX_SEQ + 1))
 fi
 
 # Canonical Arcus dist organization:
@@ -93,10 +94,11 @@ printf "  sequence: %s (shared)\n" "$SEQUENCE"
 printf "  output:   dist/%s/<component>/%s/\n" "$SEQUENCE" "$VERSION"
 printf "=====================================================================\n"
 
-# --- 0. Clean target directory ----------------------------------------------
-if [ "$NO_CLEAN" -eq 0 ] && [ -z "$ONLY_COMPONENT" ] && [ -d "$RELEASE_ROOT" ]; then
-  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s\n" "$SEQUENCE"
-  rm -rf "$RELEASE_ROOT"
+# --- 0. Enforce release immutability (refuse existing release root) -----------
+if [ -d "$RELEASE_ROOT" ]; then
+  echo "Error: Release directory already exists: $RELEASE_ROOT" >&2
+  echo "Release directories are immutable. Choose a higher monotonic sequence or inspect existing outputs." >&2
+  exit 1
 fi
 
 # --- 1. Pre-pack cargo compilation ------------------------------------------

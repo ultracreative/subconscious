@@ -34,16 +34,18 @@ Rather than modifying `subconscious` source code to add custom fleet features, a
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Official CortexKit Platform (npm)                  │
+│        Official CortexKit Platform (cortexkit.io index)         │
+│               managed via `ck setup` / `ck upgrade`             │
 │                                                                 │
 │   ck-subc (supervisor) ──┬── aft (file tools)                   │
 │                          ├── ck-claustrum (credentials)         │
 │                          ├── ck-insula (quota tracking)         │
+│                          ├── ck-synapse (inference mesh)        │
 │                          └── ck-bus (NATS message mesh)         │
 └──────────────────────────┼──────────────────────────────────────┘
                            │ subc loopback TCP (Channel 0)
 ┌──────────────────────────┴──────────────────────────────────────┐
-│              UltraCreative Studio Custom Modules (Arcus)        │
+│          UltraCreative Studio Custom Modules (Arcus)            │
 │                                                                 │
 │   ┌─────────────────────────────────────────────────────────┐   │
 │   │  ck-uc-discussions (UCS Deliberation Service)           │   │
@@ -52,15 +54,14 @@ Rather than modifying `subconscious` source code to add custom fleet features, a
 │   │  - Storage : ~/.local/share/cortexkit/uc-discussions/   │   │
 │   └─────────────────────────────────────────────────────────┘   │
 │   ┌─────────────────────────────────────────────────────────┐   │
-│   │  ck-mc (Magic Context Engine)                           │   │
-│   │  - Protocol: ManagementSurface                          │   │
-│   │  - Features: context compaction, transcript memory      │   │
-│   │  - Storage : ~/.local/share/cortexkit/magic-context/    │   │
+│   │  lore keepers (Replicator, Thalamus, Broca, Wake)       │   │
+│   │  - Protocol: ManagementSurface / ToolProvider           │   │
+│   │  - Staged  : ~/.local/lib/lore/bin/ (macOS TCC)         │   │
 │   └─────────────────────────────────────────────────────────┘   │
 │   ┌─────────────────────────────────────────────────────────┐   │
-│   │  ck-synapse (Agent Mesh Module)                         │   │
-│   │  - Protocol: ManagementSurface / ToolProvider           │   │
-│   │  - Features: distributed agent workers, execution mesh  │   │
+│   │  ck-synapse UCS custom overlay (if needed)              │   │
+│   │  - Protocol: ManagementSurface                          │   │
+│   │  - Features: art3d-pipeline & UCS contracts             │   │
 │   └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```

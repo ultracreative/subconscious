@@ -62,3 +62,39 @@ pub struct ReconcileCouncilResponse {
     pub status: String,
     pub completed_at: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetCouncilRequest {
+    pub council_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CouncilMemberStateDto {
+    pub member_name: String,
+    pub status: String,
+    pub updated_at: String,
+    pub response_block: Option<String>,
+    pub error: Option<String>,
+    pub token_cost_nanodollars: Option<i128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CouncilRunDto {
+    pub council_id: String,
+    pub name: String,
+    pub question: String,
+    pub intent: Option<String>,
+    pub mode: Option<String>,
+    pub members: Vec<String>,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub synthesis: Option<String>,
+    pub agreement_level: Option<String>,
+    pub member_states: Vec<CouncilMemberStateDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GetCouncilResponse {
+    pub ok: bool,
+    pub council: CouncilRunDto,
+}

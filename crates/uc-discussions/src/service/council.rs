@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     protocol::council::{
-        EvaluateCouncilRequest, EvaluateCouncilResponse, ReconcileCouncilRequest,
-        ReconcileCouncilResponse, StageCouncilRequest, StageCouncilResponse,
+        CouncilMemberStateDto, CouncilRunDto, EvaluateCouncilRequest, EvaluateCouncilResponse,
+        GetCouncilRequest, GetCouncilResponse, ReconcileCouncilRequest, ReconcileCouncilResponse,
+        StageCouncilRequest, StageCouncilResponse,
     },
     Storage,
 };
@@ -43,6 +44,48 @@ impl CouncilService {
             .map_err(|error| invalid_json("council members", error))?;
         let started_at = now_timestamp();
         let mut connection = self.storage.lock_connection()?;
+        let existing = connection
+            .query_row(
+                "SELECT name, question, intent, mode, members_json, status, started_at
+                 FROM council_runs WHERE council_id = ?1",
+                params![req.council_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((e_name, e_question, e_intent, e_mode, e_members_json, e_status, e_started_at)) = existing {
+            let e_members: Vec<String> = serde_json::from_str(&e_members_json)
+                .map_err(|error| invalid_json("existing council members", error))?;
+            if e_name == req.name
+                && e_question == req.question
+                && e_intent.as_deref() == Some(&req.intent)
+                && e_mode.as_deref() == Some(&req.mode)
+                && e_members == req.members
+            {
+                return Ok(StageCouncilResponse {
+                    ok: true,
+                    council_id: req.council_id,
+                    status: e_status,
+                    started_at: e_started_at,
+                });
+            } else {
+                return Err(ServiceError::Conflict(format!(
+                    "council '{}' already staged with different parameters",
+                    req.council_id
+                )));
+            }
+        }
+
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO council_runs (
@@ -212,6 +255,82 @@ impl CouncilService {
             council_id: req.council_id,
             status: "completed".to_owned(),
             completed_at,
+        })
+    }
+    pub fn get(&self, req: GetCouncilRequest) -> Result<GetCouncilResponse, ServiceError> {
+        require_non_empty("council_id", &req.council_id)?;
+        let connection = self.storage.lock_connection()?;
+        let run = connection
+            .query_row(
+                "SELECT council_id, name, question, intent, mode, members_json, status, started_at, completed_at, outcome_json
+                 FROM council_runs WHERE council_id = ?1",
+                params![req.council_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ServiceError::NotFound(format!("council {}", req.council_id)))?;
+
+        let (council_id, name, question, intent, mode, members_json, status, started_at, completed_at, outcome_json) = run;
+        let members: Vec<String> = serde_json::from_str(&members_json)
+            .map_err(|error| invalid_json("council members", error))?;
+
+        let (synthesis, agreement_level) = match outcome_json {
+            Some(json_str) => {
+                let outcome: serde_json::Value = serde_json::from_str(&json_str)
+                    .map_err(|e| invalid_json("council outcome", e))?;
+                (
+                    outcome.get("synthesis").and_then(|v| v.as_str()).map(str::to_owned),
+                    outcome.get("agreement_level").and_then(|v| v.as_str()).map(str::to_owned),
+                )
+            }
+            None => (None, None),
+        };
+        let mut stmt = connection.prepare(
+            "SELECT member_name, status, updated_at, response_text, error_text
+             FROM council_member_states WHERE council_id = ?1 ORDER BY member_name ASC",
+        )?;
+        let member_states = stmt
+            .query_map(params![req.council_id], |row| {
+                Ok(CouncilMemberStateDto {
+                    member_name: row.get(0)?,
+                    status: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    response_block: row.get(3)?,
+                    error: row.get(4)?,
+                    token_cost_nanodollars: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(GetCouncilResponse {
+            ok: true,
+            council: CouncilRunDto {
+                council_id,
+                name,
+                question,
+                intent,
+                mode,
+                members,
+                status,
+                started_at,
+                completed_at,
+                synthesis,
+                agreement_level,
+                member_states,
+            },
         })
     }
 }
@@ -659,5 +778,78 @@ mod tests {
             serde_json::from_str(&run.2).expect("decode council outcome");
         assert_eq!(outcome["synthesis"], expected_synthesis);
         assert_eq!(outcome["agreement_level"], "mixed");
+    }
+
+    #[test]
+    fn stage_is_idempotent_on_identical_request_and_rejects_conflicts() {
+        let service = service();
+        let req = stage_request("council-idempotent");
+        let res1 = service.stage(req.clone()).expect("initial stage");
+        assert!(res1.ok);
+        assert_eq!(res1.council_id, "council-idempotent");
+
+        // Re-staging identically must succeed with identical values
+        let res2 = service.stage(req.clone()).expect("idempotent re-stage");
+        assert!(res2.ok);
+        assert_eq!(res2.started_at, res1.started_at);
+        assert_eq!(res2.status, res1.status);
+
+        // Re-staging with differing parameters must fail with Conflict
+        let mut req_conflict = req;
+        req_conflict.question = "Different question".to_owned();
+        let err = service
+            .stage(req_conflict)
+            .expect_err("conflicting stage must fail");
+        assert!(matches!(
+            err,
+            ServiceError::Conflict(ref msg)
+                if msg.contains("already staged with different parameters")
+        ));
+    }
+
+    #[test]
+    fn get_returns_full_council_and_member_states() {
+        let service = service();
+        service
+            .stage(stage_request("council-get-test"))
+            .expect("stage council");
+        evaluate(
+            &service,
+            "council-get-test",
+            "alpha",
+            "completed",
+            Some("Alpha conclusion"),
+            None,
+        );
+
+        let res = service
+            .get(crate::protocol::council::GetCouncilRequest {
+                council_id: "council-get-test".to_owned(),
+            })
+            .expect("get council");
+        assert!(res.ok);
+        assert_eq!(res.council.council_id, "council-get-test");
+        assert_eq!(res.council.status, "staged");
+        assert_eq!(res.council.members, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(res.council.member_states.len(), 3);
+        let alpha_state = res
+            .council
+            .member_states
+            .iter()
+            .find(|m| m.member_name == "alpha")
+            .expect("alpha state");
+        assert_eq!(alpha_state.status, "completed");
+        assert_eq!(
+            alpha_state.response_block.as_deref(),
+            Some("Alpha conclusion")
+        );
+
+        // Nonexistent council returns NotFound
+        let err = service
+            .get(crate::protocol::council::GetCouncilRequest {
+                council_id: "nonexistent".to_owned(),
+            })
+            .expect_err("nonexistent council must return NotFound");
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 }

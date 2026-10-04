@@ -16,7 +16,9 @@ use subc_protocol::{
 
 use crate::{
     protocol::{
-        council::{EvaluateCouncilRequest, ReconcileCouncilRequest, StageCouncilRequest},
+        council::{
+            EvaluateCouncilRequest, GetCouncilRequest, ReconcileCouncilRequest, StageCouncilRequest,
+        },
         peer::{
             AckMessageRequest, AcquireLeaseRequest, EnqueueMessageRequest, PollInboxRequest,
             ReleaseLeaseRequest, RenewLeaseRequest,
@@ -57,6 +59,7 @@ pub fn manifest() -> ModuleManifest {
                 mutate("council.stage"),
                 mutate("council.evaluate"),
                 mutate("council.reconcile"),
+                query("council.get"),
             ],
             config_schema: json!({
                 "type": "object",
@@ -206,6 +209,9 @@ impl DiscussionsHandler {
             }),
             "council.reconcile" => dispatch_typed(params, |request: ReconcileCouncilRequest| {
                 state.council.reconcile(request)
+            }),
+            "council.get" => dispatch_typed(params, |request: GetCouncilRequest| {
+                state.council.get(request)
             }),
             _ => handler_error(
                 "unknown_operation",
@@ -364,6 +370,7 @@ fn service_error(error: ServiceError) -> HandlerOutcome {
         ServiceError::Storage(error) => handler_error("storage_error", error.to_string()),
         ServiceError::NotFound(message) => handler_error("not_found", message),
         ServiceError::InvalidRequest(message) => handler_error("invalid_request", message),
+        ServiceError::Conflict(message) => handler_error("conflict", message),
         ServiceError::NotRoomMember { room_id, member_id } => handler_error(
             "not_room_member",
             format!("member {member_id} is not in room {room_id}"),

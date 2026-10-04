@@ -16,6 +16,8 @@ pub enum ServiceError {
     NotFound(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("member {member_id} is not in room {room_id}")]
     NotRoomMember { room_id: String, member_id: String },
     #[error(

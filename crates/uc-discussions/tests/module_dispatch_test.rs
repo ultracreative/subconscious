@@ -69,6 +69,7 @@ fn manifest_declares_all_management_surface_operations() {
             "council.stage",
             "council.evaluate",
             "council.reconcile",
+            "council.get",
         ]
     );
 }

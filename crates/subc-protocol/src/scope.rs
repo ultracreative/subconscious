@@ -15,6 +15,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::Principal;
 
+// Scope principals are authority-bearing input: an unrecognized constraint must
+// not silently widen a grant. Principal elsewhere is a forward-compatible caller
+// fact, so keep its general decoder lenient and enforce this only on scope input.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ScopePrincipal {
+    Reserved { module_id: String },
+    Direct {},
+    Unverified {},
+}
+
+impl From<ScopePrincipal> for Principal {
+    fn from(value: ScopePrincipal) -> Self {
+        match value {
+            ScopePrincipal::Reserved { module_id } => Self::Reserved { module_id },
+            ScopePrincipal::Direct {} => Self::Direct,
+            ScopePrincipal::Unverified {} => Self::Unverified,
+        }
+    }
+}
+
+fn deserialize_scope_principal<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Principal, D::Error> {
+    ScopePrincipal::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_scope_principals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Principal>, D::Error> {
+    Vec::<ScopePrincipal>::deserialize(deserializer)
+        .map(|principals| principals.into_iter().map(Into::into).collect())
+}
+
 /// The `server.describe` capability a daemon advertises when it admits routes
 /// under scopes. A carrier that needs a scoped route and does not see it fails
 /// the call (`scope_unsupported`) instead of opening an unscoped route.
@@ -57,6 +91,7 @@ pub enum ScopeKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeParent {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,
@@ -72,14 +107,21 @@ pub struct ScopeParent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeCarrier {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub principal: Principal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<String>>,
 }
 
-/// The attributes the daemon stamps without interpreting. Both grant authority,
-/// so only an owner listed in the daemon's `scope_authority_owners` may set
-/// either.
+/// Declaring this in a manifest's `capabilities.provides` promises that the
+/// module recognises a scope carrying `flow_id` and applies flow behaviour:
+/// it never treats the flow as its owner agent.
+pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
+
+/// The attributes the daemon stamps without interpreting. They bear authority,
+/// so only an owner module named in the daemon config's `scope_authority_owners`
+/// list (by default the module that owns agent sessions) may set them; a scope
+/// owned by any other module must leave them empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeAttributes {
@@ -89,12 +131,35 @@ pub struct ScopeAttributes {
     /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegates: bool,
+    /// This scope belongs to the named flow, an automated workflow run on an
+    /// agent's behalf. Set only by an authority owner (see above), validated
+    /// with [`validate_flow_id`], and stamped verbatim. It needs neither
+    /// `agent_id` nor `delegates`. Providers treat a module other than the
+    /// owner that opens a route under a flow scope as the flow's carrier.
+    ///
+    /// Like an `agent_id` change, changing this within the same scope epoch is
+    /// accepted: the scope's content version increases (the number providers
+    /// compare to notice a change), and every route under the scope is closed
+    /// with the reason `scope_delegation_changed`, so no live route keeps the
+    /// old identity.
+    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] before the daemon may
+    /// send a bind stamped with this field. Decoding it alone is not enough:
+    /// the target must also apply flow behaviour instead of agent behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
 }
 
 impl ScopeAttributes {
     pub fn is_empty(&self) -> bool {
-        self.agent_id.is_none() && !self.delegates
+        self.agent_id.is_none() && !self.delegates && self.flow_id.is_none()
     }
+}
+
+/// Check a flow id using the shared opaque-token rule: 1–256 printable,
+/// non-space ASCII bytes. Errors name `flow_id`. Scope refs remain opaque and
+/// are not subject to this token rule.
+pub fn validate_flow_id(flow_id: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
+    crate::tool_call::validate_opaque_field("flow_id", flow_id)
 }
 
 /// One scope as its owner registers it in `scope.sync`.
@@ -112,7 +177,11 @@ pub struct ScopeRecord {
     pub parent: Option<ScopeParent>,
     /// Principals, other than the owner, allowed to register child scopes under
     /// this one. Listing a principal here grants it nothing else.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_scope_principals"
+    )]
     pub child_owners: Vec<Principal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carriers: Vec<ScopeCarrier>,
@@ -128,6 +197,7 @@ pub struct ScopeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeSelector {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,
@@ -231,4 +301,57 @@ pub struct ScopeStamp {
     /// Whether the owner is listed in the daemon's `scope_authority_owners`.
     /// Providers decide on this flag and keep no copy of the list.
     pub owner_authorized: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_call::OpaqueFieldError;
+
+    #[test]
+    fn flow_id_uses_the_shared_opaque_token_bounds_and_names_its_field() {
+        let field = "flow_id";
+        assert_eq!(validate_flow_id(""), Err(OpaqueFieldError::Empty { field }));
+        assert_eq!(validate_flow_id("f"), Ok(()));
+        assert_eq!(validate_flow_id(&"f".repeat(256)), Ok(()));
+        assert_eq!(
+            validate_flow_id(&"f".repeat(257)),
+            Err(OpaqueFieldError::TooLong { field, length: 257 })
+        );
+        assert_eq!(validate_flow_id("!~Flow:7/step"), Ok(()));
+        for bad in ["f é", "f\t", "fé", "f\u{7f}"] {
+            let error = validate_flow_id(bad).unwrap_err();
+            assert_eq!(
+                error,
+                OpaqueFieldError::InvalidCharacter { field, index: 1 }
+            );
+            assert_eq!(error.field(), "flow_id");
+        }
+    }
+
+    #[test]
+    fn flow_only_attributes_round_trip_and_absence_keeps_the_bytes() {
+        let attributes = ScopeAttributes::default();
+        assert!(attributes.is_empty());
+        assert_eq!(serde_json::to_string(&attributes).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<ScopeAttributes>("{}").unwrap(),
+            attributes
+        );
+        let attributes = ScopeAttributes {
+            flow_id: Some("flow:7".to_string()),
+            ..ScopeAttributes::default()
+        };
+        assert!(!attributes.is_empty());
+        let encoded = serde_json::to_string(&attributes).unwrap();
+        assert_eq!(encoded, r#"{"flow_id":"flow:7"}"#);
+        assert_eq!(
+            serde_json::from_str::<ScopeAttributes>(&encoded).unwrap(),
+            attributes
+        );
+        assert!(
+            serde_json::from_str::<ScopeAttributes>(r#"{"flow_id":"flow:7","unknown":true}"#)
+                .is_err()
+        );
+    }
 }

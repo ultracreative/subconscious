@@ -5000,6 +5000,18 @@ async fn bind_relay_breaker_opens_at_the_threshold_and_refuses_before_relaying()
     )
     .await;
     assert_eq!(refused.code, "module_timeout");
+    // The caller is told the module is slow, not down: a worker that reads
+    // only a count of failed relays concludes the module has died.
+    assert!(
+        refused
+            .message
+            .contains("is slow to accept new routes (3 timed out in a row)")
+            && refused
+                .message
+                .contains("its established routes are unaffected"),
+        "{}",
+        refused.message
+    );
 
     // Wait out more than a whole budget: a relay, had one been sent, would
     // have reached the stub and been recorded long before this returns.
@@ -7185,7 +7197,13 @@ where
     client.flush().await.unwrap();
 
     let ack_frame = read_frame_timeout(client).await;
-    assert_eq!(ack_frame.header.ty, FrameType::Response);
+    assert_eq!(
+        ack_frame.header.ty,
+        FrameType::Response,
+        "route.open was answered with {:?}: {}",
+        ack_frame.header.ty,
+        String::from_utf8_lossy(&ack_frame.body)
+    );
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
     match serde_json::from_slice(&ack_frame.body).unwrap() {
@@ -7929,6 +7947,7 @@ fn supervisor_with_drain_timeout(
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
+    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -7945,6 +7964,7 @@ fn health_config(
     critical: bool,
 ) -> HealthConfig {
     HealthConfig {
+        http: None,
         cadence,
         deadline,
         failure_threshold,

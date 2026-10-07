@@ -920,6 +920,383 @@ async fn stop_and_damage(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_prunes_expired_user_cutoffs_but_keeps_live_cutoffs() {
+    let _gate = harness::acceptance_gate().await;
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    let expired = KeyPair::new_user().public_key();
+    let recent = KeyPair::new_user().public_key();
+    let current = bootstrap::account_jwt::decode_claims(&run.account_jwt().await).unwrap();
+    let now = unix_now();
+    let claims = bootstrap::account_jwt::AccountClaims {
+        account_public: plane.account_public.clone(),
+        name: current["name"].as_str().unwrap().into(),
+        signing_keys: current["nats"]["signing_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().into())
+            .collect(),
+        revocations: [(expired.clone(), now - 901), (recent.clone(), now)].into(),
+        issued_at: now.max(current["iat"].as_i64().unwrap() + 1),
+    };
+    let signer = InProcessSigner(run.trust.signer.clone());
+    let jwt = bootstrap::account_jwt::sign_account_jwt(
+        &signer,
+        &Default::default(),
+        &bus::signer_root_id(),
+        &claims,
+    )
+    .await
+    .unwrap();
+    bootstrap::plane::apply_account_jwt(plane.system.as_ref(), &plane.account_public, &jwt)
+        .await
+        .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let victim = Victim::enter(&run, &plane, "pruneprobe", 2).await;
+    let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
+    revoker.revoke_module(&plane, &victim.module).await.unwrap();
+    let revoked = run.revocations().await;
+    assert!(
+        !revoked.contains_key(&expired),
+        "expired JWT cutoffs must not accumulate"
+    );
+    assert!(revoked.contains_key(&recent));
+    revoked_once(&revoked, &victim.public);
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn census_replacement_records_predecessor_before_the_crash_boundary() {
+    struct Live;
+    #[async_trait]
+    impl issuance::LiveGenerations for Live {
+        async fn live_generation(&self, _: &str) -> Result<Option<u64>, String> {
+            Ok(Some(2))
+        }
+    }
+    struct Source(issuance::Plane);
+    impl issuance::PlaneSource for Source {
+        fn current(&self) -> Option<issuance::Plane> {
+            Some(self.0.clone())
+        }
+    }
+    let _gate = harness::acceptance_gate().await;
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    let store = tempfile::tempdir().unwrap();
+    let victim = Victim::enter(&run, &plane, "replacecrash", 2).await;
+    let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let (_, ready) = tokio::sync::watch::channel(None);
+    let area = Arc::new(revocation::handler::Area::new(revoker.clone(), ready));
+    let issuing = issuance::Issuance::new(
+        Arc::new(Credentials::new(Arc::new(InProcessSigner(
+            run.trust.signer.clone(),
+        )))),
+        store.path(),
+        Arc::new(Live),
+        Arc::new(Source(issuance::Plane {
+            names: plane.names.clone(),
+            account_public: plane.account_public.clone(),
+            server_url: run.server.url.clone(),
+            box_plane: plane.box_plane.clone(),
+        })),
+    );
+    issuing.set_replacement_guard(area);
+    *issuing.crash_after.lock().unwrap() = Some(issuance::StopAfter::Census);
+    assert_eq!(
+        issuing.issue(&victim.module).await.unwrap_err().code,
+        "test_crash"
+    );
+    let successor = run.census_value(&victim.module).await.unwrap();
+    assert_ne!(successor.credential_public, victim.public);
+    let Some(progress::Entry::Present(record)) = revoker.progress().read(&victim.identity()) else {
+        panic!("predecessor disappeared at the census-write crash boundary");
+    };
+    assert_eq!(record.user_public, victim.public);
+    // A new revoker stands in for a restarted ck-bus: the crashed process's in-memory
+    // state (its record of issued credentials and the revoker that began the
+    // revocation) is gone, and only the durable progress record remains. Recovery
+    // resumes the recorded predecessor revocation from that record, and the census
+    // entry, which already names the successor, is left unchanged.
+    let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let outcomes = recovering.resume_all(&plane).await;
+    assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
+    revoked_once(&run.revocations().await, &victim.public);
+    assert_eq!(run.census_value(&victim.module).await.unwrap(), successor);
+    victim.expect_severed().await;
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+/// A TCP relay that loses exactly one census metadata request by closing its socket.
+/// Unlike a sleeping broker or an unreadable entry, the broker remains healthy and the
+/// client's next connection can answer the same read immediately.
+async fn lose_one_census_request(
+    backend: String,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("nats://{}", listener.local_addr().unwrap());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_request = armed.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let backend = backend.clone();
+            let drop_request = drop_request.clone();
+            tokio::spawn(async move {
+                let server = tokio::net::TcpStream::connect(backend.trim_start_matches("nats://"))
+                    .await
+                    .unwrap();
+                eprintln!("census relay: connected to the healthy broker");
+                let (client_read, mut client_write) = client.into_split();
+                let (mut server_read, mut server_write) = server.into_split();
+                let uplink = async {
+                    let mut client_read = BufReader::new(client_read);
+                    loop {
+                        let mut header = String::new();
+                        if client_read.read_line(&mut header).await? == 0 {
+                            return Ok::<_, std::io::Error>(());
+                        }
+                        if header.starts_with("PUB $JS.API.STREAM.INFO.")
+                            && drop_request.swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            eprintln!("census relay: lost {header:?}; closing the box connection");
+                            return Ok(());
+                        }
+                        server_write.write_all(header.as_bytes()).await?;
+                        if header.starts_with("PUB ") || header.starts_with("HPUB ") {
+                            let length: usize =
+                                header.split_whitespace().last().unwrap().parse().unwrap();
+                            let mut payload = vec![0; length + 2];
+                            client_read.read_exact(&mut payload).await?;
+                            server_write.write_all(&payload).await?;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = uplink => {}
+                    _ = tokio::io::copy(&mut server_read, &mut client_write) => {}
+                }
+            });
+        }
+    });
+    (url, armed, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_census_read_lost_at_box_reconnect_is_replayed_within_its_original_budget() {
+    let _gate = harness::acceptance_gate().await;
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(mut run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let (url, armed, relay) = lose_one_census_request(run.server.url.clone()).await;
+    run.server.url = url;
+    let plane = plane(&run).await;
+    let module = "readreconnect";
+    let key = AccountNames::census_key(module).unwrap();
+    let value = CensusValue {
+        credential_public: KeyPair::new_user().public_key(),
+        user_jwt_id: "predecessor".into(),
+        spawn_generation: 2,
+        credential_epoch: 0,
+        identities: vec![],
+        rooms: vec![],
+    };
+    plane
+        .box_plane
+        .census_put(&plane.names.census_subject(&key).unwrap(), value.to_bytes())
+        .await
+        .unwrap();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let began = Instant::now();
+    let read = plane.box_plane.census_get(&plane.names, &key).await;
+    eprintln!(
+        "census read after {:?}, box state {:?}: {:?}",
+        began.elapsed(),
+        plane
+            .box_plane
+            .sentinel_link()
+            .unwrap()
+            .client
+            .connection_state(),
+        read.as_ref()
+            .map(|record| record.as_ref().map(|record| record.revision))
+    );
+    let record = read
+        .expect("a healthy census is readable after the box connection reconnects")
+        .expect("reconnect must not be interpreted as an absent entry");
+    assert!(
+        !armed.load(std::sync::atomic::Ordering::SeqCst),
+        "the relay must actually lose the request"
+    );
+    assert_eq!(CensusValue::parse(&record.value).unwrap(), value);
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "replay stays inside the existing broker request budget"
+    );
+    // A real read failure still refuses: recovery must not fabricate an absent entry.
+    async_nats::jetstream::new(
+        bus::box_client(&run.trust, &run.server, &plane.account_public).await,
+    )
+    .delete_stream(&plane.names.buckets().census_stream)
+    .await
+    .unwrap();
+    assert!(plane
+        .box_plane
+        .census_get(&plane.names, &key)
+        .await
+        .is_err());
+    relay.abort();
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
+    struct Live;
+    #[async_trait]
+    impl issuance::LiveGenerations for Live {
+        async fn live_generation(&self, _: &str) -> Result<Option<u64>, String> {
+            Ok(Some(2))
+        }
+    }
+    struct Source(issuance::Plane);
+    impl issuance::PlaneSource for Source {
+        fn current(&self) -> Option<issuance::Plane> {
+            Some(self.0.clone())
+        }
+    }
+    let _gate = harness::acceptance_gate().await;
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    for malformed in [false, true] {
+        let store = tempfile::tempdir().unwrap();
+        let module = "unreadablepredecessor";
+        let key = AccountNames::census_key(module).unwrap();
+        let bytes = b"not a census value".to_vec();
+        plane
+            .box_plane
+            .census_put(&plane.names.census_subject(&key).unwrap(), bytes.clone())
+            .await
+            .unwrap();
+        let credentials = credentials_over(run.trust.signer.clone());
+        let revoker = Arc::new(Revoker::new(
+            credentials.clone(),
+            store.path(),
+            Arc::new(Connections::default()),
+        ));
+        let (_, ready) = tokio::sync::watch::channel(None);
+        let area = Arc::new(revocation::handler::Area::new(revoker, ready));
+        let issuing = issuance::Issuance::new(
+            credentials.clone(),
+            store.path(),
+            Arc::new(Live),
+            Arc::new(Source(issuance::Plane {
+                names: plane.names.clone(),
+                account_public: plane.account_public.clone(),
+                server_url: run.server.url.clone(),
+                box_plane: if malformed {
+                    plane.box_plane.clone()
+                } else {
+                    Arc::new(UnreadableCensus(plane.box_plane.clone()))
+                },
+            })),
+        );
+        issuing.set_replacement_guard(area);
+        let refusal = issuing
+            .issue(module)
+            .await
+            .expect_err("an unreadable predecessor must never be overwritten");
+        assert_eq!(refusal.code, issuance::code::CENSUS_UNAVAILABLE);
+        assert!(issuing.current(module).is_none());
+        assert_eq!(
+            plane
+                .box_plane
+                .census_get(&plane.names, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            bytes
+        );
+    }
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_census() {
+    let _gate = harness::acceptance_gate().await;
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    for (module, replacement) in [("damagedsupersede", true), ("damagedcensus", false)] {
+        let store = tempfile::tempdir().unwrap();
+        let (victim, path) =
+            stop_and_damage(&plane, &run, module, store.path(), Boundary::ZeroRecorded).await;
+        let key = AccountNames::census_key(module).unwrap();
+        let bytes = if replacement {
+            CensusValue {
+                credential_public: KeyPair::new_user().public_key(),
+                user_jwt_id: "successor".into(),
+                spawn_generation: victim.identity().spawn_generation,
+                credential_epoch: victim.identity().credential_epoch + 1,
+                identities: vec![],
+                rooms: vec![],
+            }
+            .to_bytes()
+        } else {
+            b"not JSON".to_vec()
+        };
+        plane
+            .box_plane
+            .census_put(&plane.names.census_subject(&key).unwrap(), bytes)
+            .await
+            .unwrap();
+        let damaged = std::fs::read(&path).unwrap();
+        let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
+        let outcomes = recovering.resume_all(&plane).await;
+        assert!(
+            matches!(outcomes[0].1, Err(RevocationError::Deferred { .. })),
+            "{outcomes:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        assert!(!run.revocations().await.contains_key(&victim.public));
+        victim.expect_still_connected().await;
+    }
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
@@ -956,7 +1333,10 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     assert_eq!(disconnects.settled_for(&victim.public).await.len(), 1);
     progress_is_empty(store.path()).await;
 
-    // (iii) Damaged after step (2): cleared, and nothing is pushed.
+    // (iii) Damaged after step (2), the census delete: the record's inputs (the user
+    // key, JWT id, generation and epoch) are unreadable and the census entry they were
+    // derived from is gone. An absent entry says nothing about which key it held, nor
+    // whether the revocation finished, so recovery defers and keeps the record.
     let store = tempfile::tempdir().unwrap();
     let (victim, _) = stop_and_damage(
         &plane,
@@ -970,10 +1350,15 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
     let outcomes = recovering.resume_all(&plane).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-    assert_eq!(outcomes[0].1, Ok(Completed::default()));
+    assert!(matches!(
+        outcomes[0].1,
+        Err(RevocationError::Deferred { .. })
+    ));
     assert_eq!(run.account_jwt().await, jwt, "nothing was pushed");
     revoked_once(&run.revocations().await, &victim.public);
-    progress_is_empty(store.path()).await;
+    assert!(ProgressStore::new(store.path())
+        .path(&victim.identity())
+        .exists());
 
     // (iv) Damaged with the census read failing: deferred, the file left as it is.
     let store = tempfile::tempdir().unwrap();

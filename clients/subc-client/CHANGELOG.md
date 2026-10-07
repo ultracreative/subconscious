@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
+
+## 0.21.0
+
+- Add optional `scope: { owner: Principal, ref: string, scopeEpoch: number }` to direct route opens, managed calls (including binary calls), and managed closes. The selector is sent as `scope: { owner, ref, scope_epoch }`, matching the Rust protocol. Owner and ref are validated locally, and a missing, negative, fractional or unsafe epoch is refused before sending.
+- Isolate managed route cache entries by the entire scope selector, apart from unscoped routes. Reconnect reopens retain the selector but never reuse a handle from an earlier connection or daemon incarnation.
+- Preserve deadline-bounded retries for `scope_not_synced` and `scope_changed`. Terminal lifecycle close reasons, including scope revocation, prevent automatic managed reopens under the same selector; restart and reload still allow them.
+- Scoped opens require the caller to be the scope's owner or a listed carrier. The normal owner form is a reserved principal; the daemon refuses other owner kinds.
+
+## 0.20.1
+
+- Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.
+- On provider close, daemon GOODBYE, or fatal disconnect, reject pending reverse requests immediately, abort handler signals, and invalidate installed routes. Explicit close rejects with `provider_closed`, daemon GOODBYE with `connection_closed`, and fatal failures retain their cause.
+- Match Rust and Swift header-validation precedence: a pure-header control frame with both a body and a nonzero epoch reports `pure_header_frame_with_body` before `nonzero_epoch_on_control_channel`.
+- `readConnectionFile` refuses a connection file owned by any uid other than the process's effective uid, even at mode 0600, because its owner could have written their own endpoint and key. The file is opened once and the ownership and permission checks run on the opened file (fstat), so replacing the path between the check and the read cannot slip an unchecked key through. The refusal is a `ConnectionFileError`. The owner check is skipped where `process.geteuid` does not exist (Windows), matching subc-transport.
+- `encodeFrame` refuses, before producing any bytes, a frame whose header the wire decoder would reject (it runs the encoded header through `decodeHeader`) and a body over `MAX_FRAME_BODY_LEN`, throwing `DecodeError` with the decoder's code (`frame_body_too_large` for the size). Every frame the SDK writes passes through it, so an invalid hand-built frame can no longer reach the socket and make the daemon drop a healthy connection. Frames built with `buildFrame` were already validated and are unaffected.
+
 ## 0.20.0 — 2026-10-02
 
 - Export `RouteEndReason` and expose `closeReason` on `SubcError` and `SubcCallError`. Named channel reasons take precedence over legacy module-only pushes; caller closes and connection losses report SDK-side reasons. Channel reuse clears history and call retry kinds are unchanged.

@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::{
+    bus_monitoring::{BusMonitoring, BusTarget},
     detection,
     mc_detection::{self, McDetection},
 };
@@ -84,6 +85,30 @@ impl fmt::Display for Component {
 /// A daemon version used only for module compatibility-floor comparisons.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CoreVersion(u64, u64, u64);
+
+impl CoreVersion {
+    /// Floors compare the numeric release triplet, not release-channel suffixes.
+    /// Keep the floor decoder strict while accepting suffixes on observed builds.
+    pub fn from_release(value: &str) -> Result<Self, ()> {
+        let (without_build, build) = value
+            .split_once('+')
+            .map_or((value, None), |(a, b)| (a, Some(b)));
+        let (triplet, prerelease) = without_build
+            .split_once('-')
+            .map_or((without_build, None), |(a, b)| (a, Some(b)));
+        for suffix in [build, prerelease].into_iter().flatten() {
+            if suffix.split('.').any(|part| {
+                part.is_empty()
+                    || !part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) {
+                return Err(());
+            }
+        }
+        triplet.parse()
+    }
+}
 
 impl FromStr for CoreVersion {
     type Err = ();
@@ -270,6 +295,9 @@ pub struct SetupObserved {
     /// The installed daemon version, absent when neither live catalog nor binary
     /// version evidence could be read.
     pub installed_core_version: Option<String>,
+    /// A daemon binary or live daemon already exists, even if its configuration
+    /// needs repair. Setup does not replace existing managed binaries.
+    pub core_binary_present: bool,
     pub runtime: RuntimeState,
     pub configuration: ConfigurationState,
     /// The bootstrap installer owns the running `ck` placement but setup has
@@ -289,6 +317,9 @@ pub struct SetupObserved {
     /// uninstall that failed partway leaves exactly this: the daemon rows
     /// gone, so no component detects, and the binaries still on disk.
     pub inventory_owned_paths: usize,
+    /// An existing nats-server install `ck setup` can give a health check, read
+    /// without changing anything. Setup does not install the bus itself.
+    pub bus_monitoring: BusMonitoring,
 }
 
 impl SetupObserved {
@@ -317,6 +348,7 @@ impl SetupObserved {
             releases,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
+            core_binary_present: false,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -324,6 +356,7 @@ impl SetupObserved {
             detections,
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            bus_monitoring: BusMonitoring::NotDeclared,
         }
     }
 
@@ -544,6 +577,12 @@ pub enum SetupOperation {
         component: Component,
     },
     RetainUserData,
+    /// Add the loopback monitoring listener to an existing nats-server's
+    /// `server.conf` (through ck-bus), then, only once that succeeded, the
+    /// nats-server health check to the daemon configuration.
+    MonitorNatsServer {
+        target: BusTarget,
+    },
 }
 
 impl SetupOperation {
@@ -561,6 +600,7 @@ impl SetupOperation {
                 | Self::StartRuntime
                 | Self::DeregisterRuntime
                 | Self::RemoveManagedComponent { .. }
+                | Self::MonitorNatsServer { .. }
         )
     }
 
@@ -584,7 +624,8 @@ impl SetupOperation {
             | Self::Validate { .. }
             | Self::DeregisterRuntime
             | Self::RemoveManagedComponent { .. }
-            | Self::RetainUserData => None,
+            | Self::RetainUserData
+            | Self::MonitorNatsServer { .. } => None,
         }
     }
 }
@@ -651,6 +692,11 @@ impl fmt::Display for SetupOperation {
             Self::RetainUserData => {
                 formatter.write_str("retain user configuration and component stores")
             }
+            Self::MonitorNatsServer { target } => write!(
+                formatter,
+                "add nats-server's monitoring listener to {}, then its health check",
+                target.nats_dir.join("server.conf").display()
+            ),
         }
     }
 }

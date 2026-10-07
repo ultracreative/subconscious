@@ -356,6 +356,9 @@ pub struct VerdictClient {
     events: Arc<Mutex<Vec<String>>>,
 }
 
+/// Bounds a complete broker connect, including the participant's nonce-sign relay.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl VerdictClient {
     /// Connects with `jwt`, answering the nonce through `sign`. `inbox_prefix` sets the
     /// client's reply inbox; `None` leaves the library's default `_INBOX`.
@@ -367,6 +370,7 @@ impl VerdictClient {
     ) -> Result<Self, async_nats::ConnectError> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
+        let label = inbox_prefix.clone();
         let mut options = async_nats::ConnectOptions::with_jwt(jwt.to_string(), move |nonce| {
             // The library needs a `Sync` future; the signing future runs as its own task
             // and only the task handle is awaited here.
@@ -380,11 +384,16 @@ impl VerdictClient {
         })
         .event_callback(move |event| {
             let recorded = recorded.clone();
+            let label = label.clone();
             async move {
+                eprintln!(
+                    "broker event {label:?} at {:?}: {event}",
+                    std::time::SystemTime::now()
+                );
                 recorded.lock().unwrap().push(event.to_string());
             }
         })
-        .connection_timeout(Duration::from_secs(5))
+        .connection_timeout(CONNECT_TIMEOUT)
         .request_timeout(Some(Duration::from_secs(3)));
         if let Some(prefix) = inbox_prefix {
             options = options.custom_inbox_prefix(prefix);
@@ -403,6 +412,7 @@ impl VerdictClient {
     ) -> Result<Self, async_nats::ConnectError> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
+        let label = inbox_prefix.clone();
         let client = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let presented = jwt.lock().unwrap().clone();
             // As in `connect`: the signing runs as its own task, only its handle is awaited.
@@ -420,11 +430,16 @@ impl VerdictClient {
         })
         .event_callback(move |event| {
             let recorded = recorded.clone();
+            let label = label.clone();
             async move {
+                eprintln!(
+                    "broker event {label:?} at {:?}: {event}",
+                    std::time::SystemTime::now()
+                );
                 recorded.lock().unwrap().push(event.to_string());
             }
         })
-        .connection_timeout(Duration::from_secs(5))
+        .connection_timeout(CONNECT_TIMEOUT)
         .request_timeout(Some(Duration::from_secs(3)))
         .custom_inbox_prefix(inbox_prefix)
         .connect(url)

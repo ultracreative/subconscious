@@ -1,4 +1,5 @@
 use super::{
+    bus_monitoring::BusMonitoring,
     conversion::{explicit_conversion_requires_confirmation, selected_components},
     model::{
         Component, ComponentState, ConfigurationState, CoreVersion, DetectionOutcome, PlanOutcome,
@@ -15,7 +16,15 @@ pub struct SetupPlan {
 
 impl SetupPlan {
     pub fn is_authorized(&self) -> bool {
-        !self.outcomes.iter().any(PlanOutcome::blocks_execution)
+        self.blocking_outcome().is_none()
+    }
+
+    /// An explicitly requested setup target that cannot be installed is a
+    /// failed request, not a successful partial setup followed by health waits.
+    pub fn blocking_outcome(&self) -> Option<&PlanOutcome> {
+        self.outcomes.iter().find(|outcome| {
+            outcome.blocks_execution() || matches!(outcome, PlanOutcome::TargetRefused { .. })
+        })
     }
 
     pub fn mutation_count(&self) -> usize {
@@ -142,7 +151,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 plan.operations
                     .push(SetupOperation::InstallComponent { component });
                 if component == Component::Core {
-                    core_is_being_installed = true;
+                    core_is_being_installed = !observed.core_binary_present;
                 }
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
@@ -204,6 +213,24 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
             .push(SetupOperation::EnableComponent { component });
     }
 
+    // After every rescan this run makes: a rescan applies a new health check
+    // live, and nats-server opens its new listener only when it restarts, so
+    // a rescan after this write would probe a listener that is not there yet.
+    match &observed.bus_monitoring {
+        BusMonitoring::Observed(bus) if bus.needs_change() => {
+            plan.operations.push(SetupOperation::MonitorNatsServer {
+                target: bus.target.clone(),
+            });
+        }
+        BusMonitoring::Observed(bus) => plan.outcomes.push(PlanOutcome::Noop {
+            scope: bus.noop_scope(),
+        }),
+        skipped @ BusMonitoring::Skipped { .. } => plan.outcomes.push(PlanOutcome::Noop {
+            scope: skipped.to_string(),
+        }),
+        BusMonitoring::NotDeclared => {}
+    }
+
     plan.operations.extend([
         SetupOperation::Validate {
             instrument: "ck daemon triage",
@@ -237,7 +264,7 @@ fn setup_core_floor_refusal(
             "{component} requires core ≥ {floor}, but the installed core version could not be read"
         ));
     };
-    let Ok(installed) = installed_text.parse::<CoreVersion>() else {
+    let Ok(installed) = CoreVersion::from_release(installed_text) else {
         return Some(format!(
             "{component} requires core ≥ {floor}, but the installed core version could not be read (`{installed_text}`)"
         ));
@@ -572,7 +599,7 @@ fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget)
             target.component
         ));
     };
-    let Ok(core_version) = core_text.parse::<CoreVersion>() else {
+    let Ok(core_version) = CoreVersion::from_release(core_text) else {
         return Some(format!(
             "{} requires core ≥ {floor}, but core version `{core_text}` could not be read",
             target.component
@@ -659,6 +686,7 @@ mod tests {
             releases,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
+            core_binary_present: false,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -666,6 +694,7 @@ mod tests {
             detections: BTreeMap::new(),
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            bus_monitoring: BusMonitoring::NotDeclared,
         }
     }
 
@@ -681,6 +710,7 @@ mod tests {
             .requires_core
             .insert(Component::Aft, "0.17.20".to_string());
         observed.installed_core_version = installed_version.map(ToOwned::to_owned);
+        observed.core_binary_present = true;
         observed.runtime = RuntimeState::Correct;
         observed
     }
@@ -772,6 +802,52 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_core_can_meet_a_numeric_module_floor() {
+        let observed = floor_upgrade_observed("0.17.20", Some("0.18.0-rc.1"), Some("0.17.0"));
+        assert!(updates_target(
+            &plan_upgrade(&observed),
+            upgrade_target("ck-aft")
+        ));
+    }
+
+    #[test]
+    fn setup_config_drift_does_not_bypass_the_installed_core_floor() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Missing);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused {
+                component: Component::Aft,
+                ..
+            }
+        )));
+        assert!(
+            !plan.operations.contains(&SetupOperation::InstallComponent {
+                component: Component::Aft
+            })
+        );
+    }
+
+    #[test]
+    fn setup_floor_refusal_blocks_runtime_mutations_and_exposes_the_reason() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed.runtime = RuntimeState::Missing;
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(!plan.is_authorized());
+        assert!(plan
+            .blocking_outcome()
+            .unwrap()
+            .to_string()
+            .contains("requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first"));
+        let mut executor = RecordingExecutor::default();
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(executor.applied.is_empty());
+    }
+
+    #[test]
     fn setup_refuses_a_module_below_its_floor_and_dry_run_matches_apply() {
         let observed = installed_core_setup(Some("0.17.19"));
         let request = SetupRequest::install(vec![Component::Aft]);
@@ -779,7 +855,7 @@ mod tests {
         let execution_plan = plan_setup(&observed, &request);
 
         assert_eq!(preview_plan, execution_plan);
-        assert!(preview_plan.is_authorized());
+        assert!(!preview_plan.is_authorized());
         assert!(!preview_plan.operations.iter().any(|operation| matches!(
             operation,
             SetupOperation::InstallComponent {
@@ -1844,5 +1920,84 @@ mod tests {
         assert!(rendered.contains(
             "outcome: ck-subc-mcp: module is not supervised on this host; restart omitted, verified by binary version only"
         ));
+    }
+
+    fn nats_install(
+        listener: super::super::bus_monitoring::ListenerState,
+        health: super::super::bus_monitoring::HealthState,
+    ) -> BusMonitoring {
+        BusMonitoring::Observed(super::super::bus_monitoring::BusObserved {
+            target: super::super::bus_monitoring::BusTarget {
+                ckbus: std::path::PathBuf::from("/bin/ck-bus"),
+                nats_dir: std::path::PathBuf::from("/nats"),
+            },
+            listener,
+            health_url: "http://127.0.0.1:18222/healthz".to_string(),
+            health,
+        })
+    }
+
+    /// On an otherwise complete install, a nats-server without monitoring is the
+    /// only change, it comes after every rescan this run makes, and a run that
+    /// finds both pieces present plans no mutation at all.
+    #[test]
+    fn nats_server_monitoring_is_planned_after_rescans_and_only_when_missing() {
+        use super::super::bus_monitoring::{HealthState, ListenerState};
+        let mut observed = live_runtime_adding_claustrum();
+        observed.bus_monitoring = nats_install(ListenerState::WouldAdd, HealthState::Missing);
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        let position = |wanted: fn(&SetupOperation) -> bool| {
+            plan.operations
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("{}", plan.render()))
+        };
+        let monitor = position(|op| matches!(op, SetupOperation::MonitorNatsServer { .. }));
+        let last_rescan = plan
+            .operations
+            .iter()
+            .rposition(|op| {
+                matches!(
+                    op,
+                    SetupOperation::RescanComponent { .. } | SetupOperation::EnableComponent { .. }
+                )
+            })
+            .expect("claustrum is rescanned");
+        assert!(monitor > last_rescan, "{}", plan.render());
+        assert!(
+            monitor < position(|op| matches!(op, SetupOperation::Validate { .. })),
+            "{}",
+            plan.render()
+        );
+
+        let mut settled = observed_setup();
+        settled
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        settled.runtime = RuntimeState::Correct;
+        settled.bus_monitoring = nats_install(ListenerState::WouldAdd, HealthState::Kept);
+        let request = SetupRequest::install(Vec::new());
+        assert_eq!(plan_setup(&settled, &request).mutation_count(), 1);
+        for (listener, health) in [
+            (ListenerState::Present, HealthState::Matching),
+            (ListenerState::Kept, HealthState::Kept),
+        ] {
+            settled.bus_monitoring = nats_install(listener, health);
+            let plan = plan_setup(&settled, &request);
+            assert_eq!(plan.mutation_count(), 0, "{}", plan.render());
+        }
+        settled.bus_monitoring = BusMonitoring::Skipped {
+            reason: "no -c".to_string(),
+        };
+        let plan = plan_setup(&settled, &request);
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(
+            plan.render().contains("skipped: no -c"),
+            "{}",
+            plan.render()
+        );
     }
 }

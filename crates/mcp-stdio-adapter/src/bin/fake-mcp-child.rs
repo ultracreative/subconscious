@@ -7,20 +7,53 @@ use serde_json::{json, Value};
 
 fn main() {
     let mode = std::env::var("FIXTURE_MODE").unwrap_or_else(|_| "normal".to_string());
+    let generation = if mode == "early-exit-recovery" {
+        let path = std::env::var("FIXTURE_GENERATION_PATH").unwrap();
+        let generation = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            + 1;
+        std::fs::write(path, generation.to_string()).unwrap();
+        generation
+    } else {
+        0
+    };
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
 
+    #[cfg(unix)]
+    let mut grandchild = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if let Ok(path) = std::env::var("FIXTURE_EVENTS_PATH") {
+            let mut events = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(events, "{request}").unwrap();
+        }
         let method = request.get("method").and_then(Value::as_str);
+        if method.is_none() {
+            continue;
+        }
         if method == Some("notifications/initialized") {
             continue;
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         if method == Some("initialize") {
+            if mode == "initialize-error" {
+                write_frame(
+                    &mut stdout,
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"invalid"}}),
+                );
+                continue;
+            }
             write_frame(
                 &mut stdout,
                 json!({"jsonrpc":"2.0","id":id,"result":{"capabilities":{}}}),
@@ -33,6 +66,20 @@ fn main() {
             // and keeps its pipes open.
             continue;
         }
+        if mode == "early-exit" {
+            return;
+        }
+        if mode == "early-exit-recovery" {
+            if generation == 3 {
+                // Keep this replacement alive past the production ten-second
+                // early-exit window, then close without answering the call.
+                std::thread::sleep(std::time::Duration::from_millis(10_100));
+            }
+            return;
+        }
+        if mode == "slow" {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         if mode == "oversized" {
             write_frame(
                 &mut stdout,
@@ -41,8 +88,43 @@ fn main() {
             continue;
         }
 
+        if mode == "same-id-ping" {
+            write_frame(
+                &mut stdout,
+                json!({"jsonrpc":"2.0","id":id,"method":"ping"}),
+            );
+        }
+
         let environment: BTreeMap<_, _> = std::env::vars().collect();
+        #[cfg(unix)]
+        if mode == "tree" && grandchild.is_none() {
+            let mut helper = std::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            io::BufReader::new(helper.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            write_frame(
+                &mut stdout,
+                json!({"jsonrpc":"2.0","id":id,"result":{"grandchild_pid":helper.id()}}),
+            );
+            grandchild = Some(helper);
+            continue;
+        }
         let result = match method {
+            Some("tools/list") if mode == "paginated" => {
+                if request.pointer("/params/cursor").and_then(Value::as_str) == Some("p2") {
+                    json!({"tools": [{"name": "second"}]})
+                } else {
+                    json!({"tools": [{"name": "first"}], "nextCursor": "p2"})
+                }
+            }
             Some("tools/list") => json!({"tools": [{"name": "fixture"}]}),
             Some("tools/call") => json!({
                 "echo": request.get("params").cloned().unwrap_or(Value::Null),
@@ -55,6 +137,10 @@ fn main() {
             &mut stdout,
             json!({"jsonrpc":"2.0","id":id,"result":result}),
         );
+    }
+    #[cfg(unix)]
+    if let Some(mut helper) = grandchild {
+        let _ = helper.wait();
     }
 }
 

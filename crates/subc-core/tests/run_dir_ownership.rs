@@ -21,7 +21,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_test_support::TestTempDir;
+use subc_test_support::{process_alive, wait_until_gone, TestTempDir};
 
 // Real daemons compete with other integration binaries for spawn and
 // registration resources; serializing this file keeps the deadlines honest.
@@ -230,11 +230,6 @@ impl Drop for Tree {
     }
 }
 
-fn process_alive(pid: i32) -> bool {
-    // Signal 0 checks existence without delivering anything.
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
-}
-
 fn lock_path(run_dir: &Path) -> PathBuf {
     run_dir.join("daemon.lock")
 }
@@ -338,8 +333,12 @@ fn a_killed_daemons_lock_does_not_block_the_next_daemon_and_its_orphan_is_swept(
     let c = tree.spawn_daemon("runtime");
     let replacement = tree.wait_module_ready(c);
     assert_ne!(replacement, orphan, "the module was spawned again");
+    // The sweep spawns the replacement once the orphan has exited (it no longer
+    // matches the pid, start time and executable the previous daemon recorded).
+    // Reaping the exited orphan is left to whichever process adopted it, so
+    // allow it a moment to disappear.
     assert!(
-        !process_alive(orphan),
+        wait_until_gone(orphan, Duration::from_secs(5)),
         "the next daemon must end the previous daemon's orphan"
     );
     assert_eq!(

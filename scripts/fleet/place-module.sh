@@ -100,7 +100,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; INSTALL=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; INSTALL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -120,6 +120,11 @@ while (($# > 0)); do
     # incident. It is an explicit flag, never a default, and the output says what
     # it reopens.
     --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
+    # An unstripped build carries its debug map, which names every source path and
+    # symbol of the build machine and makes the binary several times larger. Cards
+    # are built stripped; this lets an incident placement of an unstripped build
+    # through on purpose.
+    --allow-unstripped) ALLOW_UNSTRIPPED=1; shift ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -331,14 +336,29 @@ say "staged sidecar $sidecar: OK"
 # artifact. CUR is the destination binary's name without its "ck-" prefix, so
 # for the usual single-binary module it equals --module and nothing changes.
 CUR=$(basename "$DEST"); CUR=${CUR#ck-}
+# Every plausible spelling is read, not just the first one found, because two
+# of them can exist at once (the owner writes ck-<name>.current while an older
+# <name>.current lingers). Reading only the first let a stale declaration decide
+# which stage is live. If two declarations name different stages or revisions,
+# the owner's statement is ambiguous and the gate refuses until it is resolved.
 root_manifest=""
 for cand in "$(dirname "$staged_dir")/$CUR.current" \
             "$staged_dir/$CUR.current" \
             "$(dirname "$staged_dir")/ck-$CUR.current" \
             "$staged_dir/ck-$CUR.current"; do
-  if [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null; then
+  [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null || continue
+  if [ -z "$root_manifest" ]; then
     root_manifest="$cand"
-    break
+    continue
+  fi
+  first_decl="$(awk -F= '$1=="stage"||$1=="revision"{print $2}' "$root_manifest")"
+  this_decl="$(awk -F= '$1=="stage"||$1=="revision"{print $2}' "$cand")"
+  if [ "$first_decl" != "$this_decl" ]; then
+    echo "REFUSED: two currency declarations for $CUR disagree" >&2
+    echo "         $root_manifest: $(echo $first_decl)" >&2
+    echo "         $cand: $(echo $this_decl)" >&2
+    echo "         Remove the stale one (record its content first), then retry." >&2
+    exit 2
   fi
 done
 manifest="$staged_dir/ck-$CUR.current"
@@ -491,6 +511,21 @@ posture_for_linker_signed() {
   bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //; s/Identifier=[^ ]+ //')
   if [ -n "$f" ]; then printf '%sflags-sans-runtime-linker=0x%x ' "$bare" $(( f & ~0x30000 )); else printf '%s' "$bare"; fi
 }
+# Debug-map entries (`nm -a` type "-") are what `strip` removes; a release card
+# has none. The one exception is the linker's `OPT radr://5614542` marker, which
+# `strip` deliberately keeps and which carries no debug information. The count is
+# read to a variable rather than branched on through a pipeline, so the check
+# cannot invert under pipefail.
+if command -v nm >/dev/null; then
+  debug_entries=$(nm -a "$STAGED" 2>/dev/null | awk '$2 == "-" && $5 != "OPT"' | wc -l | tr -d ' ')
+  if [ "${debug_entries:-0}" -gt 0 ] && [ "$ALLOW_UNSTRIPPED" -eq 1 ]; then
+    say "debug map: $debug_entries entries, placed unstripped by request (--allow-unstripped)"
+  elif [ "${debug_entries:-0}" -gt 0 ]; then
+    refuse "staged binary is not stripped: $debug_entries debug-map entries (nm -a type '-'). Build the card stripped, or pass --allow-unstripped to place it on purpose"
+  else
+    say "debug map: 0 entries (stripped)"
+  fi
+fi
 if [ "$INSTALL" -eq 1 ] && command -v codesign >/dev/null; then
   # No running binary to match, so the posture is checked against fleet rules.
   staged_sig=$(signing_posture "$STAGED")
@@ -536,13 +571,36 @@ elif command -v codesign >/dev/null; then
     staged_sig_cmp=$(printf '%s' "$staged_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
     live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
   fi
-  [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
+  # The one signer change a placement may make: ad-hoc to the daemon's own team,
+  # under the same identifier. An ad-hoc running image's designated requirement is
+  # its cdhash, so no privacy grant is bound to it and none can be lost; a
+  # team-signed image keeps grants across rebuilds, which is why a module that
+  # needs one moves to the team. The reverse, and any other team, is refused.
+  team_upgrade=0
+  if [ "$(codesign -dvv "$DEST" 2>&1 | grep -c '^Signature=adhoc')" -gt 0 ] \
+    && [ "$(codesign -dvv "$STAGED" 2>&1 | grep -c '^Signature=adhoc')" -eq 0 ]; then
+    staged_team=$(codesign -dvv "$STAGED" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+    daemon_team=$(codesign -dvv "$BIN_DIR/ck-subc" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+    staged_ident=$(codesign -dvv "$STAGED" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+    live_ident=$(codesign -dvv "$DEST" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+    [ -n "$daemon_team" ] && [ "$daemon_team" != "not set" ] && [ "$staged_team" = "$daemon_team" ] \
+      || refuse "staged binary moves from ad-hoc to team [$staged_team], but only the daemon's own team [$daemon_team] is accepted"
+    if [ "$staged_ident" != "$live_ident" ] && ! { is_linker_signed "$DEST" || has_linker_identifier "$DEST"; }; then
+      refuse "staged binary moves to the team under identifier [$staged_ident], but the running identifier is [$live_ident]; keep the identifier"
+    fi
+    has_runtime "$STAGED" || refuse "a move to the team must keep hardened runtime"
+    team_upgrade=1
+    say "signing posture: $staged_sig(ad-hoc to the daemon's team $daemon_team; no grant was bound to the ad-hoc image)"
+  fi
+  [ "$team_upgrade" -eq 1 ] || [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
   if has_runtime "$DEST" && ! has_runtime "$STAGED" && [ "$ALLOW_UNHARDENED" -eq 1 ]; then
     say "hardened runtime: REMOVED BY REQUEST (--allow-unhardened): after this placement any same-user process can attach to this module and read its launch nonce, until a hardened build is placed again"
   elif has_runtime "$DEST" && ! has_runtime "$STAGED"; then
     refuse "hardened runtime would be REMOVED (pass --allow-unhardened to roll back to a pre-hardening build on purpose): the running binary has it and the staged one does not, which lets any same-user process attach and read the module's launch nonce (staged [$staged_sig] vs running [$live_sig])"
   fi
-  if has_runtime "$STAGED" && ! has_runtime "$DEST"; then
+  if [ "$team_upgrade" -eq 1 ]; then
+    :
+  elif has_runtime "$STAGED" && ! has_runtime "$DEST"; then
     say "signing posture: $staged_sig(matches running except hardened runtime, which this placement ADDS)"
   else
     say "signing posture: $staged_sig(matches running)"
@@ -865,6 +923,12 @@ if [ -n "$MIGRATES" ]; then
   # no -wal, mode=ro error 14. The concern the no-fallback guard was written for
   # (dropping a WAL) cannot arise when there is no WAL to drop.
   # (CKCRED + CEREB, 2026-09-19.)
+  # A store snapshot holds the module's whole database (vendor payloads,
+  # transcripts, audit rows), so it is created owner-only. sqlite3 creates the
+  # file under the process umask, which is usually 022 and would leave a copy of
+  # a 0600 store readable by every account that can enter the staging dir.
+  : > "$store_rb" && chmod 600 "$store_rb" \
+    || refuse "could not create $store_rb owner-only; nothing has been placed"
   if [ -f "$MIGRATES-wal" ] || [ -f "$MIGRATES-journal" ]; then
     say "store has a recovery sidecar; reading mode=ro (no immutable fallback)"
     sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
@@ -881,6 +945,8 @@ if [ -n "$MIGRATES" ]; then
         so the file is damaged or is not a SQLite database."
   fi
   [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
+  [ "$(stat -f %Lp "$store_rb" 2>/dev/null || stat -c %a "$store_rb")" = 600 ] \
+    || refuse "store snapshot $store_rb is not owner-only (0600); nothing has been placed"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
   say "ROLLBACK IS BINARY + STORE: this card migrates, so restoring the binary alone would meet a newer schema and refuse"

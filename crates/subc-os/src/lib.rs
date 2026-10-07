@@ -41,7 +41,10 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(all(unix, feature = "test-support"))]
+pub mod fork_exec_test;
 pub mod launch_nonce;
+pub mod privacy_identity;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{
@@ -438,14 +441,20 @@ mod tests {
 
     #[test]
     fn own_resource_usage_is_present_and_plausible() {
+        // Clean executable pages need not count toward physical footprint, and
+        // nextest runs this case in a fresh process with little private memory.
+        // Touch and retain private pages so the byte/unit check has a known
+        // lower bound instead of assuming a minimum footprint for the binary.
+        let pages = vec![0xa5u8; 8 * 1024 * 1024];
+        std::hint::black_box(&pages);
         let usage = resource_usage(std::process::id()).expect("own process is readable");
-        // A running test binary maps well over a megabyte; zero or a handful
-        // of bytes would mean the wrong field or unit was read.
         assert!(
-            usage.memory_bytes > 1024 * 1024,
-            "memory {} bytes is implausibly small",
-            usage.memory_bytes
+            usage.memory_bytes >= pages.len() as u64,
+            "memory {} bytes cannot account for {} touched private bytes",
+            usage.memory_bytes,
+            pages.len()
         );
+        std::hint::black_box(&pages);
         assert!(
             usage.memory_bytes < 64 * 1024 * 1024 * 1024,
             "memory {} bytes is implausibly large",

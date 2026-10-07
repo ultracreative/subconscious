@@ -434,8 +434,12 @@ async fn route_open_refusal_keeps_the_daemons_code_and_detail() {
             tool_target("refusal-held"),
             identity.clone(),
             br#"{"kind":"unary","value":"held"}"#.to_vec(),
+            // The deadline has to outlast at least one route.open round trip,
+            // or no refusal arrives to be kept: at 600 ms a loaded Windows
+            // runner timed out the first request itself. Every retry is refused
+            // module_warming, so a longer deadline still ends on that refusal.
             CallOptions {
-                route_retry_deadline: Duration::from_millis(600),
+                route_retry_deadline: Duration::from_secs(3),
                 ..fast_call_options()
             },
         )
@@ -1966,9 +1970,18 @@ fn spawn_provider(
     module_id: &str,
     events_path: &Path,
 ) -> ProviderProcess {
+    let runtime_dir = connection_file
+        .parent()
+        .expect("connection file is inside the test runtime directory");
+    let temp_dir = runtime_dir
+        .parent()
+        .expect("runtime directory is inside the test temp tree");
     let child = Command::new(module_bin)
         .arg("--subc")
         .arg(connection_file)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", temp_dir.join("config"))
+        .env("XDG_DATA_HOME", temp_dir.join("data"))
         .env(subc_protocol::SUBC_MODULE_ID_ENV, module_id)
         .env("SUBC_MODULE_ECHO_EVENTS", events_path)
         .stdin(Stdio::null())
@@ -3543,8 +3556,11 @@ async fn a_scoped_open_before_the_owners_first_sync_retries_until_the_owner_sync
 
     // Control: with a short retry budget the open runs out on scope_not_synced,
     // so the daemon really is refusing with it while the owner has not synced.
+    // Only the retry budget is short. The call itself gets a long deadline, so
+    // a slow first round trip on a loaded runner still returns the daemon's
+    // refusal instead of timing out before any answer arrives.
     let short = CallOptions {
-        timeout: Duration::from_secs(2),
+        timeout: Duration::from_secs(10),
         route_retry_deadline: Duration::from_millis(300),
         ..harness.carrier_options()
     };

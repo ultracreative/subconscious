@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.26.1
+
+- A control request the module cannot decode, such as a `route.bind` whose scope stamp carries an attribute this SDK does not know, is refused with `invalid_request` on its own correlation id, and the module keeps serving. Before, the decode error ended the module's serve loop, so one such bind stopped the whole module and every repeat after its restart stopped it again.
+
+## 0.26.0
+
+- Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Move direct protocol dependencies together with the SDK.
+
+## 0.25.3
+
+- A caller waiting behind another caller's `route.open` for the same route keeps waiting across a reconnect instead of failing at once, so a reconnect never starts a second, competing open; a `close_route` issued during the lead caller's retry backoff still wins, and the discarded route gets GOODBYE.
+- `poll_route` returns a daemon refusal as `CallError::Module` with the daemon's code, message and detail, instead of a generic send failure.
+- `catalog_list` and `spawn_snapshot` pace their transport retries with the consumer's reconnect backoff, still bounded by the call deadline, so a connection file that fails immediately cannot spin the executor; closing the consumer cancels the wait.
+
+## 0.25.2 — 2026-10-02
+
+- Every module using the SDK's serve helper now answers `health.check` independently of data-request slots, even under request saturation. When all 64 slots are in use and the oldest queued request has waited more than two seconds, the helper reports at least `Degraded` and puts the slot count and wait age at the start of the detail. A module's own `Degraded` or `Failing` status is kept, its own detail follows the saturation note, and its metrics are unchanged. With free slots, its report passes through unchanged.
+
 ## 0.25.1 — 2026-10-02
 
 - Add non-exhaustive `OutcomeUnknownCause` and `CallError::outcome_cause()` through typed error sources. Reply deadlines, writer failures, consumer closure, connection loss, route ends, and internal completion failures can be distinguished without matching `OutcomeUnknown` error message text. Existing error variants, message text, retry classes, and route-end reasons are preserved.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.29.1
+
+- Add `scope::FLOW_SCOPES_CAPABILITY` (`flow-scopes/v1`). A module that declares it in `capabilities.provides` promises to recognise a scope carrying `flow_id` and to apply flow behaviour, never owner-agent behaviour. Add the terminal route-open code `target_flow_unsupported`; the shared retry predicate and the golden decision table classify it as terminal. Additive: no existing type changes.
+
+## 0.29.0
+
+- Breaking for Rust struct literals: `ToolCallRequest` gains optional `preset`, and `ScopeAttributes` gains optional `flow_id`. Both are omitted when absent, leaving existing absent-field wire bytes unchanged; `ScopeAttributes` still refuses unknown fields.
+- `validate_preset` checks 1–64 characters of `[a-z0-9_-]` and names `preset` for a provider's `invalid_request` reply. When a call carries no preset, the provider must apply a policy it chose explicitly; it must not fall back to its most permissive preset (the one offering the most tools). A preset the provider does not serve is refused, with the preset named in the refusal, never replaced by another.
+- `flow_id` identifies the scope's flow, needs no agent or delegation, and is set only by an authority owner and stamped verbatim. `validate_flow_id` shares the 1–256 printable non-space ASCII token rule with call keys and schema pins. Same-epoch changes bump the content version and drain scoped routes with `scope_delegation_changed`, like `agent_id` changes.
+
+## 0.28.1
+
+- Refuse unknown fields inside scope principals, including parent owners, child owners, carriers, and selectors, as required for authority-bearing scope input. Principal decoding outside scopes remains forward-compatible.
+
 ## 0.28.0 — 2026-10-01
 
 - Breaking: `ToolCallRequest` gains `origin: Option<CallOrigin>`, so a struct literal must now set it (`ToolCallRequest::new` sets `None`). The member is omitted on the wire when `None` and decodes as `None` when absent, so bodies without it are unchanged in both directions.

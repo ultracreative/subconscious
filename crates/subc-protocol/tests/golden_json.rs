@@ -65,6 +65,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         },
     );
@@ -77,12 +78,39 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: Some(serde_json::json!("pt-7")),
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         },
     );
     // A call relayed for another caller: the relay's own key, and the caller
     // behind it with the carrier as a tagged principal object.
     assert_golden("tool_call_request_with_origin", &relayed_tool_call(true));
+    assert_golden(
+        "tool_call_request_with_preset",
+        &subc_protocol::tool_call::ToolCallRequest {
+            preset: Some("read_only-2".to_string()),
+            ..subc_protocol::tool_call::ToolCallRequest::new(
+                "grep",
+                serde_json::json!({ "pattern": "needle" }),
+            )
+        },
+    );
+    let mut flow_bind = module_control_request_with_scope();
+    if let ModuleControlRequest::RouteBind {
+        scope: Some(stamp), ..
+    } = &mut flow_bind
+    {
+        stamp.attributes.flow_id = Some("flow:run-7/step-2".to_string());
+    } else {
+        panic!("expected a scoped bind");
+    }
+    assert_golden("module_control_request_route_bind_with_flow_id", &flow_bind);
+    let mut flow_record = scope_head_record();
+    flow_record.attributes = ScopeAttributes {
+        flow_id: Some("flow:run-7/step-2".to_string()),
+        ..ScopeAttributes::default()
+    };
+    assert_golden("scope_record_with_flow_id_without_agent", &flow_record);
     // The same call with no origin: the member must be absent, not null.
     assert_golden(
         "tool_call_request_without_origin",
@@ -270,6 +298,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
                 attributes: ScopeAttributes {
                     agent_id: Some("agent-7".to_string()),
                     delegates: true,
+                    flow_id: None,
                 },
                 owner_authorized: true,
             }),
@@ -345,6 +374,7 @@ fn scope_head_record() -> ScopeRecord {
         attributes: ScopeAttributes {
             agent_id: Some("agent-7".to_string()),
             delegates: true,
+            flow_id: None,
         },
     }
 }
@@ -385,6 +415,24 @@ fn scope_records_refuse_unknown_fields_at_every_level() {
             Box::new(|v: &mut Value| v["carriers"][0]["scope"] = "x".into()),
         ),
         (
+            "carrier principal",
+            Box::new(|v: &mut Value| {
+                v["carriers"][0]["principal"]["targets"] = serde_json::json!(["only-this"])
+            }),
+        ),
+        (
+            "child owner",
+            Box::new(|v: &mut Value| v["child_owners"][0]["extra"] = true.into()),
+        ),
+        (
+            "parent owner",
+            Box::new(|v: &mut Value| {
+                v["parent"] = serde_json::json!({
+                    "owner": {"kind": "direct", "extra": true}, "ref": "p", "scope_epoch": 1
+                })
+            }),
+        ),
+        (
             "parent",
             Box::new(|v: &mut Value| {
                 v["parent"] = serde_json::json!({
@@ -407,6 +455,40 @@ fn scope_records_refuse_unknown_fields_at_every_level() {
     assert_eq!(
         serde_json::from_value::<ScopeRecord>(base).unwrap(),
         scope_head_record()
+    );
+}
+
+#[test]
+fn scope_selector_refuses_unknown_principal_fields() {
+    for kind in ["reserved", "direct", "unverified"] {
+        let mut owner = serde_json::json!({"kind": kind});
+        if kind == "reserved" {
+            owner["module_id"] = "aft".into();
+        }
+        let mut selector = serde_json::json!({"owner": owner, "ref": "head", "scope_epoch": 1});
+        assert!(
+            serde_json::from_value::<subc_protocol::scope::ScopeSelector>(selector.clone()).is_ok()
+        );
+        selector["owner"]["extra"] = true.into();
+        let error =
+            serde_json::from_value::<subc_protocol::scope::ScopeSelector>(selector).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{kind}: {error}"
+        );
+    }
+}
+
+#[test]
+fn principal_outside_scope_records_remains_forward_compatible() {
+    assert_eq!(
+        serde_json::from_value::<Principal>(serde_json::json!({
+            "kind": "reserved", "module_id": "aft", "future_fact": true
+        }))
+        .unwrap(),
+        Principal::Reserved {
+            module_id: "aft".into()
+        }
     );
 }
 
@@ -759,6 +841,13 @@ fn route_open_retry_predicate_matches_the_decision_table() {
 }
 
 #[test]
+fn target_flow_unsupported_is_terminal_in_the_shared_retry_predicate() {
+    assert!(!error_codes::is_retryable_route_open(
+        "target_flow_unsupported"
+    ));
+}
+
+#[test]
 fn established_route_dead_predicate_matches_the_decision_table() {
     let table: Value =
         serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();
@@ -896,6 +985,7 @@ fn relayed_tool_call(with_origin: bool) -> subc_protocol::tool_call::ToolCallReq
         progress_token: None,
         call_key: Some("pf:relay/991".to_string()),
         schema_pin: None,
+        preset: None,
         origin: with_origin.then(|| {
             subc_protocol::tool_call::CallOrigin::new(
                 Principal::Reserved {
@@ -1054,6 +1144,7 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
             attributes: ScopeAttributes {
                 agent_id: Some("agent-7".to_string()),
                 delegates: true,
+                flow_id: None,
             },
             owner_authorized: true,
         }),

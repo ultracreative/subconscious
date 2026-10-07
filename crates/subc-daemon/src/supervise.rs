@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt, io,
     path::PathBuf,
@@ -110,10 +110,193 @@ const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
 /// client resubscribes from the last cursor it did receive.
 pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
+#[cfg(target_os = "macos")]
+struct PrivacyExec {
+    reader: tokio::io::unix::AsyncFd<std::io::PipeReader>,
+    deadline: tokio::time::Instant,
+    expected: Option<subc_os::FileIdentity>,
+    trampoline: Option<subc_os::FileIdentity>,
+    script: bool,
+    module_id: String,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_privacy_trampoline() -> PathBuf {
+    // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
+    // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
+    let path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("privacy-trampoline-fixture");
+    // Without the fixture every macOS spawn is refused, and the tests that
+    // spawn fail later as a module in state Failed, which names the wrong
+    // cause. `cargo test -p subc-daemon --lib` alone does not build it.
+    assert!(
+        path.exists(),
+        "privacy-trampoline-fixture not built at {}: run `cargo build -p subc-daemon \
+         --bins --features test-support` or `cargo test -p subc-daemon` first",
+        path.display()
+    );
+    path
+}
+
+#[cfg(target_os = "macos")]
+fn probe_privacy_trampoline(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut probe = std::process::Command::new(path)
+        .args(["__disclaim-exec", "--probe"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "privacy trampoline probe failed for {}: {error}",
+                path.display()
+            )
+        })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            result => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return Err(format!(
+                    "privacy trampoline probe failed or timed out for {}: {result:?}",
+                    path.display()
+                ));
+            }
+        }
+    };
+    let mut answer = String::new();
+    if let Some(stdout) = probe.stdout.take() {
+        let _ = stdout.take(256).read_to_string(&mut answer);
+    }
+    if status.success() && answer.trim() == subc_os::privacy_identity::TRAMPOLINE_PROBE {
+        return Ok(());
+    }
+    let mut diagnostic = String::new();
+    if let Some(stderr) = probe.stderr.take() {
+        let _ = stderr.take(1024).read_to_string(&mut diagnostic);
+    }
+    let cause = diagnostic
+        .trim()
+        .strip_prefix("ck-subc: own privacy identity refused: ")
+        .unwrap_or("binary does not implement the privacy trampoline protocol");
+    Err(format!(
+        "{cause}: probe of {} exited {status}",
+        path.display()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn privacy_command(
+    spec: &ModuleSpec,
+    roster: &ChildRoster,
+) -> Result<
+    (
+        Command,
+        Option<PrivacyExec>,
+        subc_os::privacy_identity::ExecAcknowledgement,
+    ),
+    SuperviseError,
+> {
+    let failure = |cause: String| {
+        warn!(module_id = %spec.module_id, %cause, "privacy identity trampoline refused module spawn");
+        SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source: io::Error::other(cause),
+            cgroup_path: None,
+        }
+    };
+    let trampoline = roster.privacy_trampoline().map_err(failure)?;
+    // Resolve PATH with the same environment the Command will receive. For
+    // scripts retain the existing orphan-identity rule: the kernel chooses
+    // the interpreter, and its observed image is the one recorded. Do not
+    // duplicate the kernel's shebang/PATH interpreter resolution in Rust.
+    let program = if spec.program.components().count() == 1 && !spec.program.is_absolute() {
+        let path = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_else(|| "/usr/bin:/bin".into());
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&spec.program))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| spec.program.clone())
+    } else {
+        spec.program.clone()
+    };
+    let expected = subc_os::file_identity(&program);
+    let trampoline_image = subc_os::file_identity(&trampoline);
+    let script = {
+        use std::io::Read;
+        let mut prefix = [0u8; 2];
+        std::fs::File::open(&program)
+            .is_ok_and(|mut file| file.read_exact(&mut prefix).is_ok() && &prefix == b"#!")
+    };
+    if expected.is_none() || expected == subc_os::file_identity(&trampoline) {
+        return Err(failure(
+            "privacy identity module executable is missing or is the trampoline itself".to_string(),
+        ));
+    }
+    let (reader, ack) = subc_os::privacy_identity::ExecAcknowledgement::pipe()
+        .map_err(|error| failure(error.to_string()))?;
+    let reader =
+        tokio::io::unix::AsyncFd::new(reader).map_err(|error| failure(error.to_string()))?;
+    let mut command = Command::new(&trampoline);
+    command
+        .arg("__disclaim-exec")
+        .arg(ack.fd().to_string())
+        .arg(&program);
+    ack.install(command.as_std_mut());
+    Ok((
+        command,
+        Some(PrivacyExec {
+            reader,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            expected,
+            trampoline: trampoline_image,
+            script,
+            module_id: spec.module_id.clone(),
+        }),
+        ack,
+    ))
+}
+
 struct SupervisedChild {
     child: Child,
-    /// The name of this process's cgroup: the module id, or for a swap
-    /// candidate the alternate name (see `swap::cgroup_name`).
+    #[cfg(target_os = "macos")]
+    privacy_exec: Option<PrivacyExec>,
+    /// Set once this launch's exec acknowledgement confirms the module image.
+    /// On macOS the pid first runs the `ck-subc` launch trampoline (see
+    /// `subc_os::privacy_identity`), which then replaces itself with the
+    /// module. The supervisor owns and can kill that pid from spawn, but
+    /// status readers report it only after this latch is set, so nothing
+    /// reports the trampoline's image as the module's.
+    #[cfg(target_os = "macos")]
+    report_ready: Arc<OnceLock<()>>,
+    /// Refusal before the module image was accepted, retained for terminal records.
+    spawn_failure: Option<String>,
+    /// The protocol this process was launched with. A reload can store a new
+    /// launch spec with a different protocol, but that takes effect only at the
+    /// next spawn, so this process keeps being handled by the protocol it
+    /// actually speaks.
+    protocol: ModuleProtocol,
+    /// This process's cgroup name: a bounded module/slot label followed by a
+    /// spawn suffix unique to this process (when cgroup placement is on). A
+    /// retired process in a slot may still be draining when a later one is
+    /// spawned into that slot, so the suffix keeps the later process out of
+    /// the retired one's cgroup, which is the domain a kill applies to.
     #[cfg(target_os = "linux")]
     module_id: String,
     #[cfg(target_os = "linux")]
@@ -165,6 +348,8 @@ impl SupervisedChild {
     }
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "macos")]
+        self.confirm_privacy_exec().await;
         // The roster entry is NOT released here. A daemon shutdown waits for the
         // roster to empty and then exits the process, so releasing at the reap
         // let it exit before the exit handler wrote this child's terminal record
@@ -175,11 +360,118 @@ impl SupervisedChild {
         let result = self.child.wait().await;
         #[cfg(target_os = "linux")]
         if result.is_ok() {
-            if let Some(placement) = self.cgroup_placement.take() {
-                remove_module_cgroup(&placement, &self.module_id);
+            if let Some(placement) = self.cgroup_placement.as_ref() {
+                cleanup_reaped_cgroup(placement, &self.module_id).await;
+                // Keep ownership while awaiting kernel population changes: a
+                // drain timeout may cancel this wait and then escalate/reap.
+                self.cgroup_placement = None;
             }
         }
         result
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn confirm_privacy_exec(&mut self) {
+        let Some(pending) = &mut self.privacy_exec else {
+            return;
+        };
+        let result = tokio::time::timeout_at(pending.deadline, async {
+            let mut record = Vec::new();
+            loop {
+                let mut ready = pending.reader.readable().await?;
+                let read = ready.try_io(|reader| {
+                    use std::io::Read;
+                    let mut reader = reader.get_ref();
+                    let mut buffer = [0u8; 256];
+                    reader.read(&mut buffer).map(|count| (count, buffer))
+                });
+                match read {
+                    Ok(Ok((0, _))) => return Ok::<_, io::Error>(record),
+                    Ok(Ok((count, buffer))) => {
+                        if record.len() + count > 1024 {
+                            return Err(io::Error::other(
+                                "privacy exec refusal record is too long",
+                            ));
+                        }
+                        record.extend_from_slice(&buffer[..count]);
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await;
+        // Keep the reader in self across await: select cancellation must not
+        // discard the handshake or reset its original five-second deadline.
+        let pending = self.privacy_exec.as_ref().expect("pending exec");
+        let cause = match result {
+            Err(_) => Some("privacy identity trampoline did not exec within 5s".to_string()),
+            Ok(Err(error)) => Some(format!(
+                "privacy identity exec acknowledgement failed: {error}"
+            )),
+            Ok(Ok(record)) if !record.is_empty() => Some(
+                std::str::from_utf8(&record)
+                    .ok()
+                    .and_then(|record| {
+                        record
+                            .trim()
+                            .strip_prefix(subc_os::privacy_identity::EXEC_REFUSAL_TAG)
+                    })
+                    .filter(|cause| !cause.is_empty())
+                    .unwrap_or("invalid privacy exec refusal record")
+                    .to_string(),
+            ),
+            Ok(Ok(_)) => match self.child.try_wait() {
+                // Empty EOF is the exec acknowledgement. A real module may exit
+                // immediately, including with a reserved trampoline status; no
+                // image is admitted, and its ordinary exit contract stays intact.
+                Ok(Some(_status)) => None,
+                Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                Ok(None) => {
+                    let image = observe_spawned_image(self.pid);
+                    if let Some(image) = image.filter(|image| {
+                        image.executable.is_some()
+                            && image.executable != pending.trampoline
+                            && (image.executable == pending.expected || pending.script)
+                    }) {
+                        if let Some(guard) = &self.roster_guard {
+                            guard.confirm_executable(image);
+                        }
+                        let _ = self.report_ready.set(());
+                        info!(module_id = %pending.module_id, pid = self.pid,
+                            "module spawned with own privacy identity (responsibility disclaimed)");
+                        None
+                    } else if image.is_none()
+                        || image.is_some_and(|image| image.executable.is_none())
+                    {
+                        // A process can exit between try_wait and the kernel
+                        // image read. Empty EOF already acknowledged exec, so
+                        // preserve that module's ordinary exit rather than
+                        // mislabel a disappearing image as trampoline refusal.
+                        // Keep pending in self across await so cancellation does
+                        // not discard validation or reset its original deadline.
+                        match tokio::time::timeout_at(pending.deadline, self.child.wait()).await {
+                            Ok(Ok(_status)) => None,
+                            Ok(Err(error)) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                            Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
+                        }
+                    } else {
+                        Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
+                    }
+                }
+            },
+        };
+        let pending = self.privacy_exec.take().expect("pending exec");
+        if let Some(cause) = cause {
+            warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
+            self.spawn_failure = Some(cause);
+            // No image is admitted on failure. Reach the entire fresh process
+            // group, including a module which spawned a helper before refusal.
+            if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = self.child.start_kill();
+        }
     }
 
     /// Releases this child's daemon-shutdown roster entry once its exit has
@@ -275,7 +567,7 @@ async fn settle_stderr_pump(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let mut ring = lock();
-            ring.mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
+            ring.mark_incomplete_from(generation, format!("stderr pump ended unexpectedly: {err}"));
             ring.finish_pump(generation);
             warn!(module_id, error = %err, "stderr pump ended before clean EOF");
         }
@@ -332,8 +624,8 @@ pub struct ModuleSpec {
     pub reserved_prefixes: Vec<String>,
     /// The wire protocol this module speaks, as DECLARED in daemon config.
     ///
-    /// [`ModuleProtocol::None`] changes five things and nothing else: health
-    /// probing is suppressed, teardown sends SIGTERM before waiting,
+    /// [`ModuleProtocol::None`] changes five things and nothing else: wire health
+    /// probing is suppressed (an optional HTTP probe can replace it), teardown sends SIGTERM before waiting,
     /// `route.open` is refused, the spawn passes NO `--subc <path>` argument
     /// and NO launch nonce, and a clean exit the daemon did not request is
     /// restarted as a crash rather than recorded as a stop (see `on_child_exit`:
@@ -550,8 +842,12 @@ impl fmt::Display for HealthAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthConfig {
+    /// Optional loopback HTTP endpoint for a managed non-wire process.
+    /// Changing it applies live on rescan; the process protocol changes only
+    /// at its next spawn.
+    pub http: Option<String>,
     pub cadence: Duration,
     pub deadline: Duration,
     pub failure_threshold: u32,
@@ -563,6 +859,7 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            http: None,
             cadence: DEFAULT_HEALTH_CADENCE,
             deadline: DEFAULT_HEALTH_DEADLINE,
             failure_threshold: DEFAULT_HEALTH_FAILURE_THRESHOLD,
@@ -699,6 +996,8 @@ pub struct ModuleStatus {
     pub registration_active: bool,
     /// The module's declared wire protocol, carried beside `live` because it is
     /// what makes `live` readable: the two fields answer one question together.
+    /// While a process is alive this is its launch declaration, not a later
+    /// pending-reload edit. When down it is the configured next launch protocol.
     pub protocol: ModuleProtocol,
     /// Whether the module is serving, under the strongest definition the daemon
     /// can assert for its protocol.
@@ -735,6 +1034,10 @@ pub struct ModuleStatus {
     pub drain_timeout: Duration,
     pub restart_backoff: Duration,
     pub restart_max_backoff: Duration,
+    /// The module's process. On macOS this stays absent while the `ck-subc`
+    /// launch trampoline is still running in that pid, and appears once the
+    /// exec acknowledgement confirms the module image has replaced it. Launch
+    /// time and the supervisor's own hold on the process are unaffected.
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
@@ -748,6 +1051,8 @@ struct SupervisorSnapshot {
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
+    spawned_protocol: Option<ModuleProtocol>,
+    spawn_failure: Option<String>,
     /// When each crash restart was spent, oldest first. This IS the crash
     /// budget: its in-window length is the count an operator sees and the count
     /// the restart decision is made against, so there is no second counter that
@@ -765,6 +1070,8 @@ struct SupervisorSnapshot {
     /// when a live PID is accepted below.
     spawn_generation: u64,
     pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    report_ready: Option<Arc<OnceLock<()>>>,
     /// Last reaped child, retained after current process facts are cleared.
     reaped_pid: Option<u32>,
     /// Whether the command-serving supervision loop has a scheduled respawn.
@@ -801,6 +1108,22 @@ struct SupervisorSnapshot {
 }
 
 impl SupervisorSnapshot {
+    /// The pid that status, provenance and resource readings may report. While
+    /// the launch trampoline still runs in the pid, reading its executable or
+    /// resource use would describe `ck-subc`, not the module, so none is
+    /// reported until the exec acknowledgement confirms the module image.
+    fn reported_pid(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        if self
+            .report_ready
+            .as_ref()
+            .is_some_and(|ready| ready.get().is_none())
+        {
+            return None;
+        }
+        self.pid
+    }
+
     fn starting() -> Self {
         Self::new(ModuleState::Starting, true)
     }
@@ -872,10 +1195,14 @@ impl SupervisorSnapshot {
             state,
             enabled,
             process_alive: false,
+            spawned_protocol: None,
+            spawn_failure: None,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
             pid: None,
+            #[cfg(target_os = "macos")]
+            report_ready: None,
             reaped_pid: None,
             respawn_pending: false,
             coalesced_restart_pending: false,
@@ -1441,6 +1768,18 @@ struct SupervisedConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
+    /// Module ids the supervisor has taken on. An id is added BEFORE the
+    /// module's first process is spawned and removed only when the module
+    /// leaves the roster (see [`Self::retire`]), so it is always a superset of
+    /// the keys of `modules`.
+    ///
+    /// `modules` cannot answer "is this module configured?" on its own: a
+    /// [`SupervisedModule`] only exists once its process has been spawned, and
+    /// a fast child can connect, register, sync its scopes and ask about them
+    /// before the supervisor has inserted it. Answering "not configured" in that
+    /// gap makes scope admission refuse with the terminal "will never sync"
+    /// instead of the retryable "has not synced yet".
+    configured_ids: Arc<Mutex<HashSet<String>>>,
     spawn_events: SpawnEventFeed,
     /// The current expected launch nonce for each reserved module_id. Set when the
     /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
@@ -1930,11 +2269,55 @@ impl SupervisorHandle {
     }
 
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
+        // Normally already marked before the process was spawned; marking here
+        // too keeps `configured_ids` a superset of the roster for any caller
+        // that inserts a module directly.
+        self.mark_configured(module.module_id());
         let mut modules = self
             .modules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         modules.insert(module.module_id().to_string(), module)
+    }
+
+    /// Record that the supervisor has taken on `module_id`. Called before the
+    /// module's first process is spawned, so that by the time that process can
+    /// register, [`Self::is_configured`] already answers true.
+    fn mark_configured(&self, module_id: &str) {
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string());
+    }
+
+    /// Undo [`Self::mark_configured`] for a module whose first spawn failed
+    /// before it was ever put on the roster. A module already on the roster
+    /// keeps its mark: only [`Self::retire`] takes a rostered module off.
+    fn unmark_configured_unless_rostered(&self, module_id: &str) {
+        let modules = self
+            .modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !modules.contains_key(module_id) {
+            self.configured_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(module_id);
+        }
+    }
+
+    /// Whether `module_id` is a module this daemon supervises: on the roster,
+    /// or about to be (its process is being spawned right now).
+    ///
+    /// This, not `get(..).is_some()`, is what "the owner is configured" means
+    /// for scopes: a supervised module's process can register and sync before
+    /// [`Self::get`] can return it, and in that window it is still a module
+    /// that will sync, not one that never will.
+    pub(crate) fn is_configured(&self, module_id: &str) -> bool {
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(module_id)
     }
 
     pub fn get(&self, module_id: &str) -> Option<SupervisedModule> {
@@ -1977,10 +2360,11 @@ impl SupervisorHandle {
         let Some(module) = self.get(module_id) else {
             return Ok(false);
         };
-        let status = module.status()?;
-        let Some((pid, start_time)) = status.pid.zip(status.process_start_time) else {
+        let snapshot = lock_snapshot(&module.inner.snapshot)?;
+        let Some((pid, start_time)) = snapshot.pid.zip(snapshot.process_start_time) else {
             return Ok(false);
         };
+        drop(snapshot);
         module.record_deliberate_severance(ProcessIdentity { pid, start_time })
     }
 
@@ -2014,10 +2398,16 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|_, owner| owner != module_id);
-        self.modules
+        let removed = self
+            .modules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(module_id)
+            .remove(module_id);
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+        removed
     }
 
     /// Remember a module removed by a non-preview rescan so route.open can
@@ -2084,9 +2474,64 @@ pub struct Supervisor {
     child_roster: ChildRoster,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
+    #[cfg(test)]
+    test_after_first_spawn: AfterFirstSpawnHook,
+}
+
+/// Test-only hook run on the path that takes on a new module, right after its
+/// first `spawn_child` returns (the process exists and could already be
+/// registering) and before that process is handed to the module's supervise
+/// loop and put on the roster. Lets a test observe what a fast child would see
+/// in that window without racing a real one.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct AfterFirstSpawnHook(Option<AfterFirstSpawnFn>);
+
+#[cfg(test)]
+type AfterFirstSpawnFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+impl fmt::Debug for AfterFirstSpawnHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AfterFirstSpawnHook")
+    }
+}
+
+#[cfg(test)]
+impl AfterFirstSpawnHook {
+    fn run(&self, module_id: &str) {
+        if let Some(hook) = &self.0 {
+            hook(module_id);
+        }
+    }
 }
 
 impl Supervisor {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(registry: Arc<Registry>, policy: RestartPolicy) -> Self {
+        let supervisor = Self::new(registry, policy);
+        #[cfg(target_os = "macos")]
+        let supervisor = supervisor.with_privacy_trampoline(test_privacy_trampoline());
+        supervisor
+    }
+    /// Verify the trampoline once when configured. Missing private OS support
+    /// refuses every macOS launch by name but does not stop the daemon's control
+    /// server. Embedders must explicitly provide a binary with the subc-os hidden
+    /// entry point; the library must not exec an arbitrary hosting program.
+    pub fn with_privacy_trampoline(self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        #[cfg(target_os = "macos")]
+        {
+            let result = probe_privacy_trampoline(&path).map(|()| path);
+            if let Err(cause) = &result {
+                error!(%cause, "macOS privacy identity unavailable; supervised launches will refuse");
+            }
+            self.child_roster.set_privacy_trampoline(result);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = path;
+        self
+    }
     /// The first step of an announced daemon shutdown, before the notice and
     /// before any connection is closed.
     ///
@@ -2299,6 +2744,8 @@ impl Supervisor {
             child_roster: ChildRoster::default(),
             #[cfg(target_os = "linux")]
             cgroup_placement: None,
+            #[cfg(test)]
+            test_after_first_spawn: AfterFirstSpawnHook::default(),
         }
     }
 
@@ -2387,10 +2834,11 @@ impl Supervisor {
     /// register with channel-0 `HELLO` using `spec.module_id` as its manifest id.
     pub fn spawn(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let child = spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2399,12 +2847,66 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        )?;
-        set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-        self.process_liveness
-            .track(spec.module_id.clone(), Arc::clone(&snapshot));
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        let child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                // Unlike the configured paths, a failed `spawn` leaves nothing
+                // on the roster, so the module must not stay marked configured.
+                self.abandon_unrostered(&spec.module_id);
+                return Err(err);
+            }
+        };
+        self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
 
         Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+    }
+
+    /// Make `spec`'s module count as configured, with its identity gates
+    /// (reserved id, reserved prefixes) in place, BEFORE any process of it
+    /// exists.
+    ///
+    /// Every path that takes on a new module calls this before `spawn_child`.
+    /// The order is the point: the child can connect, register, sync its
+    /// scopes and ask about them as soon as it is spawned, and the module is
+    /// only put on the roster after `spawn_child` returns. Were the mark set
+    /// with the roster entry, a fast child would see its own owner reported
+    /// as not configured, and a scoped `route.open` in that window would be
+    /// refused as terminal `scope_not_live` ("will never sync") instead of
+    /// retryable `scope_not_synced`.
+    fn establish_identity(&self, spec: &ModuleSpec) {
+        if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.apply_identity_configuration(spec);
+            supervisor_handle.mark_configured(&spec.module_id);
+        }
+    }
+
+    /// Take back [`Self::establish_identity`]'s configured mark when the
+    /// module will not be put on the roster after all.
+    fn abandon_unrostered(&self, module_id: &str) {
+        if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.unmark_configured_unless_rostered(module_id);
+        }
+    }
+
+    /// Record a freshly spawned first process as running. On failure the
+    /// module never reaches the roster, so its configured mark is taken back.
+    fn mark_first_process_running(
+        &self,
+        spec: &ModuleSpec,
+        runtime: &SupervisorRuntimeConfig,
+        snapshot: &SharedSnapshot,
+        child: &SupervisedChild,
+    ) -> Result<(), SuperviseError> {
+        if let Err(err) = set_running(snapshot, child, &spec.module_id, &runtime.spawn_events) {
+            self.abandon_unrostered(&spec.module_id);
+            return Err(err);
+        }
+        self.process_liveness
+            .track(spec.module_id.clone(), Arc::clone(snapshot));
+        Ok(())
     }
 
     /// Start supervising a module declared in daemon configuration.
@@ -2418,6 +2920,7 @@ impl Supervisor {
         enabled: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let runtime = self.runtime_config();
         if !enabled {
@@ -2426,7 +2929,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        match spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2435,11 +2938,12 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        ) {
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
             Ok(child) => {
-                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-                self.process_liveness
-                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -2469,9 +2973,10 @@ impl Supervisor {
         restart_policy: RestartPolicy,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let mut runtime = self.runtime_config();
-        runtime.health = health;
+        runtime.health = health.clone();
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
@@ -2486,7 +2991,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        match spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2495,11 +3000,12 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        ) {
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
             Ok(child) => {
-                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-                self.process_liveness
-                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -2538,7 +3044,7 @@ impl Supervisor {
                 .for_module(Arc::clone(&effective_drain_timeout)),
             effective_drain_timeout,
             default_drain_timeout: self.drain_timeout,
-            health: self.health,
+            health: self.health.clone(),
             connection_file_path: self.connection_file_path.clone(),
             capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
@@ -2572,7 +3078,7 @@ impl Supervisor {
     ) -> SupervisedModule {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
-            health: runtime.health,
+            health: runtime.health.clone(),
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let terminal_ring = Arc::clone(&runtime.terminal_ring);
@@ -2608,8 +3114,10 @@ impl Supervisor {
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
+        // The identity gates and the configured mark were set by
+        // `establish_identity` before any process was spawned; only the roster
+        // entry waits for the module handle, which needs the spawned child.
         if let Some(supervisor_handle) = &self.supervisor_handle {
-            supervisor_handle.apply_identity_configuration(&spec);
             supervisor_handle.insert(module.clone());
         }
         module
@@ -2730,6 +3238,7 @@ impl SupervisedModule {
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
         self.status_with_snapshot_lock(&self.inner.snapshot, None)
+            .map(|(status, _)| status)
     }
 
     pub(crate) fn record_deliberate_severance(
@@ -2755,13 +3264,14 @@ impl SupervisedModule {
         caller: &'static str,
     ) -> Result<ModuleStatus, SuperviseError> {
         self.status_with_snapshot_lock(&self.inner.snapshot, Some(caller))
+            .map(|(status, _)| status)
     }
 
     fn status_with_snapshot_lock(
         &self,
         snapshot: &SharedSnapshot,
         caller: Option<&'static str>,
-    ) -> Result<ModuleStatus, SuperviseError> {
+    ) -> Result<(ModuleStatus, Option<SpawnedFileIdentity>), SuperviseError> {
         let mut guard = match caller {
             Some(caller) => lock_snapshot_for_control(snapshot, &self.inner.module_id, caller)?,
             None => lock_snapshot(snapshot)?,
@@ -2783,7 +3293,9 @@ impl SupervisedModule {
             .get_module(&self.inner.module_id)
             .map_err(SuperviseError::Registry)?
             .is_some();
-        let protocol = self.declared_protocol()?;
+        let protocol = snapshot
+            .spawned_protocol
+            .unwrap_or(self.declared_protocol()?);
         let running_process =
             snapshot.enabled && snapshot.state == ModuleState::Running && snapshot.process_alive;
         // Registration is the difference between the two protocols and the only
@@ -2796,29 +3308,32 @@ impl SupervisedModule {
             ModuleProtocol::None => running_process,
         };
 
-        Ok(ModuleStatus {
-            module_id: self.inner.module_id.clone(),
-            state: snapshot.state,
-            enabled: snapshot.enabled,
-            process_alive: snapshot.process_alive,
-            registration_active,
-            protocol,
-            live,
-            restart_count,
-            lifetime_restarts: snapshot.lifetime_restarts,
-            spawn_generation: snapshot.spawn_generation,
-            max_restarts: self.inner.restart_policy.max_restarts,
-            restart_window: self.inner.restart_policy.window,
-            drain_timeout,
-            restart_backoff: self.inner.restart_policy.backoff,
-            restart_max_backoff: self.inner.restart_policy.max_backoff,
-            pid: snapshot.pid,
-            spawned_at_ms: snapshot.spawned_at_ms,
-            spawned_from: snapshot.spawned_from,
-            process_start_time: snapshot.process_start_time,
-            last_exit: snapshot.last_exit,
-            health: snapshot.health,
-        })
+        Ok((
+            ModuleStatus {
+                module_id: self.inner.module_id.clone(),
+                state: snapshot.state,
+                enabled: snapshot.enabled,
+                process_alive: snapshot.process_alive,
+                registration_active,
+                protocol,
+                live,
+                restart_count,
+                lifetime_restarts: snapshot.lifetime_restarts,
+                spawn_generation: snapshot.spawn_generation,
+                max_restarts: self.inner.restart_policy.max_restarts,
+                restart_window: self.inner.restart_policy.window,
+                drain_timeout,
+                restart_backoff: self.inner.restart_policy.backoff,
+                restart_max_backoff: self.inner.restart_policy.max_backoff,
+                pid: snapshot.reported_pid(),
+                spawned_at_ms: snapshot.spawned_at_ms,
+                spawned_from: snapshot.spawned_from,
+                process_start_time: snapshot.process_start_time,
+                last_exit: snapshot.last_exit,
+                health: snapshot.health,
+            },
+            snapshot.spawned_file_identity,
+        ))
     }
 
     #[cfg(test)]
@@ -2837,6 +3352,28 @@ impl SupervisedModule {
         })
     }
 
+    /// The status and the running-image check for `supervisor.provenance`,
+    /// taken from one status read. The exec acknowledgement can land between
+    /// two separate reads, and the reply would then pair "no pid yet" with an
+    /// image observed after the module started, which describes no single
+    /// moment.
+    pub(crate) async fn status_and_running_image_agreement(
+        &self,
+    ) -> Result<(ModuleStatus, subc_control::RunningImageAgreement), SuperviseError> {
+        let (status, identity) = self.status_with_snapshot_lock(&self.inner.snapshot, None)?;
+        let image = self
+            .inner
+            .provenance_probe
+            .observe(
+                status.pid,
+                status.spawned_from.as_deref(),
+                identity,
+                status.process_start_time,
+            )
+            .await;
+        Ok((status, image))
+    }
+
     pub(crate) async fn running_image_agreement(&self) -> subc_control::RunningImageAgreement {
         let snapshot = match lock_snapshot(&self.inner.snapshot) {
             Ok(snapshot) => snapshot.clone(),
@@ -2849,7 +3386,7 @@ impl SupervisedModule {
         self.inner
             .provenance_probe
             .observe(
-                snapshot.pid,
+                snapshot.reported_pid(),
                 snapshot.spawned_from.as_deref(),
                 snapshot.spawned_file_identity,
                 snapshot.process_start_time,
@@ -2861,7 +3398,7 @@ impl SupervisedModule {
     /// process the supervisor spawned is read, not processes it has started.
     pub(crate) fn child_resource_usage(&self) -> subc_control::ChildResourceUsage {
         let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
-            Ok(snapshot) => (snapshot.pid, snapshot.process_start_time),
+            Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
             Err(_) => {
                 return subc_control::ChildResourceUsage::Unavailable {
                     reason: subc_control::ChildResourceUnavailableReason::Unreadable,
@@ -3034,12 +3571,11 @@ impl SupervisedModule {
         })?
     }
 
-    /// This module's declared protocol, read from the same stored configuration
-    /// the rescan diff compares and `update_configuration` rewrites, so a status
-    /// read and the supervise loop can never disagree about which protocol is in
-    /// force.
+    /// The current process's protocol, or the configured protocol when down.
+    /// A rescan stores the next launch spec without changing how an existing
+    /// process registers, serves routes, is probed, or exits.
     pub(crate) fn declared_protocol(&self) -> Result<ModuleProtocol, SuperviseError> {
-        Ok(self
+        let configured = self
             .inner
             .configuration
             .lock()
@@ -3047,7 +3583,9 @@ impl SupervisedModule {
                 module_id: Some(self.inner.module_id.clone()),
             })?
             .spec
-            .protocol)
+            .protocol;
+        let state = lock_snapshot(&self.inner.snapshot)?;
+        Ok(state.spawned_protocol.unwrap_or(configured))
     }
 
     pub(crate) fn configuration(&self) -> Result<(ModuleSpec, HealthConfig), SuperviseError> {
@@ -3058,7 +3596,7 @@ impl SupervisedModule {
                 .map_err(|_| SuperviseError::StatePoisoned {
                     module_id: Some(self.inner.module_id.clone()),
                 })?;
-        Ok((configuration.spec.clone(), configuration.health))
+        Ok((configuration.spec.clone(), configuration.health.clone()))
     }
 
     /// Replace this module's launch spec, keeping its health and drain policy,
@@ -3096,7 +3634,7 @@ impl SupervisedModule {
             .commands
             .send(SupervisorCommand::UpdateConfiguration {
                 spec: spec.clone(),
-                health,
+                health: health.clone(),
                 drain_timeout_ms,
                 reply: reply_tx,
             })
@@ -3476,10 +4014,18 @@ pub(crate) fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
 
 #[derive(Debug, Default)]
 struct HealthProbeRuntime {
+    configured_health: Option<HealthConfig>,
     registered_connection: Option<crate::ConnectionId>,
     advertised: bool,
     next_probe_at: Option<Instant>,
     probe_index: u64,
+}
+
+fn running_protocol(spec: &ModuleSpec, snapshot: &SharedSnapshot) -> ModuleProtocol {
+    lock_snapshot(snapshot)
+        .ok()
+        .and_then(|state| state.spawned_protocol)
+        .unwrap_or(spec.protocol)
 }
 
 impl HealthProbeRuntime {
@@ -3490,21 +4036,29 @@ impl HealthProbeRuntime {
         registry: &Registry,
         snapshot: &SharedSnapshot,
     ) {
-        // THE PROBE GATE FOR A MODULE THAT SPEAKS NO SUBC WIRE, placed here
-        // because this is the only place that ever arms a probe: leaving
-        // `advertised` false and `next_probe_at` empty makes `due()` false
-        // forever, so `run_health_probe_cycle` -- and with it every arm of
-        // `probe_module_health`, including the one that reads an absent
-        // registration as proof the module is gone and escalates to a restart --
-        // is unreachable for this module.
-        //
-        // That arm is right for a subc module and is exactly wrong here: a
-        // `protocol: "none"` module never registers by declaration, so the
-        // absence it would classify is the module working as configured.
-        if spec.protocol == ModuleProtocol::None {
-            self.registered_connection = None;
-            self.advertised = false;
+        if self.configured_health.as_ref() != Some(&runtime.health) {
+            self.configured_health = Some(runtime.health.clone());
             self.next_probe_at = None;
+            self.registered_connection = None;
+            self.probe_index = 0;
+        }
+        // A non-wire process never registers. Only an explicitly configured
+        // HTTP endpoint can arm its health probe; an absent HELLO is not a
+        // health failure for that kind of process.
+        if running_protocol(spec, snapshot) == ModuleProtocol::None {
+            self.registered_connection = None;
+            self.advertised = runtime.health.http.is_some();
+            if !self.advertised {
+                self.next_probe_at = None;
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health = ModuleHealthStatus::default();
+                });
+            } else if self.next_probe_at.is_none() {
+                self.next_probe_at = Some(
+                    Instant::now()
+                        + jittered_health_delay(&spec.module_id, 0, runtime.health.cadence),
+                );
+            }
             return;
         }
 
@@ -3710,7 +4264,14 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
-    match probe_module_health(&spec.module_id, runtime, None).await {
+    let http = (running_protocol(spec, snapshot) == ModuleProtocol::None)
+        .then_some(runtime.health.http.as_deref())
+        .flatten();
+    let result = match http {
+        Some(url) => probe_http_health(url, runtime.health.deadline).await,
+        None => probe_module_health(&spec.module_id, runtime, None).await,
+    };
+    match result {
         Ok(report) => {
             handle_health_report(
                 spec,
@@ -3725,6 +4286,11 @@ async fn run_health_probe_cycle(
             .await;
         }
         Err(err) => {
+            if http.is_some() {
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health.status = SupervisorHealthStatus::Failing;
+                });
+            }
             handle_health_probe_failure(
                 spec,
                 runtime,
@@ -3738,6 +4304,205 @@ async fn run_health_probe_cycle(
             .await;
         }
     }
+}
+
+pub(crate) struct HttpProbeTarget<'a> {
+    address: std::net::SocketAddr,
+    localhost: bool,
+    authority: &'a str,
+    path: String,
+}
+
+/// Resolve only literal loopback endpoints, without DNS, redirects, proxies,
+/// or TLS. A URL cannot turn a local health check into an outbound connection.
+pub(crate) fn parse_http_probe_url(url: &str) -> Result<HttpProbeTarget<'_>, String> {
+    if url.bytes().any(|b| b <= b' ' || b == 127) || url.contains('#') {
+        return Err("must not contain whitespace, controls, or a fragment".into());
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("must use plain http://")?;
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(split);
+    let (host, port) = if let Some(rest) = authority.strip_prefix("[::1]") {
+        ("::1", rest)
+    } else {
+        let split = authority.find(':').unwrap_or(authority.len());
+        authority.split_at(split)
+    };
+    let ip: std::net::IpAddr = match host {
+        "127.0.0.1" | "localhost" => std::net::Ipv4Addr::LOCALHOST.into(),
+        "::1" => std::net::Ipv6Addr::LOCALHOST.into(),
+        _ => return Err("host must be 127.0.0.1, [::1], or localhost".into()),
+    };
+    let port = if port.is_empty() {
+        80
+    } else {
+        port.strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|p| *p > 0)
+            .ok_or("must have a valid nonzero TCP port")?
+    };
+    let path = if suffix.is_empty() {
+        "/".into()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        suffix.into()
+    };
+    Ok(HttpProbeTarget {
+        address: std::net::SocketAddr::new(ip, port),
+        localhost: host == "localhost",
+        authority,
+        path,
+    })
+}
+
+async fn probe_http_health(
+    url: &str,
+    deadline: Duration,
+) -> Result<HealthReport, HealthProbeError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    let target = parse_http_probe_url(url).map_err(HealthProbeError::misconfigured)?;
+    // Keep partial diagnostics outside the timed future so cancellation does
+    // not discard a status line or body bytes already received.
+    let mut response_status = String::new();
+    let mut body = Vec::new();
+    let probe = async {
+        // Resolve localhost ourselves so a hosts-file override cannot turn
+        // this into an outbound request, while IPv6-only local servers work.
+        let connection = match tokio::net::TcpStream::connect(target.address).await {
+            Err(_) if target.localhost => {
+                tokio::net::TcpStream::connect((
+                    std::net::Ipv6Addr::LOCALHOST,
+                    target.address.port(),
+                ))
+                .await
+            }
+            result => result,
+        };
+        let mut stream = connection.map_err(|error| {
+            HealthProbeError::no_answer(format!("HTTP connect failed: {error}"))
+        })?;
+        stream.write_all(format!("GET {} HTTP/1.1\r\nHost: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", target.path, target.authority).as_bytes()).await
+            .map_err(|error| HealthProbeError::no_answer(format!("HTTP write failed: {error}")))?;
+        let mut reader = BufReader::new(stream);
+        let mut budget = 16 * 1024;
+        let status = http_line(&mut reader, &mut budget).await?;
+        let mut words = status.split_ascii_whitespace();
+        let version = words.next();
+        let code = words
+            .next()
+            .filter(|word| word.len() == 3)
+            .and_then(|word| word.parse::<u16>().ok());
+        if !matches!(version, Some("HTTP/1.1" | "HTTP/1.0"))
+            || !code.is_some_and(|code| (100..600).contains(&code))
+        {
+            return Err(HealthProbeError::bad_answer(format!(
+                "invalid HTTP status: {status}"
+            )));
+        }
+        let code = code.expect("validated status code");
+        response_status = status.clone();
+        let mut length = None;
+        let mut chunked = false;
+        loop {
+            let line = http_line(&mut reader, &mut budget).await?;
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<u64>().map_err(|_| {
+                        HealthProbeError::bad_answer("invalid HTTP Content-Length")
+                    })?);
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = value.trim().eq_ignore_ascii_case("chunked");
+                }
+            }
+        }
+        if chunked {
+            while body.len() < 200 {
+                let line = http_line(&mut reader, &mut budget).await?;
+                let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+                    .map_err(|_| HealthProbeError::bad_answer("invalid HTTP chunk size"))?;
+                if size == 0 {
+                    break;
+                }
+                let count = size.min((200 - body.len()) as u64) as usize;
+                let start = body.len();
+                (&mut reader)
+                    .take(count as u64)
+                    .read_to_end(&mut body)
+                    .await
+                    .map_err(|error| {
+                        HealthProbeError::no_answer(format!("HTTP body read failed: {error}"))
+                    })?;
+                if body.len() - start != count {
+                    return Err(HealthProbeError::bad_answer("truncated HTTP chunk"));
+                }
+                if size > count as u64 || body.len() == 200 {
+                    break;
+                }
+                if !http_line(&mut reader, &mut budget).await?.is_empty() {
+                    return Err(HealthProbeError::bad_answer("invalid HTTP chunk delimiter"));
+                }
+            }
+        } else {
+            reader
+                .take(length.unwrap_or(200).min(200))
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| {
+                    HealthProbeError::no_answer(format!("HTTP body read failed: {error}"))
+                })?;
+        }
+        if (200..300).contains(&code) {
+            Ok(HealthReport::ok())
+        } else {
+            Err(HealthProbeError::bad_answer(
+                "HTTP health endpoint returned non-2xx",
+            ))
+        }
+    };
+    let mut result = timeout(deadline, probe).await.unwrap_or_else(|_| {
+        Err(HealthProbeError::no_answer(format!(
+            "HTTP probe timed out after {deadline:?}"
+        )))
+    });
+    if let Err(error) = &mut result {
+        if !response_status.is_empty() {
+            error.message = format!(
+                "{}; {response_status}: {}",
+                error.message,
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+    result
+}
+
+async fn http_line(
+    reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    remaining: &mut usize,
+) -> Result<String, HealthProbeError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut line = Vec::new();
+    (&mut *reader)
+        .take(*remaining as u64)
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|error| {
+            HealthProbeError::no_answer(format!("HTTP header read failed: {error}"))
+        })?;
+    *remaining -= line.len();
+    if !line.ends_with(b"\r\n") {
+        return Err(HealthProbeError::bad_answer(
+            "HTTP headers are incomplete or exceed 16 KiB",
+        ));
+    }
+    line.truncate(line.len() - 2);
+    String::from_utf8(line).map_err(|_| HealthProbeError::bad_answer("HTTP header is not UTF-8"))
 }
 
 async fn probe_module_health(
@@ -3970,6 +4735,11 @@ async fn handle_health_probe_failure(
     // tell which one is proof of anything.
     let detail = format!("[{}] {err}", err.label());
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        // A failed wire probe invalidates the last report, even before the
+        // restart threshold. HTTP probes already mark failures as Failing.
+        if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
+            state.health.status = SupervisorHealthStatus::Unknown;
+        }
         state.health.last_probe_ms = Some(now_ms);
         state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
         state.health.detail = Some(detail.clone());
@@ -4357,6 +5127,155 @@ mod tests {
         );
     }
 
+    /// What one module's owner looked like from the control plane at the
+    /// instant after its first process was spawned.
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnerInSpawnWindow {
+        module_id: String,
+        configured: bool,
+        on_roster: bool,
+        admission_refusal: Option<&'static str>,
+    }
+
+    /// A supervised module's process can connect, register, sync its scopes
+    /// and describe them as soon as it is spawned, which is BEFORE the
+    /// supervisor puts the module on the roster. In that window the owner must
+    /// already read as configured, so a scoped `route.open` against it is
+    /// refused as retryable `scope_not_synced` and not as terminal
+    /// `scope_not_live` ("will never sync").
+    ///
+    /// The hook runs in exactly that window on every path that takes on a new
+    /// module, so no race with a real child is needed: `on_roster: false`
+    /// proves each observation was taken before the roster insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_module_is_configured_before_its_first_process_can_register() {
+        use crate::scopes::ScopeTable;
+        use subc_protocol::{error_codes, scope::ScopeSelector, Principal};
+
+        let dir = subc_test_support::TestTempDir::new("configured-before-spawn");
+        let stub = |module_id: &str, program: PathBuf| ModuleSpec {
+            module_id: module_id.to_string(),
+            program,
+            args: Vec::new(),
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.to_string(), dir.path().display().to_string()))
+                .chain([("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string())])
+                .collect(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let live = super::terminal_history_tests::fake_aft_stub_path();
+        let missing = dir.path().join("definitely-missing-module");
+
+        let handle = SupervisorHandle::new();
+        let mut supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_handle(handle.clone());
+        let observed = Arc::new(Mutex::new(Vec::<OwnerInSpawnWindow>::new()));
+        let hook_handle = handle.clone();
+        let hook_observed = Arc::clone(&observed);
+        supervisor.test_after_first_spawn = AfterFirstSpawnHook(Some(Arc::new(move |module_id| {
+            // Exactly what the control plane computes for a scoped route.open
+            // naming this module as the owner of a scope it has not synced.
+            let configured = hook_handle.is_configured(module_id);
+            let selector = ScopeSelector {
+                owner: Principal::Reserved {
+                    module_id: module_id.to_string(),
+                },
+                scope_ref: "s".to_string(),
+                scope_epoch: Some(1),
+            };
+            let carrier = Principal::Reserved {
+                module_id: "carrier".to_string(),
+            };
+            let admission_refusal = match ScopeTable::new(Vec::<String>::new())
+                .admit(&carrier, module_id, &selector, configured)
+            {
+                Ok(_) => None,
+                Err(refusal) => Some(refusal.code),
+            };
+            hook_observed.lock().unwrap().push(OwnerInSpawnWindow {
+                module_id: module_id.to_string(),
+                configured,
+                on_roster: hook_handle.get(module_id).is_some(),
+                admission_refusal,
+            });
+        })));
+
+        let plain = supervisor.spawn(stub("plain", live.clone())).unwrap();
+        let configured = supervisor
+            .supervise_configured(stub("configured", live.clone()), true)
+            .unwrap();
+        let with_health = supervisor
+            .supervise_configured_with_health(
+                stub("with-health", live.clone()),
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        // The failed-spawn path still puts the module on the roster (as
+        // failed), so it is configured throughout.
+        let failed = supervisor
+            .supervise_configured_with_health(
+                stub("failed-spawn", missing.clone()),
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        // A failed plain `spawn` puts nothing on the roster, so its mark is
+        // taken back once the spawn has failed.
+        assert!(supervisor.spawn(stub("spawn-error", missing)).is_err());
+
+        let expected = [
+            "plain",
+            "configured",
+            "with-health",
+            "failed-spawn",
+            "spawn-error",
+        ]
+        .into_iter()
+        .map(|module_id| OwnerInSpawnWindow {
+            module_id: module_id.to_string(),
+            configured: true,
+            on_roster: false,
+            admission_refusal: Some(error_codes::SCOPE_NOT_SYNCED),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(*observed.lock().unwrap(), expected);
+
+        for module_id in ["plain", "configured", "with-health", "failed-spawn"] {
+            assert!(
+                handle.get(module_id).is_some(),
+                "{module_id} is on the roster"
+            );
+            assert!(
+                handle.is_configured(module_id),
+                "{module_id} stays configured"
+            );
+        }
+        assert!(handle.get("spawn-error").is_none());
+        assert!(
+            !handle.is_configured("spawn-error"),
+            "a plain spawn that failed must not leave its module marked configured"
+        );
+
+        // Leaving the roster clears the mark with it.
+        handle.retire("failed-spawn");
+        assert!(!handle.is_configured("failed-spawn"));
+
+        for module in [plain, configured, with_health] {
+            module.stop().await.unwrap();
+        }
+        drop(failed);
+    }
+
     fn stale_process_snapshot(state: ModuleState, enabled: bool) -> SharedSnapshot {
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(state, enabled)));
         update_snapshot(&snapshot, Some("stale-process-facts"), |snapshot| {
@@ -4384,7 +5303,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_enable_spawn_clears_preexisting_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let mut runtime = supervisor.runtime_config();
         runtime.test_seed_stale_facts_before_enable_spawn = true;
         let snapshot = stale_process_snapshot(ModuleState::Disabled, false);
@@ -4418,7 +5338,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_revives_stranded_restarting_but_not_pending_backoff() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
             ModuleState::Restarting,
@@ -4471,7 +5392,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_reload_spawn_clears_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let mut runtime = supervisor.runtime_config();
         runtime.restart_policy = RestartPolicy::new(0, Duration::ZERO);
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
@@ -4504,7 +5426,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_a_module_with_an_active_monitor_clears_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let module = supervisor.supervised_module(
             ModuleSpec {
@@ -4539,9 +5462,440 @@ mod tests {
         assert_snapshot_process_facts_cleared(&snapshot);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rescan_preserves_running_protocol_until_respawn() {
+        let dir = subc_test_support::TestTempDir::new("rescan-protocol");
+        let initial = ModuleSpec {
+            module_id: "rescan-protocol".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["60".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), dir.path().to_string_lossy().into_owned()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let module = supervisor.spawn(initial.clone()).unwrap();
+        assert!(module.status().unwrap().live);
+        let mut next = initial;
+        next.protocol = ModuleProtocol::Subc;
+        module
+            .update_configuration(next.clone(), HealthConfig::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            module.status().unwrap().live,
+            "rescan must not require HELLO from the old non-wire process"
+        );
+        let runtime = supervisor.runtime_config();
+        let action = on_child_exit(
+            &next,
+            RestartPolicy::default(),
+            &supervisor.registry,
+            &module.inner.snapshot,
+            &runtime.terminal_ring,
+            &runtime.spawn_events,
+            &runtime.child_roster,
+            ExitReport {
+                kind: ExitKind::Clean,
+                code: Some(0),
+                signal: None,
+                at_ms: unix_ms_now(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(action, NextAction::Restart { .. }),
+            "the old non-wire process's clean exit must restart"
+        );
+        module.drain().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_identity_matches_path_names_and_shebang_interpreters() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = subc_test_support::TestTempDir::new("spawn-image-identity");
+        let script = dir.join("module.sh");
+        std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join("live-children.json");
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_live_children_record(&record_path);
+        for (program, args) in [
+            (PathBuf::from("sleep"), vec!["60".into()]),
+            (script, vec![]),
+        ] {
+            let spec = ModuleSpec {
+                module_id: "image-identity".into(),
+                program: program.clone(),
+                args,
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            };
+            let module = supervisor.spawn(spec).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                // SETEXEC confirmation is asynchronous; the orphan record must
+                // identify the final image, never the intermediate trampoline.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while crate::live_children::read_record(&record_path)
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.executable.is_none())
+                {
+                    assert!(Instant::now() < deadline, "module image was not confirmed");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            let entry = crate::live_children::read_record(&record_path)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let observed = subc_os::Process::open(entry.pid)
+                .unwrap()
+                .unwrap()
+                .observe()
+                .unwrap();
+            let verdict = crate::live_children::identity_verdict(&entry, entry.pid, &observed);
+            module.drain().await.unwrap();
+            assert_eq!(
+                verdict,
+                crate::live_children::IdentityVerdict::Matches,
+                "program {program:?}: recorded {entry:?}, observed {observed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn http_fixture(
+        dir: &std::path::Path,
+        url: &str,
+        threshold: u32,
+    ) -> crate::daemon_config::ConfiguredModule {
+        let path = dir.join("subc.jsonc");
+        std::fs::write(&path, serde_json::json!({"version": 1, "modules": {"http-process": {
+            "program": "/bin/sleep", "args": ["60"], "protocol": "none",
+            "env": {"XDG_DATA_HOME":dir,"XDG_RUNTIME_DIR":dir,"XDG_CONFIG_HOME":dir},
+            "health": {"http":url,"cadence_ms":20,"deadline_ms":200,"failure_threshold":threshold},
+            "restart": {"backoff_ms":1,"max_backoff_ms":1}, "drain_timeout_ms":10
+        }}}).to_string()).unwrap();
+        crate::daemon_config::load(&path)
+            .unwrap()
+            .unwrap()
+            .modules
+            .pop()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn wait_http_health(module: &SupervisedModule, status: SupervisorHealthStatus) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if module.status().unwrap().health.status == status {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected {status:?}, got {:?}",
+                module.status().unwrap().health
+            )
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_status_flips_ok_failing_ok() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = subc_test_support::TestTempDir::new("http-status-flips");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let serving_status = status.clone();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let count = stream.read(&mut request).await.unwrap();
+                assert!(count > 0, "a probe must send an HTTP request");
+                let code = serving_status.load(std::sync::atomic::Ordering::SeqCst);
+                let body = if code == 200 {
+                    "ready"
+                } else {
+                    "{\"status\":\"unavailable\",\"error\":\"scratch failure\"}"
+                };
+                let response = format!("HTTP/1.1 {code} scratch\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let configured = http_fixture(&dir, &url, 1000);
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        status.store(503, std::sync::atomic::Ordering::SeqCst);
+        wait_http_health(&module, SupervisorHealthStatus::Failing).await;
+        assert!(module
+            .status()
+            .unwrap()
+            .health
+            .detail
+            .unwrap()
+            .contains("scratch failure"));
+        status.store(200, std::sync::atomic::Ordering::SeqCst);
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        assert_eq!(module.status().unwrap().health.consecutive_failures, 0);
+        let before = module.status().unwrap();
+        let (spec, mut health) = module.configuration().unwrap();
+        health.http = None;
+        module
+            .update_configuration(spec.clone(), health.clone(), Some(10))
+            .await
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Unknown).await;
+        health.http = Some(url);
+        module
+            .update_configuration(spec, health, Some(10))
+            .await
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        assert_eq!(
+            module.status().unwrap().pid,
+            before.pid,
+            "changing a probe must apply live, not restart its process"
+        );
+        let (spec, mut health) = module.configuration().unwrap();
+        health.failure_threshold = 2;
+        module
+            .update_configuration(spec, health, Some(10))
+            .await
+            .unwrap();
+        status.store(503, std::sync::atomic::Ordering::SeqCst);
+        timeout(Duration::from_secs(5), async {
+            while module.status().unwrap().spawn_generation == before.spawn_generation {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sustained HTTP 503 responses must trigger the health restart policy");
+        module.drain().await.unwrap();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_no_listener_restarts_after_consecutive_failures() {
+        let dir = subc_test_support::TestTempDir::new("http-refused");
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", unused.local_addr().unwrap());
+        drop(unused);
+        let configured = http_fixture(&dir, &url, 2);
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        let before = module.status().unwrap().spawn_generation;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let status = module.status().unwrap();
+                if status.spawn_generation > before {
+                    assert!(status.lifetime_restarts > 0);
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sustained HTTP refusal must trigger the health restart policy");
+        module.drain().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_timeout_honours_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = timeout(
+            Duration::from_secs(1),
+            probe_http_health(&url, Duration::from_millis(10)),
+        )
+        .await
+        .expect("the probe must enforce its own deadline")
+        .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_localhost_reaches_an_ipv6_only_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let url = format!(
+            "http://localhost:{}/healthz",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        // The deadline only bounds a hang. A probe that never tried the IPv6
+        // address would be refused on 127.0.0.1 and fail at once, so a longer
+        // deadline does not weaken the assertion; one second timed out under a
+        // loaded parallel test run.
+        assert_eq!(
+            probe_http_health(&url, Duration::from_secs(10))
+                .await
+                .unwrap()
+                .status,
+            HealthStatus::Ok
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_timeout_keeps_partial_status_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 100\r\n\r\npartial diagnostic",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = probe_http_health(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        server.abort();
+        assert!(
+            error.contains("timed out")
+                && error.contains("503 Unavailable")
+                && error.contains("partial diagnostic"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_diagnostic_body_is_bounded_to_200_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = format!("{}not-in-diagnostic", "x".repeat(400));
+            let response = format!(
+                "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let error = probe_http_health(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(error.ends_with(&"x".repeat(200)), "{error}");
+        assert_eq!(error.split(": ").last().unwrap().len(), 200);
+        assert!(!error.contains("not-in-diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_real_nats_server_monitoring() {
+        if std::process::Command::new("nats-server")
+            .arg("--version")
+            .env("XDG_DATA_HOME", std::env::temp_dir())
+            .env("XDG_RUNTIME_DIR", std::env::temp_dir())
+            .env("XDG_CONFIG_HOME", std::env::temp_dir())
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skipped: http_health_real_nats_server_monitoring (nats-server is not on PATH)"
+            );
+            return;
+        }
+        let dir = subc_test_support::TestTempDir::new("nats-http-monitoring");
+        let monitor = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = monitor.local_addr().unwrap().port();
+        let client = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let config = dir.join("server.conf");
+        std::fs::write(&config, format!("listen: 127.0.0.1:{client_port}\nhttp: 127.0.0.1:{port}\njetstream {{ store_dir: \"{}\" }}\n", dir.join("jetstream").display())).unwrap();
+        let mut configured = http_fixture(&dir, &format!("http://127.0.0.1:{port}/healthz"), 1000);
+        configured.program = PathBuf::from("nats-server");
+        configured.args = vec!["-c".into(), config.to_string_lossy().into_owned()];
+        drop(monitor);
+        drop(client);
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        module.drain().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configuration_update_does_not_replace_captured_running_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let initial = ModuleSpec {
             module_id: "rescan-preserves-spawn-facts".to_string(),
@@ -4601,6 +5955,10 @@ async fn supervise_loop(
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        #[cfg(target_os = "macos")]
+        if let Some(active) = child.as_mut() {
+            active.confirm_privacy_exec().await;
+        }
         if let Some(scheduled) = runtime
             .scheduled_respawn
             .lock()
@@ -4919,7 +6277,7 @@ async fn handle_supervisor_command(
     command: SupervisorCommand,
     spec: &mut ModuleSpec,
     runtime: &mut SupervisorRuntimeConfig,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
@@ -5134,7 +6492,15 @@ async fn handle_supervisor_command(
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.configuration_updated_since_spawn = true;
             });
+            let health_changed = runtime.health != health;
             runtime.health = health;
+            // Reset the cadence and old endpoint's failure streak on a live
+            // health-policy change rather than waiting for its old deadline.
+            if health_changed {
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health = ModuleHealthStatus::default();
+                });
+            }
             runtime.drain_timeout = drain_timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(runtime.default_drain_timeout);
@@ -5364,7 +6730,10 @@ async fn finish_reload_child(
                 child,
                 ReloadRegistrationFailure {
                     exit_report: registration_failure_exit_report(exit_report),
-                    reason: "new child exited before registering".to_string(),
+                    reason: exited_child
+                        .spawn_failure
+                        .clone()
+                        .unwrap_or_else(|| "new child exited before registering".to_string()),
                 },
             )
             .await;
@@ -5557,8 +6926,8 @@ async fn on_child_exit(
     // stop would leave the module down for good after any stray signal, so it
     // goes through the crash path instead: it spends restart budget, respawns
     // with the crash backoff, and ends `failed` when the budget runs out.
-    let unrequested_clean_exit_of_protocol_none =
-        exit_report.kind == ExitKind::Clean && spec.protocol == ModuleProtocol::None;
+    let unrequested_clean_exit_of_protocol_none = exit_report.kind == ExitKind::Clean
+        && running_protocol(spec, snapshot) == ModuleProtocol::None;
     match exit_report.kind {
         ExitKind::Clean if !unrequested_clean_exit_of_protocol_none => {
             info!(
@@ -5619,7 +6988,9 @@ async fn on_child_exit(
             // Set only when the budget is what stopped the module, so the
             // terminal record says which limit was hit rather than leaving
             // `failed` to be read as "crashed once, badly".
-            let mut disposition_detail = None;
+            let mut disposition_detail = lock_snapshot(snapshot)
+                .ok()
+                .and_then(|mut state| state.spawn_failure.take());
             let now = Instant::now();
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 clear_current_process_facts(state);
@@ -5630,9 +7001,13 @@ async fn on_child_exit(
                         restart_schedule = Some(schedule);
                         disposition = TerminalDisposition::Restarting;
                     } else {
-                        state.state = ModuleState::Failed;
                         disposition = TerminalDisposition::Failed;
-                        disposition_detail = Some(policy.budget_exhausted_detail());
+                        let budget = policy.budget_exhausted_detail();
+                        disposition_detail =
+                            Some(disposition_detail.take().map_or_else(
+                                || budget.clone(),
+                                |cause| format!("{cause}; {budget}"),
+                            ));
                     }
                 } else {
                     state.state = ModuleState::Disabled;
@@ -5644,7 +7019,7 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
-            if disposition_detail.is_some() {
+            if disposition == TerminalDisposition::Failed {
                 // The window is in the message, not only in the fields: this line
                 // is read in a scrollback where a bare `max_restarts=3` reads as a
                 // lifetime cap and sends the operator looking for three crashes
@@ -5657,14 +7032,41 @@ async fn on_child_exit(
                     policy.budget_exhausted_detail()
                 );
             }
-            record_terminal_with_detail(
-                &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                disposition,
-                disposition_detail,
-            );
+            let budget_exhausted = disposition == TerminalDisposition::Failed;
+            let record_exit = || {
+                record_terminal_with_detail(
+                    &spec.module_id,
+                    terminal_ring,
+                    spawn_events,
+                    &exit_report,
+                    disposition,
+                    disposition_detail,
+                );
+            };
+            if budget_exhausted {
+                // Publish Failed only after its terminal record is available.
+                // Recording takes the event-feed lock, then ring -> journal
+                // writer (with file I/O), all without the hot snapshot lock.
+                // No lock is held when the final snapshot update runs, nor
+                // across the registration-release await below. Commands and
+                // health actions run on this same supervisor task, so none can
+                // act on the old state during the write; process facts already
+                // say the child is dead to concurrent liveness readers.
+                // A journal error is retained in history, not returned. If
+                // recording panics, still publish Failed before resuming the
+                // original unwind rather than leaving a dead child Running.
+                let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record_exit));
+                if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.state = ModuleState::Failed;
+                }) {
+                    error!(module_id = %spec.module_id, error = %err, "failed to publish exhausted restart budget");
+                }
+                if let Err(panic) = recorded {
+                    std::panic::resume_unwind(panic);
+                }
+            } else {
+                record_exit();
+            }
 
             if let Some(schedule) = restart_schedule {
                 NextAction::Restart {
@@ -6044,7 +7446,7 @@ fn spawn_child(
 
 /// Spawn one process of `spec` into a slot.
 ///
-/// `alternate_slot` picks the process's cgroup name (see `swap::cgroup_name`).
+/// `alternate_slot` picks the process's cgroup label on Linux (see `swap::cgroup_name`).
 /// A swap candidate needs a different cgroup from the process it is replacing,
 /// which is still alive: in the same cgroup the two would be one kill domain,
 /// and killing a failed candidate could take the incumbent with it.
@@ -6074,9 +7476,33 @@ fn spawn_child_in_slot(
         });
     }
     #[cfg(target_os = "linux")]
-    let cgroup_name = swap::cgroup_name(&spec.module_id, alternate_slot);
+    let cgroup_name = {
+        // Slot names alone are not kill domains: a retired incumbent may still
+        // be draining when a later enable/restart spawns into the same slot.
+        // Decimal entropy keeps the suffix unambiguous; Placement performs
+        // the module-id escaping and constructs the filesystem path.
+        if cgroup_placement.is_none() {
+            swap::cgroup_name(&spec.module_id, alternate_slot)
+        } else {
+            let nonce = generate_launch_nonce()?;
+            let suffix = u128::from_str_radix(&nonce[..32], 16).expect("hex launch nonce");
+            // Leave room for byte escaping and the suffix under NAME_MAX. The
+            // label is only for humans; the nonce identifies the kill domain.
+            let mut end = spec.module_id.len().min(64);
+            while !spec.module_id.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}_{suffix}",
+                swap::cgroup_name(&spec.module_id[..end], alternate_slot)
+            )
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let _ = alternate_slot;
+    #[cfg(target_os = "macos")]
+    let (mut command, privacy_exec, exec_ack) = privacy_command(spec, roster)?;
+    #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
@@ -6203,6 +7629,12 @@ fn spawn_child_in_slot(
             });
         }
     };
+    // The parent must close its writer now: the acknowledgement pipe reports EOF
+    // only when every writer is gone, and the child's copy closes when the
+    // trampoline replaces itself with the module. Command holds only an integer
+    // in its pre_exec callback, not another writer.
+    #[cfg(target_os = "macos")]
+    drop(exec_ack);
 
     // Containment, steps 2 and 3: assign while suspended, then resume.
     #[cfg(windows)]
@@ -6217,9 +7649,23 @@ fn spawn_child_in_slot(
     })?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
-    // The executable identity is the spawned path's, read above, not the
-    // running image's: right after spawn the child may not have finished its
-    // exec yet and would still report this daemon's own image.
+    #[cfg(all(test, target_os = "macos"))]
+    privacy_exec_boundary_tests::before_image_sample(spec, pid);
+    // Unix spawn returns after exec's error pipe closes. The kernel image is
+    // therefore the executable to compare during a future orphan sweep: PATH
+    // lookup and shebang interpretation may select a different file from the
+    // configured program. Keep the literal program's identity for provenance,
+    // but never use it as proof that a recorded pid may be signalled.
+    let recorded_image = observe_spawned_image(pid);
+    // spawn() confirms only the first exec, into the trampoline. Never persist
+    // the trampoline image; the asynchronous acknowledgement publishes the
+    // module image once the trampoline has replaced itself with the module.
+    #[cfg(target_os = "macos")]
+    let recorded_image = if privacy_exec.is_some() {
+        None
+    } else {
+        recorded_image
+    };
     #[cfg(target_os = "linux")]
     let recorded_cgroup_name = cgroup_path.as_ref().map(|_| cgroup_name.clone());
     #[cfg(not(target_os = "linux"))]
@@ -6230,13 +7676,10 @@ fn spawn_child_in_slot(
         spec.protocol,
         process_start_time,
         crate::child_roster::RecordedIdentity {
-            start_time: subc_os::start_time(pid),
-            executable: spawned_file_identity.map(|identity| {
-                crate::live_children::ExecutableIdentity {
-                    device: identity.device,
-                    inode: identity.inode,
-                }
-            }),
+            start_time: recorded_image.map(|image| image.start_time),
+            executable: recorded_image
+                .and_then(|image| image.executable)
+                .map(crate::live_children::ExecutableIdentity::from),
             cgroup_name: recorded_cgroup_name,
             #[cfg(target_os = "linux")]
             cgroup_placement: cgroup_placement.cloned(),
@@ -6256,6 +7699,29 @@ fn spawn_child_in_slot(
         kill_module_cgroup(cgroup_placement, &cgroup_name);
         if let Err(error) = child.start_kill() {
             debug!(module_id = %spec.module_id, pid, %error, "kill of a process spawned during daemon shutdown failed; it may already have exited");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(placement) = cgroup_placement {
+            // This spawn was never admitted, so shutdown has no roster entry
+            // to await. Do not detach its cleanup: the runtime could exit
+            // before that task reaps the rejected child and removes its group.
+            while matches!(child.try_wait(), Ok(None)) {
+                std::thread::yield_now();
+            }
+            if matches!(
+                subc_cgroup::kill_module(Some(placement), &cgroup_name),
+                subc_cgroup::KillOutcome::Killed
+            ) {
+                if let Ok(path) = placement.module_path(&cgroup_name) {
+                    while std::fs::read_to_string(path.join("cgroup.events"))
+                        .ok()
+                        .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            remove_module_cgroup(placement, &cgroup_name);
         }
         drop(roster_guard);
         return Err(SuperviseError::Spawn {
@@ -6310,6 +7776,7 @@ fn spawn_child_in_slot(
 
     Ok(SupervisedChild {
         child,
+        protocol: spec.protocol,
         #[cfg(target_os = "linux")]
         module_id: cgroup_name,
         #[cfg(target_os = "linux")]
@@ -6326,6 +7793,11 @@ fn spawn_child_in_slot(
         process_identity,
         pid,
         roster_guard: Some(roster_guard),
+        #[cfg(target_os = "macos")]
+        privacy_exec,
+        #[cfg(target_os = "macos")]
+        report_ready: Arc::new(OnceLock::new()),
+        spawn_failure: None,
     })
 }
 
@@ -6444,6 +7916,27 @@ fn remove_module_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
 }
 
 #[cfg(target_os = "linux")]
+async fn cleanup_reaped_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
+    // Reaping the direct child is not proof its descendants exited. End the
+    // residual tree and wait for the kernel's population fact before rmdir;
+    // otherwise a successful parent wait leaks a directory on each restart.
+    if matches!(
+        subc_cgroup::kill_module(Some(placement), module_id),
+        subc_cgroup::KillOutcome::Killed
+    ) {
+        if let Ok(path) = placement.module_path(module_id) {
+            while std::fs::read_to_string(path.join("cgroup.events"))
+                .ok()
+                .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
+            {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+    remove_module_cgroup(placement, module_id);
+}
+
+#[cfg(target_os = "linux")]
 fn apply_cgroup_placement(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -6502,6 +7995,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// The kernel's image after an acknowledged exec, shared by ordinary launches
+/// and privacy trampolines. PATH and shebang interpretation are kernel facts,
+/// not identities inferred from a configured pathname.
+fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
+    subc_os::Process::open(pid)
+        .ok()
+        .flatten()
+        .and_then(|process| process.observe())
 }
 
 fn spawn_and_mark_running(
@@ -7456,7 +8959,7 @@ async fn drain_optional_child(
 #[allow(clippy::too_many_arguments)]
 async fn drain_child_to_state(
     module_id: &str,
-    protocol: ModuleProtocol,
+    _protocol: ModuleProtocol,
     stop_notice: StopNotice,
     registry: &Registry,
     forwarding: Option<&ForwardingTable>,
@@ -7468,6 +8971,7 @@ async fn drain_child_to_state(
     final_state: ModuleState,
     enabled: Option<bool>,
 ) -> Result<(), SuperviseError> {
+    let protocol = child.protocol;
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
         state.draining_to_replace = final_state == ModuleState::Restarting;
@@ -7766,7 +9270,7 @@ mod slot_registration_wait_tests {
     #[tokio::test]
     async fn enable_release_failure_is_failed_and_a_second_enable_retries() {
         let registry = Arc::new(Registry::default());
-        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default());
+        let supervisor = Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default());
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
         let spec = ModuleSpec {
@@ -7989,14 +9493,20 @@ fn set_running(
         info!(module_id, "restart already satisfied by generation {generation}; coalesced pending request completed");
     }
     state.drain_disposition_detail = None;
+    state.spawn_failure = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
     state.configuration_updated_since_spawn = false;
+    state.spawned_protocol = Some(child.protocol);
     state.state = ModuleState::Running;
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    #[cfg(target_os = "macos")]
+    {
+        state.report_ready = Some(Arc::clone(&child.report_ready));
+    }
     state.spawned_at_ms = Some(child.spawned_at_ms);
     state.spawned_from = Some(child.spawned_from.clone());
     state.spawned_file_identity = child.spawned_file_identity;
@@ -8006,7 +9516,12 @@ fn set_running(
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.process_alive = false;
+    state.spawned_protocol = None;
     state.pid = None;
+    #[cfg(target_os = "macos")]
+    {
+        state.report_ready = None;
+    }
     state.spawned_at_ms = None;
     state.spawned_from = None;
     state.spawned_file_identity = None;
@@ -8043,7 +9558,10 @@ fn classify_reaped_child_exit(
     child: &SupervisedChild,
     status: &ExitStatus,
 ) -> ExitReport {
-    let _ = update_snapshot(snapshot, None, |state| state.reaped_pid = Some(child.pid));
+    let _ = update_snapshot(snapshot, None, |state| {
+        state.reaped_pid = Some(child.pid);
+        state.spawn_failure = child.spawn_failure.clone();
+    });
     apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
 }
 
@@ -8363,7 +9881,7 @@ mod terminal_history_tests {
     ) -> SupervisedModule {
         let registry = Arc::new(Registry::default());
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
                 module_id: "recovery-snapshot".to_string(),
@@ -8392,8 +9910,9 @@ mod terminal_history_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn no_cgroup_placement_does_not_block_fake_aft_stub_spawn() {
-        let supervisor = Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
-            .with_cgroup_placement(None);
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_cgroup_placement(None);
         let result = supervisor.spawn(ModuleSpec {
             module_id: "no-cgroup-placement".to_string(),
             program: fake_aft_stub_path(),
@@ -8478,7 +9997,7 @@ mod terminal_history_tests {
     async fn terminal_history_survives_respawn_and_keeps_both_crashes_in_order() {
         let registry = Arc::new(Registry::default());
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
                 module_id: "terminal-history".to_string(),
@@ -8523,7 +10042,7 @@ mod terminal_history_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disable_during_crash_backoff_cancels_pending_respawn() {
         let backoff = Duration::from_secs(2);
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(10, backoff),
         );
@@ -8630,7 +10149,7 @@ mod terminal_history_tests {
         let dir = subc_test_support::TestTempDir::new("none-unrequested-clean-exit");
         let (spec, ready, marker) =
             protocol_none_sigterm_exits_clean_spec("none-unrequested-clean-exit", dir.path());
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -8683,7 +10202,7 @@ mod terminal_history_tests {
     /// the budget named.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn protocol_none_repeated_clean_exits_exhaust_the_restart_budget() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(1, Duration::ZERO),
         );
@@ -8700,6 +10219,8 @@ mod terminal_history_tests {
             })
             .unwrap();
 
+        // Failed follows the terminal write; this deadline only bounds a hang,
+        // not an assumed duration for the two launches or their exit recording.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = module.status().unwrap();
@@ -8733,6 +10254,152 @@ mod terminal_history_tests {
         assert_eq!(module.status().unwrap().spawn_generation, 2);
     }
 
+    #[test]
+    fn restart_budget_failure_is_published_after_its_terminal_record() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            protocol: ModuleProtocol::None,
+            ..windowed_crash_spec("budget-publication-order")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
+            ModuleState::Running,
+            true,
+        )));
+        let reaped_snapshot = snapshot.clone();
+        let events = runtime.spawn_events.clone();
+        let history = runtime.terminal_ring.clone();
+
+        // Exit recording takes the event-feed lock before the history lock.
+        // Holding it pauses the writer after choosing a disposition but before
+        // recording history, without assuming anything about scheduler timing.
+        let before_record = events.0.lock().unwrap();
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &reaped_snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    ExitReport {
+                        kind: ExitKind::Clean,
+                        code: Some(0),
+                        signal: None,
+                        at_ms: 1,
+                    },
+                ))
+        });
+        // The deadline bounds a hung writer only; last_exit is the handshake.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let before_state = loop {
+            let state = lock_snapshot(&snapshot).unwrap();
+            if state.last_exit.is_some() {
+                break state.state;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "exit decision was not reached");
+            std::thread::yield_now();
+        };
+        let before_history = history.lock().unwrap().snapshot();
+        drop(before_record);
+        assert!(matches!(reap.join().unwrap(), NextAction::Stop { .. }));
+        assert!(before_history.entries.is_empty());
+        assert_ne!(
+            before_state,
+            ModuleState::Failed,
+            "Failed was visible before its terminal record could be written"
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        let history = history.lock().unwrap().snapshot();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].exit_code, Some(0));
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[tokio::test]
+    async fn restart_budget_failure_remains_failed_when_journal_append_fails() {
+        let dir = subc_test_support::TestTempDir::new("budget-journal-failure");
+        let path = dir.join("terminals.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_terminal_journal(path, "budget-journal-failure".into());
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("budget-journal-failure");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                &runtime.spawn_events,
+                &runtime.child_roster,
+                crash_exit_report(1),
+            )
+            .await,
+            NextAction::Stop { .. }
+        ));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        let history = runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .durable_history(&spec.module_id);
+        assert!(history.journal_write_failures > 0);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn restart_budget_failure_remains_failed_when_exit_recording_panics() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("budget-recording-panic");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        runtime.spawn_events.emit_spawned(&spec.module_id, 1, 1);
+        // Exhausting the event sequence makes emit_exited panic before the
+        // terminal write, exercising publication on the recording unwind.
+        runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    crash_exit_report(1),
+                ))
+        }));
+        let panic = result.err().expect("recording must still unwind");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("spawn event sequence exhausted")
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+    }
+
     /// A stop the supervisor itself requests still stops a protocol-none
     /// module, even though the child answers the SIGTERM with exit 0.
     #[cfg(unix)]
@@ -8746,7 +10413,7 @@ mod terminal_history_tests {
             };
             let dir = subc_test_support::TestTempDir::new(label);
             let (spec, ready, marker) = protocol_none_sigterm_exits_clean_spec(label, dir.path());
-            let supervisor = Supervisor::new(
+            let supervisor = Supervisor::new_for_test(
                 Arc::new(Registry::default()),
                 RestartPolicy::new(3, Duration::ZERO),
             );
@@ -8792,7 +10459,7 @@ mod terminal_history_tests {
     /// protocol-none rule must not reach it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subc_wire_clean_exit_is_still_a_stop() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -8830,7 +10497,7 @@ mod terminal_history_tests {
     async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
         let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
         let record = dir.join("live-children.json");
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(0, Duration::ZERO),
         );
@@ -8894,7 +10561,7 @@ mod terminal_history_tests {
     /// spending budget without recording the historical restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_restart_increment_path_advances_lifetime_count() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(1, Duration::ZERO),
         );
@@ -8988,7 +10655,7 @@ mod terminal_history_tests {
 
     #[tokio::test]
     async fn deliberately_severed_live_child_records_lifetime_without_spending_restart_budget() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9042,7 +10709,7 @@ mod terminal_history_tests {
 
     #[tokio::test]
     async fn genuine_crash_spends_restart_budget_and_records_lifetime() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9113,7 +10780,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn three_crashes_inside_the_window_stop_the_module_and_name_the_window() {
         let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::ERROR);
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -9194,7 +10861,7 @@ mod terminal_history_tests {
     /// connection to the daemon drops.
     #[tokio::test]
     async fn a_crash_older_than_the_window_frees_its_slot_for_a_later_crash() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -9263,7 +10930,7 @@ mod terminal_history_tests {
     /// operator action answers only the first.
     #[tokio::test]
     async fn an_operator_restart_clears_the_ring_and_leaves_the_ledger_alone() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -9358,7 +11025,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn drain_reap_marks_deliberate_severance_and_records_lifetime_without_budget() {
         let registry = Registry::default();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9424,7 +11091,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn ordinary_drain_reap_does_not_record_a_lifetime_restart() {
         let registry = Registry::default();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9643,6 +11310,7 @@ mod health_tombstone_tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let supervisor_handle = super::SupervisorHandle::new();
         let health = HealthConfig {
+            http: None,
             cadence: Duration::from_secs(30),
             deadline: Duration::from_secs(5),
             failure_threshold: 3,
@@ -9650,7 +11318,7 @@ mod health_tombstone_tests {
             on_failing: HealthAction::Report,
             critical: false,
         };
-        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+        let supervisor = Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
             .with_forwarding(Arc::clone(&forwarding))
             .with_handle(supervisor_handle.clone())
             .with_health_config(health);
@@ -9736,6 +11404,115 @@ mod health_tombstone_tests {
         let (probe_result, ()) = tokio::join!(probe, exhaust_deadline);
         let err = probe_result.expect_err("probe must miss its deadline");
         assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+    }
+
+    async fn run_probe_cycle(harness: &mut ProbeHarness, answer: bool) {
+        let registry = Arc::clone(&harness.module.inner.registry);
+        let snapshot = Arc::clone(&harness.module.inner.snapshot);
+        let process_liveness = super::SupervisorProcessLiveness::default();
+        let mut child = None;
+        let cycle = super::run_health_probe_cycle(
+            &harness.spec,
+            &harness.runtime,
+            &registry,
+            &process_liveness,
+            &snapshot,
+            &mut child,
+        );
+        let peer = async {
+            let frame = harness.module_rx.recv().await.expect("health.check frame");
+            if answer {
+                harness
+                    .forwarding
+                    .complete_module_control_rpc(
+                        harness.module_connection,
+                        frame.header.corr,
+                        Some("health.check"),
+                        ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                            status: HealthStatus::Ok,
+                            detail: None,
+                            metrics: Some(serde_json::json!({"ready": true})),
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                tokio::time::advance(harness.runtime.health.deadline).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(cycle, peer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_probe_is_unknown_until_threshold_and_ok_report_recovers() {
+        let mut harness = probe_harness();
+        // Drive the probe cycle directly with an in-memory wire peer. Stop the
+        // disabled module's monitor so only this test owns lifecycle transitions;
+        // no OS process is launched, and a restart is observed at scheduling.
+        let monitor = harness.module.inner.monitor.lock().unwrap().take().unwrap();
+        monitor.abort();
+        let _ = monitor.await;
+        super::update_snapshot(&harness.module.inner.snapshot, None, |state| {
+            state.enabled = true;
+            state.state = super::ModuleState::Running;
+            state.process_alive = true;
+        })
+        .unwrap();
+
+        run_probe_cycle(&mut harness, true).await;
+        assert_eq!(
+            harness.module.status().unwrap().health.status,
+            super::SupervisorHealthStatus::Ok
+        );
+
+        for failures in 1..harness.runtime.health.failure_threshold {
+            run_probe_cycle(&mut harness, false).await;
+            let status = harness.module.status().unwrap();
+            assert_eq!(status.health.status, super::SupervisorHealthStatus::Unknown);
+            assert_eq!(status.health.consecutive_failures, failures);
+            assert!(status.health.last_probe_ms.is_some());
+            assert!(status.health.detail.unwrap().starts_with("[no-answer]"));
+            assert!(status.health.metrics.is_none());
+            assert_eq!(status.state, super::ModuleState::Running);
+            assert!(status.process_alive);
+            assert_eq!(status.restart_count, 0);
+            assert_eq!(status.lifetime_restarts, 0);
+            assert!(status.health.last_action.is_none());
+            assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_none());
+        }
+
+        run_probe_cycle(&mut harness, true).await;
+        let recovered = harness.module.status().unwrap();
+        assert_eq!(recovered.health.status, super::SupervisorHealthStatus::Ok);
+        assert_eq!(recovered.health.consecutive_failures, 0);
+        assert!(recovered.health.detail.is_none());
+        assert_eq!(
+            recovered.health.metrics,
+            Some(serde_json::json!({"ready": true}))
+        );
+        assert_eq!(recovered.lifetime_restarts, 0);
+
+        for failures in 1..=harness.runtime.health.failure_threshold {
+            run_probe_cycle(&mut harness, false).await;
+            let status = harness.module.status().unwrap();
+            assert_eq!(status.health.consecutive_failures, failures);
+            if failures < harness.runtime.health.failure_threshold {
+                assert_eq!(status.health.status, super::SupervisorHealthStatus::Unknown);
+                assert_eq!(status.state, super::ModuleState::Running);
+                assert_eq!(status.lifetime_restarts, 0);
+                assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_none());
+            } else {
+                assert_eq!(
+                    status.health.status,
+                    super::SupervisorHealthStatus::Unresponsive
+                );
+                assert_eq!(status.state, super::ModuleState::Restarting);
+                assert_eq!(status.restart_count, 1);
+                assert_eq!(status.lifetime_restarts, 1);
+                assert_eq!(status.health.last_action.as_deref(), Some("restart"));
+                assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_some());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -10176,6 +11953,125 @@ mod cgroup_placement_tests {
     use subc_test_support::TestTempDir;
     use tokio::process::Command;
 
+    #[tokio::test]
+    async fn unique_spawn_cgroups_clean_up_across_restarts_and_shutdown() {
+        use super::*;
+        let dir = TestTempDir::new("unique-spawn-cgroups");
+        let root = PathBuf::from(format!(
+            "/sys/fs/cgroup/subc-unique-test-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        if let Err(error) = fs::create_dir(&root) {
+            assert!(
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                "required cgroup test cannot execute: {error}"
+            );
+            eprintln!("SKIP unique_spawn_cgroups_clean_up_across_restarts_and_shutdown: {error}");
+            return;
+        }
+        let placement = subc_cgroup::prepare_at(&root).unwrap().unwrap();
+        let group_count = || {
+            fs::read_dir(root.join("subc-modules"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_type().unwrap())
+                .filter(|kind| kind.is_dir())
+                .count()
+        };
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_cgroup_placement(Some(placement.clone()));
+        let runtime = supervisor.runtime_config();
+        let mut spec = ModuleSpec {
+            module_id: "unique-spawn".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["60".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let spawn = |spec: &ModuleSpec| {
+            spawn_child(
+                spec,
+                None,
+                None,
+                &runtime.stderr_ring,
+                None,
+                &runtime.child_roster,
+                Some(&placement),
+            )
+            .unwrap()
+        };
+        let mut live = spawn(&spec);
+        for _ in 0..3 {
+            // A new process can enter the old slot while retirement is pending.
+            let next = spawn(&spec);
+            assert_ne!(live.module_id, next.module_id);
+            live.start_kill().unwrap();
+            live.wait().await.unwrap();
+            live = next;
+            assert!(
+                live.child.try_wait().unwrap().is_none(),
+                "retiring the old slot must not kill the replacement"
+            );
+            assert_eq!(
+                group_count(),
+                1,
+                "only the live spawn's cgroup should remain"
+            );
+        }
+        supervisor.begin_daemon_shutdown();
+        let reap = tokio::spawn(async move {
+            live.wait().await.unwrap();
+        });
+        supervisor
+            .end_children_for_daemon_shutdown(false, std::future::pending())
+            .await;
+        reap.await.unwrap();
+        assert_eq!(group_count(), 0);
+        // A normal exit uses the same tree-cleanup path as a killed spawn.
+        spec.program = PathBuf::from("/bin/true");
+        spec.args.clear();
+        let fresh_roster = ChildRoster::default();
+        let mut short = spawn_child(
+            &spec,
+            None,
+            None,
+            &runtime.stderr_ring,
+            None,
+            &fresh_roster,
+            Some(&placement),
+        )
+        .unwrap();
+        short.wait().await.unwrap();
+        assert_eq!(group_count(), 0);
+        spec.module_id = "_".repeat(255);
+        let mut long_id = spawn_child(
+            &spec,
+            None,
+            None,
+            &runtime.stderr_ring,
+            None,
+            &fresh_roster,
+            Some(&placement),
+        )
+        .unwrap();
+        long_id.wait().await.unwrap();
+        assert_eq!(
+            group_count(),
+            0,
+            "valid long module IDs must not exceed cgroup NAME_MAX"
+        );
+        fs::remove_dir(root.join("subc-modules")).unwrap();
+        fs::remove_dir(root).unwrap();
+        eprintln!("EXECUTED unique_spawn_cgroups_clean_up_across_restarts_and_shutdown");
+    }
+
     #[test]
     fn failed_parent_cgroup_open_is_a_cgroup_supervision_error() {
         let path = Path::new("/definitely-missing-subc-cgroup");
@@ -10219,11 +12115,15 @@ mod cgroup_placement_tests {
             .module_path(module_id)
             .expect("create scratch module cgroup");
         let child = Command::new("true")
+            .env("XDG_DATA_HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             child,
+            protocol: ModuleProtocol::Subc,
             module_id: module_id.to_string(),
             cgroup_placement: Some(placement),
             stdout_pump: None,
@@ -10236,6 +12136,9 @@ mod cgroup_placement_tests {
             process_identity: None,
             pid,
             roster_guard: None,
+            #[cfg(target_os = "macos")]
+            privacy_exec: None,
+            spawn_failure: None,
         };
 
         child.wait().await.expect("reap short-lived child");
@@ -10746,7 +12649,7 @@ mod job_containment_tests {
     fn fixture(label: &str, module_id: &str) -> Fixture {
         let dir = TestTempDir::new(label);
         let pid_file = dir.join("grandchild.pid");
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -10922,6 +12825,264 @@ mod job_containment_tests {
     }
 }
 
+#[cfg(test)]
+mod privacy_trampoline_configuration_tests {
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_spawn_without_a_configured_trampoline_refuses_by_name() {
+        #[cfg(target_os = "macos")]
+        {
+            let supervisor = super::Supervisor::new(
+                std::sync::Arc::new(crate::Registry::default()),
+                super::RestartPolicy::default(),
+            );
+            let error = supervisor.spawn(spec()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no privacy trampoline configured"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_wrong_trampoline_is_rejected_by_the_startup_probe() {
+        #[cfg(target_os = "macos")]
+        {
+            let supervisor = super::Supervisor::new(
+                std::sync::Arc::new(crate::Registry::default()),
+                super::RestartPolicy::default(),
+            )
+            .with_privacy_trampoline(std::env::current_exe().unwrap());
+            let error = supervisor.spawn(spec()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("binary does not implement the privacy trampoline protocol"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spec() -> super::ModuleSpec {
+        super::ModuleSpec {
+            module_id: "privacy-configuration".into(),
+            program: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: subc_control::ModuleProtocol::None,
+            overlap: super::ModuleOverlap::Exclusive,
+        }
+    }
+}
+
+#[cfg(test)]
+mod privacy_exec_boundary_tests {
+    #[cfg(target_os = "macos")]
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+    };
+
+    /// Unit-test-only pause at the actual early image read, not at a later
+    /// status read. Production supervisors never inspect this environment key.
+    #[cfg(target_os = "macos")]
+    pub(super) fn before_image_sample(spec: &ModuleSpec, pid: u32) {
+        if let Some((_, path)) = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "SUBC_TEST_PRIVACY_SAMPLE_BARRIER")
+        {
+            let mut barrier = TcpStream::connect(path).unwrap();
+            barrier
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            barrier.write_all(&pid.to_ne_bytes()).unwrap();
+            let mut release = [0];
+            barrier.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spec(program: &str, args: &[&str]) -> ModuleSpec {
+        ModuleSpec {
+            module_id: "privacy-boundary".into(),
+            program: program.into(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: ModuleOverlap::Exclusive,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn accept(listener: TcpListener) -> TcpStream {
+        // Socket readiness, not elapsed time, establishes both pause points.
+        let listener = tokio::net::TcpListener::from_std({
+            listener.set_nonblocking(true).unwrap();
+            listener
+        })
+        .unwrap();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = stream.into_std().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_roster_withholds_a_nonnull_trampoline_image_until_exec_confirmation() {
+        #[cfg(target_os = "macos")]
+        {
+            let root = subc_test_support::TestTempDir::new("privacy-roster-barrier");
+            // Loopback sockets also work when the replay adapter's TMPDIR is
+            // longer than Darwin's Unix-domain socket path limit.
+            let exec_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let sample_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let record = root.join("live-children.json");
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_live_children_record(&record);
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let mut spec = spec("/bin/sleep", &["30"]);
+            spec.env = vec![
+                (
+                    "SUBC_TEST_PRIVACY_EXEC_BARRIER".into(),
+                    exec_listener.local_addr().unwrap().to_string(),
+                ),
+                (
+                    "SUBC_TEST_PRIVACY_SAMPLE_BARRIER".into(),
+                    sample_listener.local_addr().unwrap().to_string(),
+                ),
+            ];
+            let spawn = tokio::task::spawn_blocking(move || {
+                spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap()
+            });
+            let mut sample = accept(sample_listener).await;
+            let mut pid = [0; 4];
+            sample.read_exact(&mut pid).unwrap();
+            let pid = u32::from_ne_bytes(pid);
+            let mut exec = accept(exec_listener).await;
+            let mut ready = [0];
+            exec.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"R");
+            // The early read is guaranteed to see a real, non-null trampoline
+            // image: the fixture has reached its barrier and cannot exec yet.
+            let trampoline = subc_os::file_identity(&test_privacy_trampoline()).unwrap();
+            assert_eq!(
+                observe_spawned_image(pid).unwrap().executable,
+                Some(trampoline)
+            );
+            sample.write_all(b"X").unwrap();
+            let mut child = spawn.await.unwrap();
+            let early = crate::live_children::read_record(&record).unwrap();
+            assert_eq!(early.len(), 1);
+            assert_eq!(early[0].pid, pid);
+            assert_eq!(
+                early[0].executable, None,
+                "unconfirmed trampoline image entered the roster"
+            );
+            assert!(child.report_ready.get().is_none());
+            // The barrier's duration is unrelated to the production five-second
+            // exec budget. Start the test's confirmation budget upon release.
+            child.privacy_exec.as_mut().unwrap().deadline =
+                tokio::time::Instant::now() + Duration::from_secs(30);
+            exec.write_all(b"X").unwrap();
+            child.confirm_privacy_exec().await;
+            assert_eq!(child.spawn_failure, None);
+            assert!(child.report_ready.get().is_some());
+            let confirmed = crate::live_children::read_record(&record).unwrap();
+            let module = subc_os::file_identity(std::path::Path::new("/bin/sleep")).unwrap();
+            assert_ne!(module, trampoline);
+            assert_eq!(confirmed[0].executable, Some(module.into()));
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+            child.release_roster();
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_already_exited_121_in_try_wait_is_a_module_exit_not_a_trampoline_refusal() {
+        #[cfg(target_os = "macos")]
+        {
+            let registry = Arc::new(Registry::default());
+            let policy = RestartPolicy::new(0, Duration::ZERO);
+            let supervisor = Supervisor::new_for_test(Arc::clone(&registry), policy);
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let spec = spec("/bin/sh", &["-c", "exit 121"]);
+            // Drive spawn and confirmation separately instead of starting the
+            // monitor. WNOWAIT observes a real exit without consuming its status,
+            // so confirmation's first try_wait must take the already-exited arm.
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            let pid = child.pid;
+            tokio::task::spawn_blocking(move || {
+                subc_os::fork_exec_test::wait_for_child_exit_without_reaping(pid)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            child.privacy_exec.as_mut().unwrap().deadline =
+                tokio::time::Instant::now() + Duration::from_secs(30);
+            let status = child.wait().await.unwrap();
+            assert_eq!(status.code(), Some(121));
+            assert!(child.privacy_exec.is_none());
+            assert!(
+                child.report_ready.get().is_none(),
+                "an exited module must not publish a live pid"
+            );
+            let report = classify_reaped_child_exit(&snapshot, &child, &status);
+            on_child_exit(
+                &spec,
+                policy,
+                &registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                &runtime.spawn_events,
+                &runtime.child_roster,
+                report,
+            )
+            .await;
+            let state = lock_snapshot(&snapshot).unwrap();
+            assert_eq!(state.state, ModuleState::Failed);
+            assert_eq!(state.last_exit.as_ref().unwrap().code, Some(121));
+            assert_eq!(state.reported_pid(), None);
+            drop(state);
+            let history = runtime.terminal_ring.lock().unwrap().snapshot();
+            assert_eq!(history.entries.len(), 1);
+            let terminal = &history.entries[0];
+            assert_eq!(terminal.exit_code, Some(121));
+            assert_eq!(terminal.exit_kind, subc_control::TerminalExitKind::Crash);
+            assert_eq!(terminal.disposition, TerminalDisposition::Failed);
+            assert_eq!(
+                terminal.disposition_detail.as_deref(),
+                Some(policy.budget_exhausted_detail().as_str()),
+                "module exit 121 was classified as a trampoline refusal: {terminal:?}"
+            );
+            assert_eq!(child.spawn_failure, None);
+            child.release_roster();
+        }
+    }
+}
+
 /// The daemon's real spawn path hands a subc-wire child its launch nonce on
 /// descriptor 3, without an environment copy. The shell records the nonce
 /// and its environment after exec so these tests observe the real handover.
@@ -10963,6 +13124,11 @@ mod launch_nonce_descriptor_tests {
         let handle = SupervisorHandle::new();
         let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
         let roster = ChildRoster::default();
+        #[cfg(target_os = "macos")]
+        {
+            let path = super::test_privacy_trampoline();
+            roster.set_privacy_trampoline(super::probe_privacy_trampoline(&path).map(|()| path));
+        }
         let child = super::spawn_child_in_slot(
             &spec,
             None,
@@ -11076,7 +13242,7 @@ mod cgroup_containment_tests {
             eprintln!("SKIP {test_name}: cgroup.kill unavailable (kernel < 5.14)");
             return;
         }
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         )

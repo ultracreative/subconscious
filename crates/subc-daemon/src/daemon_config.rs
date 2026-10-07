@@ -33,10 +33,17 @@ pub(crate) const CHILD_LOG_ALARM_SEGMENT_MB_ENV: &str = "CK_LOG_ALARM_SEGMENT_MB
 
 /// Top-level daemon config sections that rescan cannot apply. The daemon
 /// snapshots these sections at start and reports later rescan changes as
-/// `restart_required`. Setup intersects this set with sections core
-/// configuration would write so a dry-run can flag a restart before the
-/// config file exists on disk. Match this enum exhaustively so a new section
-/// cannot be added without a comparison.
+/// `restart_required`. Setup also uses this set, when it observes the system
+/// before writing config (a dry run included): it lists the dotted keys core
+/// setup would write, treating a missing config file as empty so every
+/// desired key counts as pending, and, when the daemon is live, flags each key
+/// whose top-level section is one of these (`restart_required_from_pending_keys`
+/// in subc-core). It cannot ask the daemon instead, because the new sections
+/// are not on disk yet. Match this enum
+/// exhaustively so a new section cannot be added without a comparison.
+/// Per-module `health` (including `health.http`, cadence and deadline) is not
+/// in this set: rescan applies it live without a module restart. Launch-spec
+/// fields such as `protocol` take effect at the next spawn instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartRequiredSection {
     Port,
@@ -464,6 +471,8 @@ struct RawRestartConfig {
 #[derive(Debug, Deserialize)]
 struct RawHealthConfig {
     #[serde(default)]
+    http: Option<String>,
+    #[serde(default)]
     cadence_ms: Option<u64>,
     #[serde(default)]
     deadline_ms: Option<u64>,
@@ -739,9 +748,10 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         .modules
         .into_iter()
         .map(|(module_id, module)| {
+            let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
             let health = module
                 .health
-                .map(|health| parse_health_config(health, path, &module_id))
+                .map(|health| parse_health_config(health, path, &module_id, protocol))
                 .transpose()?
                 .unwrap_or_default();
             if let Err(reason) = crate::registry::module_id_path_hazard(&module_id) {
@@ -781,7 +791,6 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                     "launch_nonce_env is deprecated and ignored; nonce delivery is determined by the platform"
                 );
             }
-            let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
             let overlap = parse_module_overlap(module.overlap.as_deref(), path, &module_id)?;
             // The spawn role is set by the supervisor on a swap candidate and
             // nowhere else; a configured value would put the long swap warm-up
@@ -1202,7 +1211,21 @@ fn parse_health_config(
     raw: RawHealthConfig,
     path: &Path,
     module_id: &str,
+    protocol: ModuleProtocol,
 ) -> Result<HealthConfig, DaemonConfigError> {
+    if let Some(url) = raw.http.as_deref() {
+        let reason = if protocol != ModuleProtocol::None {
+            Some("is valid only for protocol: \"none\" modules".to_string())
+        } else {
+            crate::supervise::parse_http_probe_url(url).err()
+        };
+        if let Some(reason) = reason {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!("module '{module_id}' health.http {reason}"),
+            });
+        }
+    }
     let defaults = HealthConfig::default();
     let cadence = positive_millis(
         raw.cadence_ms,
@@ -1230,6 +1253,7 @@ fn parse_health_config(
     };
 
     Ok(HealthConfig {
+        http: raw.http,
         cadence,
         deadline,
         failure_threshold,
@@ -2559,13 +2583,34 @@ mod tests {
         )
         .unwrap();
 
-        let health = config.modules[0].health;
+        let health = &config.modules[0].health;
         assert_eq!(health.cadence, std::time::Duration::from_millis(100));
         assert_eq!(health.deadline, std::time::Duration::from_millis(20));
         assert_eq!(health.failure_threshold, 2);
         assert_eq!(health.on_degraded, HealthAction::Report);
         assert_eq!(health.on_failing, HealthAction::Restart);
         assert!(health.critical);
+    }
+
+    #[test]
+    fn http_health_refuses_non_loopback_https_and_wire_modules() {
+        for (protocol, url) in [
+            ("none", "http://example.com/healthz"),
+            ("none", "https://127.0.0.1/healthz"),
+            ("subc", "http://127.0.0.1/healthz"),
+        ] {
+            let doc = serde_json::json!({"version": 1, "modules": {"bus": {
+                "program": "nats-server", "protocol": protocol, "health": {"http": url}
+            }}})
+            .to_string();
+            let error = parse_doc(&doc, Path::new("test.jsonc"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("bus") && error.contains("health.http"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

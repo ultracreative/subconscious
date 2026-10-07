@@ -17,6 +17,22 @@ const session = log.child("historian").withSession("pi", "01a0b7fc-bba1-7f60-aa2
 session.info("trigger fired", { reason: "force_band", usage: "93.9%" });
 ```
 
+## Installing and developing
+
+The published package contains compiled ESM and declarations for Node 18+ and
+Bun. A fresh checkout needs the sibling store built **before installing log**:
+the development lockfile uses the local store package, whose exports point at
+its compiled `dist/` files. From the repository root, run:
+
+```sh
+(cd clients/store && bun install --frozen-lockfile && bun run build)
+(cd clients/log && bun install --frozen-lockfile && bun run typecheck && bun test)
+```
+
+CI and npm releases use the same build-before-install order with frozen
+lockfiles. Consumers of the published tarball resolve the versioned npm
+dependency, not the local sibling.
+
 ## The line
 
 ```

@@ -519,7 +519,7 @@ struct ModuleBreakerState {
     /// what makes the probe EXACTLY ONE: the flag is set under the same lock
     /// that read the cooldown, so concurrent opens arriving at the moment the
     /// cooldown expires cannot all decide that they are the probe.
-    probe_in_flight: bool,
+    probe_in_flight: Option<Arc<()>>,
 }
 
 /// What the breaker decided for one `route.open`, before any relay work.
@@ -549,6 +549,7 @@ enum RouteBindAdmission<'a> {
 struct RouteBindBreakerGuard<'a> {
     breakers: RouteBindBreakers,
     module_id: &'a str,
+    probe_token: Option<Arc<()>>,
     settled: bool,
 }
 
@@ -565,8 +566,12 @@ impl RouteBindBreakerGuard<'_> {
     /// COUNTS TOWARD OPENING.
     fn record_timeout(&mut self, threshold: u32, cooldown: Duration) -> Option<BreakerOpened> {
         self.settled = true;
-        self.breakers
-            .record_timeout(self.module_id, threshold, cooldown)
+        self.breakers.record_timeout(
+            self.module_id,
+            self.probe_token.as_ref(),
+            threshold,
+            cooldown,
+        )
     }
 
     /// Everything else: the module REJECTED the bind, its connection went away
@@ -579,14 +584,16 @@ impl RouteBindBreakerGuard<'_> {
     /// neither increment nor reset the count -- they only release a probe slot.
     fn record_inconclusive(&mut self) {
         self.settled = true;
-        self.breakers.record_inconclusive(self.module_id);
+        self.breakers
+            .record_inconclusive(self.module_id, self.probe_token.as_ref());
     }
 }
 
 impl Drop for RouteBindBreakerGuard<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.breakers.record_inconclusive(self.module_id);
+            self.breakers
+                .record_inconclusive(self.module_id, self.probe_token.as_ref());
         }
     }
 }
@@ -611,23 +618,24 @@ impl RouteBindBreakers {
     /// Decide whether this `route.open` may attempt its relay. Takes the map
     /// lock and nothing else, and never awaits.
     fn admit<'a>(&self, module_id: &'a str) -> RouteBindAdmission<'a> {
-        let admitted = |probe| RouteBindAdmission::Admitted {
+        let admitted = |probe_token: Option<Arc<()>>| RouteBindAdmission::Admitted {
+            probe: probe_token.is_some(),
             guard: RouteBindBreakerGuard {
                 breakers: self.clone(),
                 module_id,
+                probe_token,
                 settled: false,
             },
-            probe,
         };
 
         let mut modules = self.lock();
         let Some(state) = modules.get_mut(module_id) else {
-            return admitted(false);
+            return admitted(None);
         };
         let Some(cooldown_until) = state.cooldown_until else {
-            return admitted(false);
+            return admitted(None);
         };
-        if state.probe_in_flight {
+        if state.probe_in_flight.is_some() {
             return RouteBindAdmission::Refused {
                 consecutive_timeouts: state.consecutive_timeouts,
                 retry_in: Duration::ZERO,
@@ -642,8 +650,9 @@ impl RouteBindBreakers {
                 probe_in_flight: false,
             };
         }
-        state.probe_in_flight = true;
-        admitted(true)
+        let token = Arc::new(());
+        state.probe_in_flight = Some(Arc::clone(&token));
+        admitted(Some(token))
     }
 
     fn record_accepted(&self, module_id: &str) -> bool {
@@ -655,14 +664,17 @@ impl RouteBindBreakers {
     fn record_timeout(
         &self,
         module_id: &str,
+        probe_token: Option<&Arc<()>>,
         threshold: u32,
         cooldown: Duration,
     ) -> Option<BreakerOpened> {
         let mut modules = self.lock();
         let state = modules.entry(module_id.to_string()).or_default();
         let was_open = state.cooldown_until.is_some();
-        let was_probe = state.probe_in_flight;
-        state.probe_in_flight = false;
+        let was_probe = Self::owns_probe(state, probe_token);
+        if was_probe {
+            state.probe_in_flight = None;
+        }
         state.consecutive_timeouts = state.consecutive_timeouts.saturating_add(1);
         if state.consecutive_timeouts < threshold {
             return None;
@@ -674,9 +686,22 @@ impl RouteBindBreakers {
         })
     }
 
-    fn record_inconclusive(&self, module_id: &str) {
+    fn owns_probe(state: &ModuleBreakerState, token: Option<&Arc<()>>) -> bool {
+        // A relay can finish after the breaker was reset or after it opened
+        // again and started a new probe. Only the guard whose token matches the
+        // active probe may release it, so a late relay never frees a newer probe.
+        state
+            .probe_in_flight
+            .as_ref()
+            .zip(token)
+            .is_some_and(|(active, token)| Arc::ptr_eq(active, token))
+    }
+
+    fn record_inconclusive(&self, module_id: &str, probe_token: Option<&Arc<()>>) {
         if let Some(state) = self.lock().get_mut(module_id) {
-            state.probe_in_flight = false;
+            if Self::owns_probe(state, probe_token) {
+                state.probe_in_flight = None;
+            }
         }
     }
 
@@ -720,7 +745,7 @@ impl RouteBindBreakers {
                         "consecutive_timeouts": state.consecutive_timeouts,
                         "cooldown_remaining_ms":
                             cooldown_until.saturating_duration_since(now).as_millis() as u64,
-                        "probe_in_flight": state.probe_in_flight,
+                        "probe_in_flight": state.probe_in_flight.is_some(),
                     }),
                 ))
             })
@@ -1544,7 +1569,21 @@ impl ControlHandler {
             (module_id, routes, reason, terminal)
         });
         let registrations = self.deregister_connection(connection_id);
-        let cleanup = self.forwarding.cleanup_connection_counted(connection_id);
+        let cleanup = if crash_closed.is_some() {
+            self.forwarding.cleanup_connection_counted(connection_id)
+        } else {
+            // A module connection's teardown needs the count of abandoned
+            // route.bind relays for its route.closed notice below. Any other
+            // connection, such as a client's, sends no such notice and needs
+            // only its routes released, so it uses the route-only wrapper and
+            // reports zero.
+            self.forwarding
+                .cleanup_connection(connection_id)
+                .map(|released| crate::forwarding::ConnectionCleanup {
+                    released,
+                    abandoned_relays: 0,
+                })
+        };
         // The route.closed push waits for forwarding teardown because only
         // teardown knows how many pending route.bind relays it aborted. It still
         // goes out before the GOODBYEs for the released routes, and its targets
@@ -1734,6 +1773,21 @@ impl ControlHandler {
             corr = frame.header.corr,
             "handling HELLO"
         );
+        // A module connection has one identity for its entire lifetime. A second
+        // registration would leave the old registry owner behind while replacing
+        // its forwarding endpoint and launch nonce.
+        if self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_some()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_hello",
+                "connection is already registered as a module",
+            )?]);
+        }
         let hello_value = match serde_json::from_slice::<serde_json::Value>(&frame.body) {
             Ok(value) => value,
             Err(err) => {
@@ -1993,7 +2047,11 @@ impl ControlHandler {
                 }
                 return Ok(vec![control_error_frame(
                     &frame,
-                    forwarding_error_code(&err),
+                    if matches!(err, ForwardingError::ConnectionRoleConflict { .. }) {
+                        "invalid_hello"
+                    } else {
+                        forwarding_error_code(&err)
+                    },
                     err.to_string(),
                 )?]);
             }
@@ -2483,7 +2541,11 @@ impl ControlHandler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .describe(&owner, &scope_ref);
         let owner_configured = match &owner {
-            Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+            // Ask whether the owner is configured (`is_configured`), not
+            // whether it is on the roster (`get(..).is_some()`): a supervised
+            // module's process can register and describe a scope before the
+            // supervisor has put it on the roster.
+            Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
             _ => false,
         };
         let response = ModuleControlResponseToModule::ScopeDescribe {
@@ -2542,6 +2604,27 @@ impl ControlHandler {
                 &frame,
                 "invalid_capability_grammar",
                 err.to_string(),
+            )?]);
+        }
+
+        // Updates must honor the same reserved owner as initial registration;
+        // otherwise an empty HELLO could acquire the claim after admission.
+        let mut conflicts = self
+            .capability_evaluator
+            .reserved_hello_refusals(&candidate.module_id, candidate.capabilities.as_ref());
+        if let Some(conflict) = conflicts.first() {
+            let message = format!(
+                "capability '{}' is reserved for module_id '{}'; claimant '{}' was refused",
+                conflict.capability, conflict.claimants[0], candidate.module_id
+            );
+            for conflict in &mut conflicts {
+                conflict.source = DuplicateClaimSource::CatalogUpdate;
+            }
+            log_duplicate_claim_events(conflicts);
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_capability",
+                message,
             )?]);
         }
 
@@ -2756,17 +2839,23 @@ impl ControlHandler {
             probe_in_flight,
             "route.open refused by open bind-relay breaker"
         );
+        // Say what a caller can act on. An open bind-relay breaker means the
+        // module timed out accepting several new routes in a row. The module
+        // is still running and its established routes keep working; only new
+        // route.open requests are refused until the cooldown ends and one
+        // test route (the probe) gets through. A message that only counts
+        // failed relays reads as "the module is down" to a worker that sees it.
         let detail = if probe_in_flight {
-            "one probe bind is already in flight; retry once it settles".to_string()
+            "one test route is already being tried; retry once it settles".to_string()
         } else {
-            format!("not relaying for another {retry_in:?}")
+            format!("retrying new routes in {}s", retry_in.as_secs().max(1))
         };
         control_error_frame(
             frame,
             "module_timeout",
             format!(
-                "module_id '{module_id}' failed {consecutive_timeouts} consecutive route.bind \
-                 relays; {detail}"
+                "module '{module_id}' is slow to accept new routes ({consecutive_timeouts} \
+                 timed out in a row); {detail}; its established routes are unaffected"
             ),
         )
     }
@@ -2911,6 +3000,18 @@ impl ControlHandler {
             scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
+        if self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_some()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_request",
+                "module connections cannot open client routes",
+            )?]);
+        }
         debug!(
             connection_id = ctx.connection_id.get(),
             corr = frame.header.corr,
@@ -3288,14 +3389,27 @@ impl ControlHandler {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
-                    Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+                    // A reserved owner counts as configured from before its
+                    // process is spawned (see `SupervisorHandle::is_configured`).
+                    // So an owner that has not synced its scopes yet is refused
+                    // as retryable (`scope_not_synced`), not as one that will
+                    // never sync.
+                    Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
                     _ => false,
                 };
                 let admitted = self
                     .scopes
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .admit(&principal, &target_module_id, &selector, owner_configured);
+                    .admit(&principal, &target_module_id, &selector, owner_configured)
+                    .and_then(|admission| {
+                        crate::scopes::check_target_flow_support(
+                            &admission.stamp,
+                            &target_module_id,
+                            registration.manifest.capabilities.as_ref(),
+                        )?;
+                        Ok(admission)
+                    });
                 match admitted {
                     Ok(admission) => (
                         Some(BoundScope {
@@ -3452,6 +3566,37 @@ impl ControlHandler {
         } = pending;
         let mut reservation =
             RouteBindReservationGuard::new(Arc::clone(&self.forwarding), endpoint, relay_corr);
+
+        // Reserving egress can wait while a module reconnects or a swap cuts
+        // over. Check the connection the relay actually captured, not the
+        // earlier by-id lookup: a flow-aware module must not vouch for a
+        // replacement. The captured sink cannot turn into another connection.
+        if let Some(stamp) = scope_stamp
+            .as_ref()
+            .filter(|stamp| stamp.attributes.flow_id.is_some())
+        {
+            let relay_registration = self
+                .registry
+                .get_module_by_connection(endpoint.connection_id)
+                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+            if let Err(refusal) = crate::scopes::check_target_flow_support(
+                stamp,
+                &target_module_id,
+                relay_registration
+                    .as_ref()
+                    .and_then(|registration| registration.manifest.capabilities.as_ref()),
+            ) {
+                reservation.release_and_disarm();
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    refusal.code,
+                    refusal.code,
+                    refusal.message,
+                )?]);
+            }
+        }
 
         debug!(
             connection_id = ctx.connection_id.get(),
@@ -3930,13 +4075,16 @@ impl ControlHandler {
 
         let mut modules = Vec::with_capacity(selected.len());
         for module in selected.drain(..) {
-            let status = module.status().map_err(|err| {
-                RouterError::backend(
-                    0,
-                    frame.header.corr,
-                    format!("failed to read supervisor status: {err}"),
-                )
-            })?;
+            let (status, observed_image) = module
+                .status_and_running_image_agreement()
+                .await
+                .map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        format!("failed to read supervisor status: {err}"),
+                    )
+                })?;
             let module_declared = self
                 .registry
                 .get_module(&status.module_id)
@@ -3947,10 +4095,10 @@ impl ControlHandler {
             #[cfg(test)]
             let running_image = match &self.provenance_probe_override {
                 Some(result) => result.clone(),
-                None => module.running_image_agreement().await,
+                None => observed_image,
             };
             #[cfg(not(test))]
-            let running_image = module.running_image_agreement().await;
+            let running_image = observed_image;
             modules.push(SupervisorModuleProvenance {
                 module_id: status.module_id,
                 module_declared,
@@ -4503,11 +4651,17 @@ impl ControlHandler {
             else {
                 continue;
             };
-            let configuration_changed = *current_spec != configured_module.module_spec()
-                || *current_health != configured_module.health;
+            // Compare the whole launch spec so a future launch field cannot
+            // accidentally become a live-only policy change. Health is stored
+            // separately and applies live without replacing the process.
+            let launch_changed = *current_spec != configured_module.module_spec();
+            let configuration_changed =
+                launch_changed || *current_health != configured_module.health;
             let enabled_changed = *current_enabled != configured_module.enabled;
             if configuration_changed {
                 configuration_changes.insert(module_id.clone());
+            }
+            if launch_changed {
                 changed_pending_reload.push(module_id.clone());
             }
             if enabled_changed {
@@ -4596,7 +4750,7 @@ impl ControlHandler {
                 module
                     .update_configuration(
                         configured_module.module_spec(),
-                        configured_module.health,
+                        configured_module.health.clone(),
                         configured_module.drain_timeout_ms,
                     )
                     .await
@@ -4631,7 +4785,7 @@ impl ControlHandler {
                 .supervise_configured_with_health(
                     configured_module.module_spec(),
                     configured_module.enabled,
-                    configured_module.health,
+                    configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
                 )
@@ -5313,18 +5467,11 @@ impl ControlHandler {
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
         debug!(connection_id = connection_id.get(), "handling GOODBYE");
-        let registrations = self
-            .deregister_connection(connection_id)
+        // GOODBYE ends the connection's logical session even when its socket
+        // stays open. Use disconnect teardown so verdicts, client notices and
+        // scope authority are released at the same lifecycle boundary.
+        self.cleanup_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
-        let released_routes = self
-            .forwarding
-            .cleanup_connection(connection_id)
-            .map_err(RouterError::Forwarding)?;
-        self.emit_route_goodbyes(released_routes);
-        // Notify only after forwarding teardown completes (see cleanup_connection).
-        if !registrations.is_empty() {
-            crate::supervise::notify_registration_release();
-        }
         Ok(Vec::new())
     }
 }
@@ -5914,6 +6061,7 @@ fn control_response_body_frame<T: Serialize>(
 /// Pin identity here the moment a consumer branches on a specific code.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
+        ForwardingError::ConnectionRoleConflict { .. } => "invalid_request",
         ForwardingError::NoModuleConnection => "target_unavailable",
         ForwardingError::ModuleReloading { .. } => "module_reloading",
         ForwardingError::ClientRouteChannelExhausted { .. }
@@ -6065,6 +6213,64 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rescan_health_only_is_live_but_launch_edits_need_reload() {
+        let dir = subc_test_support::TestTempDir::new("rescan-live-health");
+        let path = dir.join("subc.jsonc");
+        std::fs::write(&path, serde_json::json!({"version":1,"modules":{"stock":{
+            "program":"/bin/sleep","args":["60"],"protocol":"none",
+            "env":{"XDG_DATA_HOME":dir.path(),"XDG_RUNTIME_DIR":dir.path(),"XDG_CONFIG_HOME":dir.path()}
+        }}}).to_string()).unwrap();
+        let mut configured = crate::daemon_config::load(&path)
+            .unwrap()
+            .unwrap()
+            .modules
+            .pop()
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::Registry::default());
+        let handle = crate::SupervisorHandle::new();
+        let supervisor = crate::Supervisor::new(registry.clone(), crate::RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .supervise_configured_with_health(
+                configured.module_spec(),
+                true,
+                configured.health.clone(),
+                None,
+                configured.restart,
+            )
+            .unwrap();
+        let handler = super::ControlHandler::new(registry).with_supervisor(handle);
+        let before = module.status().unwrap().pid;
+        configured.health.http = Some("http://127.0.0.1:1/healthz".into());
+        configured.health.cadence = std::time::Duration::from_secs(3600);
+        let health_only = handler
+            .reconcile_supervised_modules(&supervisor, vec![configured.clone()], false)
+            .await
+            .unwrap();
+        assert!(
+            health_only.changed_pending_reload.is_empty(),
+            "health policy is already applied live"
+        );
+        assert_eq!(module.status().unwrap().pid, before);
+        assert_eq!(
+            module.configuration().unwrap().1.http,
+            configured.health.http
+        );
+        configured.args = vec!["61".into()];
+        let launch = handler
+            .reconcile_supervised_modules(&supervisor, vec![configured], false)
+            .await
+            .unwrap();
+        assert_eq!(launch.changed_pending_reload, ["stock"]);
+        assert_eq!(
+            module.status().unwrap().pid,
+            before,
+            "a launch edit is stored until reload"
+        );
+        module.drain().await.unwrap();
+    }
     use std::{
         collections::BTreeMap,
         fmt,
@@ -6194,6 +6400,9 @@ mod tests {
         // recover at all — the worst thing to advertise as retryable, since every
         // client would storm a daemon that will never answer.
         let permanent = [
+            ForwardingError::ConnectionRoleConflict {
+                connection_id: ConnectionId::new(1),
+            },
             ForwardingError::ClientRouteChannelExhausted {
                 connection_id: ConnectionId::new(1),
             },
@@ -6721,7 +6930,7 @@ mod tests {
     {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::clone(&registry),
             RestartPolicy::new(1, Duration::from_millis(10)),
         )
@@ -6833,7 +7042,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
@@ -6905,7 +7114,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
@@ -7293,6 +7502,150 @@ mod tests {
             0,
             "a reserved capability refusal must not leave a catalog entry"
         );
+    }
+
+    #[test]
+    fn stale_relay_settlement_cannot_release_the_half_open_probe() {
+        for settlement in ["timeout", "inconclusive", "drop"] {
+            let breakers = RouteBindBreakers::default();
+            let RouteBindAdmission::Admitted {
+                guard: mut old,
+                probe: false,
+            } = breakers.admit("prov")
+            else {
+                panic!("ordinary relay admitted")
+            };
+            let RouteBindAdmission::Admitted {
+                guard: mut opener, ..
+            } = breakers.admit("prov")
+            else {
+                panic!("second relay admitted")
+            };
+            assert!(
+                !opener
+                    .record_timeout(1, Duration::ZERO)
+                    .unwrap()
+                    .reopened_after_probe
+            );
+            let RouteBindAdmission::Admitted {
+                guard: mut probe,
+                probe: true,
+            } = breakers.admit("prov")
+            else {
+                panic!("one cooldown probe admitted")
+            };
+            match settlement {
+                "timeout" => assert!(
+                    !old.record_timeout(1, Duration::ZERO)
+                        .unwrap()
+                        .reopened_after_probe
+                ),
+                "inconclusive" => old.record_inconclusive(),
+                "drop" => drop(old),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    breakers.admit("prov"),
+                    RouteBindAdmission::Refused {
+                        probe_in_flight: true,
+                        ..
+                    }
+                ),
+                "{settlement} of a pre-open relay cannot release the real probe"
+            );
+            assert!(
+                probe
+                    .record_timeout(1, Duration::ZERO)
+                    .unwrap()
+                    .reopened_after_probe
+            );
+            assert!(matches!(
+                breakers.admit("prov"),
+                RouteBindAdmission::Admitted { probe: true, .. }
+            ));
+        }
+        let breakers = RouteBindBreakers::default();
+        let admit = || match breakers.admit("prov") {
+            RouteBindAdmission::Admitted { guard, .. } => guard,
+            _ => panic!("relay admitted"),
+        };
+        admit().record_timeout(1, Duration::ZERO);
+        let mut old_probe = admit();
+        breakers.reset_for_new_module_connection("prov");
+        admit().record_timeout(1, Duration::ZERO);
+        let _new_probe = admit();
+        old_probe.record_inconclusive();
+        assert!(matches!(
+            breakers.admit("prov"),
+            RouteBindAdmission::Refused {
+                probe_in_flight: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_update_refuses_reserved_capabilities_for_active_and_candidate() {
+        for candidate in [false, true] {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry)).with_capability_config(
+                [("vault".to_string(), true), ("squatter".to_string(), true)],
+                BTreeMap::from([("credentials-provider/v1".to_string(), "vault".to_string())]),
+            );
+            let conn = ConnectionId::new(77);
+            let (ctx, mut rx) = route_ctx(conn);
+            let initial = capability_manifest("squatter", &[], &[]);
+            if candidate {
+                registry
+                    .register_candidate_with_control_ops(
+                        initial.clone(),
+                        PROTOCOL_VERSION,
+                        conn,
+                        module_baseline_control_ops(),
+                    )
+                    .unwrap();
+                handler
+                    .forwarding
+                    .register_candidate_module_connection(
+                        conn,
+                        "squatter".to_string(),
+                        PROTOCOL_VERSION,
+                        manifest_concurrency(&initial),
+                        ctx.egress.clone(),
+                    )
+                    .unwrap();
+            } else {
+                hello_via_sink(
+                    &handler,
+                    &ctx,
+                    &mut rx,
+                    hello_frame_with_manifest(initial.clone(), 1),
+                )
+                .await;
+            }
+            let response = handler
+                .handle_control_frame(
+                    &ctx,
+                    catalog_update_with_capabilities_frame(
+                        2,
+                        capability_manifest("squatter", &["credentials-provider/v1"], &[])
+                            .capabilities
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse_error(&response[0])["code"], "reserved_capability");
+            assert_eq!(
+                registry
+                    .get_module_by_connection(conn)
+                    .unwrap()
+                    .unwrap()
+                    .manifest,
+                initial
+            );
+        }
     }
 
     #[test]
@@ -9325,7 +9678,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(
                     std::env::temp_dir()
@@ -9480,7 +9833,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(std::env::temp_dir().join(format!(
                     "subc-route-open-refusal-info-{}",
@@ -9567,7 +9920,7 @@ mod tests {
     ) -> (SupervisorHandle, crate::supervise::SupervisedModule) {
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(std::env::temp_dir().join(format!(
                     "subc-route-outage-{module_id}-{}",
@@ -9847,7 +10200,7 @@ mod tests {
             std::process::id()
         ));
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .supervise_configured(
@@ -9947,9 +10300,10 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let supervisor_handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(Arc::clone(&registry), crate::RestartPolicy::default())
-            .with_forwarding(Arc::clone(&forwarding))
-            .with_handle(supervisor_handle.clone());
+        let supervisor =
+            Supervisor::new_for_test(Arc::clone(&registry), crate::RestartPolicy::default())
+                .with_forwarding(Arc::clone(&forwarding))
+                .with_handle(supervisor_handle.clone());
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
@@ -10155,6 +10509,67 @@ mod tests {
         assert_eq!(responses[0].header.ty, FrameType::Error);
         assert_eq!(parse_error(&responses[0])["code"], "invalid_hello");
         assert!(registry.get_module("aft-second").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn second_hello_preserves_registration_routes_and_launch_nonce() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(registry.clone(), forwarding.clone());
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(101));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame_with_nonce("alpha", PROTOCOL_VERSION, 1, Some("alpha-nonce")),
+        )
+        .await;
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(202));
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_ctx.connection_id,
+                client_ctx.egress.clone(),
+                2,
+                "alpha",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_ctx.connection_id,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        client_rx.try_recv().unwrap();
+        for module_id in ["beta", "alpha"] {
+            let replies = handler
+                .handle_control_frame(
+                    &module_ctx,
+                    hello_frame_with_nonce(module_id, PROTOCOL_VERSION, 3, Some("replacement")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replies.len(), 1, "second HELLO must be refused");
+            assert_eq!(parse_error(&replies[0])["code"], "invalid_hello");
+        }
+        assert_eq!(registry.list_modules().unwrap().1.len(), 1);
+        assert!(registry.get_module("beta").unwrap().is_none());
+        assert!(matches!(
+            forwarding
+                .lookup_data_route(
+                    client_ctx.connection_id,
+                    pending.client_channel,
+                    pending.client_epoch,
+                )
+                .unwrap(),
+            DataRoute::Client(DataRouteState::Bound(_))
+        ));
+        assert!(handler
+            .hello_launch_nonces
+            .lock()
+            .unwrap()
+            .presented(module_ctx.connection_id, Some("alpha-nonce")));
+        assert!(module_rx.try_recv().is_err());
     }
 
     #[test]
@@ -10622,6 +11037,66 @@ mod tests {
         let error_frame = rx.recv().await.unwrap();
         assert_eq!(error_frame.header.ty, FrameType::Error);
         assert_eq!(error_frame.header.channel, channel);
+    }
+
+    #[tokio::test]
+    async fn module_goodbye_refreshes_requirements_and_pushes_route_closed() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry).with_capability_config(
+            [("prov".to_string(), true), ("cons".to_string(), true)],
+            BTreeMap::new(),
+        );
+        let (provider_ctx, mut provider_rx) = route_ctx(ConnectionId::new(701));
+        register_capability_manifest(
+            &handler,
+            &provider_ctx,
+            &mut provider_rx,
+            capability_manifest("prov", &["thing/v1"], &[]),
+            1,
+        )
+        .await;
+        let mut consumer = capability_manifest("cons", &[], &[]);
+        consumer.capabilities.as_mut().unwrap().requires.push(
+            subc_protocol::manifest::CapabilityRequirement {
+                capability: "thing/v1".to_string(),
+                need: subc_protocol::manifest::CapabilityNeed::Required,
+            },
+        );
+        let (consumer_ctx, mut consumer_rx) = route_ctx(ConnectionId::new(702));
+        register_capability_manifest(&handler, &consumer_ctx, &mut consumer_rx, consumer, 2).await;
+        assert_eq!(
+            handler.capability_evaluator.verdict("cons", "thing/v1"),
+            Some(CapabilityVerdict::Provided)
+        );
+        let (mut client_rx, _) = open_route_for_capability_test(
+            &handler,
+            &provider_ctx,
+            &mut provider_rx,
+            703,
+            3,
+            "prov",
+            None,
+        )
+        .await;
+        let goodbye =
+            Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap();
+        handler
+            .handle_control_frame(&provider_ctx, goodbye)
+            .await
+            .unwrap();
+        assert_eq!(
+            handler.capability_evaluator.verdict("cons", "thing/v1"),
+            Some(CapabilityVerdict::NeverProvided)
+        );
+        let closed = client_rx
+            .try_recv()
+            .expect("GOODBYE pushes route.closed before route GOODBYE");
+        assert!(
+            matches!(serde_json::from_slice::<ClientControlPush>(&closed.body).unwrap(),
+            ClientControlPush::RouteClosed { module_id, channels, .. } if module_id == "prov" && channels.len() == 1)
+        );
+        assert_eq!(client_rx.try_recv().unwrap().header.ty, FrameType::Goodbye);
+        assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -11863,12 +12338,36 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn module_goodbye_releases_scope_sync_authority_without_socket_close() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler =
+                ControlHandler::new(Arc::new(Registry::default())).with_supervisor(supervisor);
+            let (first, _rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &first, 10, vec![head("s", 1)])
+                .await
+                .unwrap();
+            handler
+                .handle_control_frame(
+                    &first,
+                    Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap(),
+                )
+                .await
+                .unwrap();
+            let (second, _rx) = module(&handler, 2, OWNER, Some("n1")).await;
+            sync(&handler, &second, 1, vec![head("s", 1)])
+                .await
+                .expect("GOODBYE releases authority even if the old socket remains open");
+        }
+
+        #[tokio::test]
         async fn describe_reports_the_incarnation_and_whether_the_owner_is_configured() {
             let registry = Arc::new(Registry::default());
             let supervisor_handle = SupervisorHandle::new();
-            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
-                .with_handle(supervisor_handle.clone())
-                .with_daemon_incarnation("incarnation-7".to_string());
+            let supervisor =
+                Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
+                    .with_handle(supervisor_handle.clone())
+                    .with_daemon_incarnation("incarnation-7".to_string());
             // Configured with enabled: false, so the supervisor lists the
             // module without spawning a process for it.
             supervisor
@@ -12043,11 +12542,16 @@ mod tests {
         }
 
         async fn rig() -> Rig {
+            rig_with_flow_support(true).await
+        }
+
+        async fn rig_with_flow_support(flow_support: bool) -> Rig {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
-            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
-                .with_handle(supervisor_handle.clone());
+            let supervisor =
+                Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
+                    .with_handle(supervisor_handle.clone());
             supervisor
                 .supervise_configured(
                     ModuleSpec {
@@ -12080,13 +12584,27 @@ mod tests {
             let mut modules = BTreeMap::new();
             for (connection, module_id) in [(2, PLEXUS), (3, OTHER)] {
                 let (ctx, mut rx) = wide_ctx(connection);
-                hello_via_sink(
-                    &handler,
-                    &ctx,
-                    &mut rx,
-                    hello_frame(module_id, PROTOCOL_VERSION, connection),
+                let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
+                let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+                // A decoder version alone must not admit flow routes. Every
+                // target here declares wire crate version 0.29.0; only one that
+                // declares `flow-scopes/v1` promises flow behaviour.
+                body["manifest"]["provenance"] =
+                    serde_json::json!({"wire_crate_version": "0.29.0"});
+                if flow_support {
+                    body["manifest"]["capabilities"] =
+                        serde_json::json!({"provides": ["flow-scopes/v1"]});
+                }
+                let hello = Frame::build(
+                    FrameType::Hello,
+                    control_flags(),
+                    0,
+                    0,
+                    connection,
+                    serde_json::to_vec(&body).unwrap(),
                 )
-                .await;
+                .unwrap();
+                hello_via_sink(&handler, &ctx, &mut rx, hello).await;
                 modules.insert(module_id.to_string(), (ctx, rx));
             }
             Rig {
@@ -12189,12 +12707,26 @@ mod tests {
                 target: &str,
                 scope: Option<ScopeSelector>,
             ) -> String {
+                self.refusal_body(opener, target, scope).await["code"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+
+            async fn refusal_body(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> Value {
                 let (ctx, _rx, frame) = self.open_frame(opener, target, scope);
-                let replies = self
-                    .handler
-                    .handle_control_frame(&ctx, frame)
-                    .await
-                    .unwrap();
+                let replies = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.handler.handle_control_frame(&ctx, frame),
+                )
+                .await
+                .expect("the open must be refused before waiting for a bind ack")
+                .unwrap();
                 assert_eq!(replies.len(), 1, "{replies:?}");
                 assert_eq!(replies[0].header.ty, FrameType::Error);
                 let (_, module_rx) = self.modules.get_mut(target).unwrap();
@@ -12202,10 +12734,8 @@ mod tests {
                     module_rx.try_recv().is_err(),
                     "a refused open relays nothing"
                 );
-                parse_error(&replies[0])["code"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
+                assert_eq!(self.forwarding.reserved_route_count().unwrap(), (0, 0));
+                parse_error(&replies[0])
             }
 
             /// Start an open and return its task and the bind the target got.
@@ -12487,6 +13017,203 @@ mod tests {
             };
             let route = rig.bound(Some(BROCA), PLEXUS, Some(own)).await;
             assert!(!route.stamp().unwrap().owner_authorized);
+        }
+
+        #[tokio::test]
+        async fn an_authority_owners_flow_id_without_an_agent_is_stamped_verbatim_on_bind() {
+            let mut rig = rig().await;
+            let mut record = head("s", 1);
+            record.carriers = vec![carrier(AFT, None)];
+            let flow_id = "Flow:run-7/step_2!~";
+            record.attributes.flow_id = Some(flow_id.to_string());
+            let reply = sync(&rig.handler, &rig.owner, 1, vec![record])
+                .await
+                .unwrap();
+            let ModuleControlResponseToModule::ScopeSync { results, .. } = reply else {
+                panic!("not a sync reply");
+            };
+            assert_eq!(results[0].outcome, ScopeRecordOutcome::Created);
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route), "the stamped bind committed");
+            let stamp = route.stamp().expect("a flow scope carries a stamp");
+            assert_eq!(stamp.attributes.flow_id.as_deref(), Some(flow_id));
+            assert_eq!(stamp.attributes.agent_id, None);
+            assert!(!stamp.attributes.delegates);
+            assert!(stamp.owner_authorized);
+            let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            assert_eq!(unscoped.stamp(), None);
+        }
+
+        #[tokio::test]
+        async fn flow_scope_refuses_a_0_29_target_without_flow_capability_and_relays_nothing() {
+            let mut rig = rig_with_flow_support(false).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            for opener in [OWNER, AFT] {
+                let body = rig
+                    .refusal_body(Some(opener), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                assert_eq!(body["code"], "target_flow_unsupported");
+                let message = body["message"].as_str().unwrap();
+                for required in [PLEXUS, "flow-scopes/v1"] {
+                    assert!(message.contains(required), "{message}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn flow_scope_admits_a_capable_target_and_preserves_flow_id_on_bind() {
+            let mut rig = rig_with_flow_support(true).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            for opener in [OWNER, AFT] {
+                let route = rig
+                    .bound(Some(opener), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                assert!(rig.live(&route));
+                assert_eq!(
+                    route.stamp().unwrap().attributes.flow_id.as_deref(),
+                    Some("flow:7")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn flow_scope_rechecks_the_relay_target_after_a_reconnect() {
+            use std::future::Future;
+
+            let mut rig = rig_with_flow_support(true).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            let (client, mut client_rx, frame) =
+                rig.open_frame(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))));
+            // Hold the route-open response permit so admission sees the first
+            // target but relay reservation cannot capture an endpoint yet.
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+
+            let old_connection = rig.modules[PLEXUS].0.connection_id;
+            rig.handler.cleanup_connection(old_connection).unwrap();
+            let (replacement, mut replacement_rx) = wide_ctx(200);
+            let hello = hello_frame(PLEXUS, PROTOCOL_VERSION, 200);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            body["manifest"]["provenance"] = serde_json::json!({"wire_crate_version": "0.29.0"});
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                200,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            hello_via_sink(&rig.handler, &replacement, &mut replacement_rx, hello).await;
+
+            client_rx.try_recv().unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .expect("the replacement is refused without waiting for a bind ack")
+                .unwrap();
+            assert_eq!(replies.len(), 1);
+            let body = parse_error(&replies[0]);
+            assert_eq!(body["code"], "target_flow_unsupported");
+            for required in [PLEXUS, "flow-scopes/v1"] {
+                assert!(body["message"].as_str().unwrap().contains(required));
+            }
+            assert!(replacement_rx.try_recv().is_err(), "no bind is relayed");
+            assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+            assert!(rig
+                .handler
+                .registry
+                .get_module_by_connection(replacement.connection_id)
+                .unwrap()
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn scope_without_flow_id_and_unscoped_routes_admit_a_target_without_flow_capability()
+        {
+            let mut rig = rig_with_flow_support(false).await;
+            rig.sync(vec![session(1)]).await;
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route));
+            assert_eq!(route.stamp().unwrap().attributes.flow_id, None);
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            let unscoped = rig.bound(Some(AFT), OTHER, None).await;
+            assert!(rig.live(&unscoped));
+            assert_eq!(unscoped.stamp(), None);
+        }
+
+        #[tokio::test]
+        async fn a_same_epoch_flow_id_change_bumps_version_and_drains_all_scoped_routes() {
+            let mut rig = rig().await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record.clone()]).await;
+            let before = rig.forwarding.published_scope_tag(OWNER, "s");
+            let mut owner_route = rig
+                .bound(Some(OWNER), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            let mut carrier_route = rig
+                .bound(Some(AFT), OTHER, Some(rig_selector("s", Some(1))))
+                .await;
+            let mut unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            rig.sync(vec![record.clone()]).await;
+            assert_eq!(rig.forwarding.published_scope_tag(OWNER, "s"), before);
+            assert!(rig.live(&owner_route) && owner_route.untouched());
+            assert!(rig.live(&carrier_route) && carrier_route.untouched());
+
+            record.attributes.flow_id = Some("flow:8".to_string());
+            rig.sync(vec![record]).await;
+            let after = rig.forwarding.published_scope_tag(OWNER, "s").unwrap();
+            let before = before.unwrap();
+            assert_eq!(after.scope_epoch, before.scope_epoch);
+            assert!(after.version > before.version);
+            for route in [&mut owner_route, &mut carrier_route] {
+                assert!(!rig.live(route));
+                assert_eq!(
+                    route.closed_reason(),
+                    RouteCloseReason::ScopeDelegationChanged
+                );
+            }
+            assert!(rig.live(&unscoped) && unscoped.untouched());
+            // Each provider also receives a GOODBYE for its drained route;
+            // consume it before expecting the next route.bind on that sink.
+            for target in [PLEXUS, OTHER] {
+                let (_, module_rx) = rig.modules.get_mut(target).unwrap();
+                let goodbye = module_rx
+                    .try_recv()
+                    .expect("the provider sees the drain")
+                    .frame;
+                assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+                assert!(module_rx.try_recv().is_err());
+            }
+            let rebound = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert_eq!(
+                rebound.stamp().unwrap().attributes.flow_id.as_deref(),
+                Some("flow:8")
+            );
         }
 
         /// The owner's sync lands between admission and the module's ack. The

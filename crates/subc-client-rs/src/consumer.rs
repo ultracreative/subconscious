@@ -1186,6 +1186,7 @@ impl SubcConsumer {
     }
 
     /// Fetch the daemon's module catalog over channel 0.
+    /// Transport retries use the consumer's reconnect backoff and call deadline.
     pub async fn catalog_list(&self) -> Result<CatalogList, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
         let body = serde_json::to_vec(&serde_json::json!({
@@ -1193,7 +1194,9 @@ impl SubcConsumer {
         }))
         .map_err(|err| CallError::not_sent(format!("failed to encode catalog.list: {err}")))?;
 
+        let mut attempt = 0usize;
         loop {
+            attempt = attempt.saturating_add(1);
             match self
                 .shared
                 .control_call(body.clone(), deadline, false, None)
@@ -1229,6 +1232,16 @@ impl SubcConsumer {
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
                 {
+                    // Connection-file and discovery failures can complete without
+                    // yielding. Pace the outer retry as well as reconnect itself,
+                    // so repeated immediate failures cannot monopolize the executor.
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1242,14 +1255,17 @@ impl SubcConsumer {
     ///
     /// A daemon refusal comes back as [`CallError::Module`], so its code is readable
     /// through [`CallError::code`]. Transport failures are retried until the
-    /// consumer's call deadline, as for [`SubcConsumer::catalog_list`].
+    /// consumer's call deadline with its reconnect backoff, as for
+    /// [`SubcConsumer::catalog_list`].
     pub async fn spawn_snapshot(&self) -> Result<SpawnSnapshot, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
         let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSnapshot {}).map_err(
             |err| CallError::not_sent(format!("failed to encode supervisor.spawn_snapshot: {err}")),
         )?;
 
+        let mut attempt = 0usize;
         loop {
+            attempt = attempt.saturating_add(1);
             match self
                 .shared
                 .control_call(body.clone(), deadline, false, None)
@@ -1279,6 +1295,13 @@ impl SubcConsumer {
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
                 {
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1446,6 +1469,7 @@ impl SubcConsumer {
     }
 
     /// Poll status or liveness for exactly this route handle.
+    /// A daemon refusal is returned as [`CallError::Module`] with its original body.
     pub async fn poll_route(
         &self,
         handle: &RouteHandle,
@@ -1473,10 +1497,14 @@ impl SubcConsumer {
                 route_open_reverse_requests: None,
             })
             .await?;
-        let TerminalFrame::Response { body, .. } = terminal else {
-            return Err(CallError::not_sent(
-                "route.poll returned a non-response frame",
-            ));
+        let body = match terminal {
+            TerminalFrame::Response { body, .. } => body,
+            TerminalFrame::Error { body, .. } => return Err(CallError::Module(body)),
+            TerminalFrame::StreamEnd => {
+                return Err(CallError::not_sent(
+                    "route.poll returned a non-response frame",
+                ));
+            }
         };
         let ClientControlResponse::RoutePoll {
             route_channel,
@@ -3820,7 +3848,7 @@ impl Shared {
         reason: String,
         cause: OutcomeUnknownCause,
     ) {
-        let (should_emit, pending, openings, callbacks) = {
+        let (should_emit, pending, callbacks) = {
             let mut inner = self.lock_inner();
             if inner.closed || inner.generation != generation || inner.writer.is_none() {
                 return;
@@ -3833,9 +3861,12 @@ impl Shared {
             inner.route_end_reasons.clear();
             inner.legacy_channel_reasons.clear();
             let pending = drain_pending_generation(&mut inner.pending, generation);
-            let openings = drain_openings(&mut inner.openings);
+            // An opening belongs to its lead caller, not to a socket generation:
+            // the caller may still be retrying after this transport is replaced.
+            // Keep its waiters and close flag until its OpeningGuard finishes, so
+            // a new caller cannot start a competing open for the same key.
             let callbacks = inner.callbacks.clone();
-            (true, pending, openings, callbacks)
+            (true, pending, callbacks)
         };
 
         if should_emit {
@@ -3845,7 +3876,6 @@ impl Shared {
                 RouteEndReason::ConnectionLost,
                 cause,
             );
-            fail_openings(openings, SharedCallFailure::not_sent(reason.clone()));
             emit_callbacks(callbacks, ConnectionState::Dropped);
             self.notify.notify_waiters();
             let _ = self.spawn_reconnect(generation);
@@ -5507,13 +5537,6 @@ fn drain_pending_handle(
         .collect()
 }
 
-fn drain_openings(openings: &mut HashMap<RouteKey, Opening>) -> Vec<Vec<OpeningWaiter>> {
-    openings
-        .drain()
-        .map(|(_, opening)| opening.waiters)
-        .collect()
-}
-
 fn fail_openings(openings: Vec<Vec<OpeningWaiter>>, failure: SharedCallFailure) {
     for waiters in openings {
         for waiter in waiters {
@@ -6890,6 +6913,135 @@ mod tests {
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
     }
 
+    async fn assert_pending(mut future: Pin<&mut impl Future>) {
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+        );
+    }
+
+    /// Replace only the transport, leaving the actual generation-drop cleanup in use.
+    fn drop_and_replace_test_transport(shared: &Arc<Shared>) -> mpsc::Receiver<WriteCommand> {
+        let generation = shared.lock_inner().generation;
+        // Keep the background supervisor from touching a real connection file.
+        shared.lock_inner().reconnect = ReconnectState::Inline { generation };
+        shared.handle_generation_drop(generation, "test connection drop".into());
+        let (writer, receiver) = mpsc::channel(64);
+        let mut inner = shared.lock_inner();
+        inner.generation += 1;
+        inner.epoch += 1;
+        inner.next_corr = Some(1);
+        inner.writer = Some(writer);
+        inner.reconnect = ReconnectState::Idle;
+        receiver
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_open_single_flight_survives_generation_drop_during_backoff() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let opts = CallOptions::default();
+        let opener = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(opener);
+        assert_pending(opener.as_mut()).await;
+        let first = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                route_open_answer(first.frame.header.corr, 0, Some(reloading())),
+            )
+            .await
+        );
+        assert_pending(opener.as_mut()).await;
+
+        // A caller already waiting and one arriving after the drop must both stay
+        // behind the same lead opener, including its unfinished retry backoff.
+        let waiting = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(waiting);
+        assert_pending(waiting.as_mut()).await;
+        let mut receiver = drop_and_replace_test_transport(&shared);
+        assert_pending(waiting.as_mut()).await;
+        let arriving = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(arriving);
+        assert_pending(arriving.as_mut()).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "a second opener bypassed the backoff"
+        );
+
+        tokio::time::advance(opts.route_retry.base).await;
+        assert_pending(opener.as_mut()).await;
+        let retry = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                2,
+                route_open_answer(retry.frame.header.corr, 42, None),
+            )
+            .await
+        );
+        let handle = opener.await.unwrap();
+        assert_eq!(waiting.await.unwrap(), handle);
+        assert_eq!(arriving.await.unwrap(), handle);
+        assert!(
+            receiver.try_recv().is_err(),
+            "more than one retry was emitted"
+        );
+        let inner = shared.lock_inner();
+        assert!(inner.openings.is_empty());
+        assert_eq!(inner.routes.len(), 1);
+        assert_eq!(inner.route_epochs.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_route_during_backoff_survives_generation_drop() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let opts = CallOptions::default();
+        let opener = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(opener);
+        assert_pending(opener.as_mut()).await;
+        let first = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                route_open_answer(first.frame.header.corr, 0, Some(reloading())),
+            )
+            .await
+        );
+        assert_pending(opener.as_mut()).await;
+        consumer
+            .close_route(
+                restart_target("m"),
+                restart_identity(),
+                CloseRouteOptions::default(),
+            )
+            .await;
+        let mut receiver = drop_and_replace_test_transport(&shared);
+        tokio::time::advance(opts.route_retry.base).await;
+        assert_pending(opener.as_mut()).await;
+        let retry = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                2,
+                route_open_answer(retry.frame.header.corr, 42, None),
+            )
+            .await
+        );
+        let err = opener.await.expect_err("close must win over the retry");
+        assert!(matches!(err, CallError::NotSent(_)));
+        let goodbye = receiver
+            .try_recv()
+            .expect("discarded route must get GOODBYE");
+        assert_eq!(goodbye.frame.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.frame.header.channel, 42);
+        assert!(receiver.try_recv().is_err());
+        let inner = shared.lock_inner();
+        assert!(inner.routes.is_empty());
+        assert!(inner.route_epochs.is_empty());
+        assert!(inner.openings.is_empty());
+    }
+
     #[tokio::test]
     async fn route_channel_index_tracks_lookup_close_and_generation_drop() {
         let shared = writer_test_shared();
@@ -7644,6 +7796,45 @@ mod tests {
             rx.try_recv().is_err(),
             "stale operations must not queue frames"
         );
+    }
+
+    #[tokio::test]
+    async fn route_poll_refusal_preserves_daemon_code_message_and_detail() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let handle = RouteHandle::new(3, 9, 1);
+        shared
+            .lock_inner()
+            .route_epochs
+            .insert(handle.channel, handle);
+        let poll = consumer.poll_route(&handle, PollKind::Liveness, Duration::from_secs(1));
+        tokio::pin!(poll);
+        assert_pending(poll.as_mut()).await;
+        let request = receiver.try_recv().unwrap();
+        let refusal = ErrorBody {
+            code: "unknown_route".into(),
+            message: "the route is no longer present".into(),
+            detail: Some(serde_json::json!({ "route_channel": 3, "route_epoch": 9 })),
+        };
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                channel_zero_frame(
+                    FrameType::Error,
+                    request.frame.header.corr,
+                    serde_json::to_vec(&refusal).unwrap(),
+                ),
+            )
+            .await
+        );
+        let err = poll.await.unwrap_err();
+        assert_eq!(err.code(), Some("unknown_route"));
+        let CallError::Module(body) = err else {
+            panic!("a delivered refusal must not be classified as a send failure");
+        };
+        assert_eq!(body.code, refusal.code);
+        assert_eq!(body.message, refusal.message);
+        assert_eq!(body.detail, refusal.detail);
     }
 
     #[tokio::test]
@@ -8889,6 +9080,56 @@ mod tests {
             .expect("catalog.list must finish at its configured deadline")
             .unwrap_err();
         assert!(matches!(result, CallError::NotSent(_)));
+    }
+
+    fn consumer_with_malformed_connection_file() -> (subc_test_support::TestTempDir, SubcConsumer) {
+        let temp = subc_test_support::TestTempDir::new("consumer-malformed-connection");
+        let path = temp.path().join("connection.json");
+        std::fs::write(&path, b"not JSON").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let shared = Arc::new(Shared::new(
+            path,
+            ConsumerOptions {
+                call_timeout: Duration::from_millis(100),
+                reconnect_backoff: RetryBackoff {
+                    base: Duration::from_millis(20),
+                    cap: Duration::from_millis(40),
+                    max_attempts: 6,
+                },
+                ..ConsumerOptions::default()
+            },
+        ));
+        (temp, SubcConsumer { shared })
+    }
+
+    // A malformed file fails synchronously. Keep the clock running so an unpaced
+    // retry loop reaches its deadline instead of hanging a paused-time runtime.
+    #[tokio::test]
+    async fn catalog_list_backs_off_after_malformed_connection_file_and_close_cancels_it() {
+        let (_temp, consumer) = consumer_with_malformed_connection_file();
+        let call = consumer.catalog_list();
+        tokio::pin!(call);
+        assert_pending(call.as_mut()).await;
+        consumer.close().await;
+        let err = call.await.unwrap_err();
+        assert!(matches!(err, CallError::NotSent(_)));
+        assert!(err.to_string().contains("consumer closed"));
+    }
+
+    #[tokio::test]
+    async fn spawn_snapshot_backs_off_after_malformed_connection_file_and_close_cancels_it() {
+        let (_temp, consumer) = consumer_with_malformed_connection_file();
+        let call = consumer.spawn_snapshot();
+        tokio::pin!(call);
+        assert_pending(call.as_mut()).await;
+        consumer.close().await;
+        let err = call.await.unwrap_err();
+        assert!(matches!(err, CallError::NotSent(_)));
+        assert!(err.to_string().contains("consumer closed"));
     }
 }
 

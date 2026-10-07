@@ -23,10 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use subc_protocol::{
     error_codes,
+    manifest::CapabilityDeclarations,
     scope::{
         ParentState, ScopeEnded, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
-        ScopeSelector, ScopeStamp, ScopeStatus, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
-        MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        ScopeSelector, ScopeStamp, ScopeStatus, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
+        MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
     },
     Principal, RouteCloseReason,
 };
@@ -214,6 +215,7 @@ fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
     let after_attributes = &after.record.attributes;
     if (before_attributes.delegates && !after_attributes.delegates)
         || before_attributes.agent_id != after_attributes.agent_id
+        || before_attributes.flow_id != after_attributes.flow_id
     {
         drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged));
     }
@@ -242,6 +244,36 @@ pub(crate) struct ScopeAdmission {
     pub(crate) owner: String,
     pub(crate) stamp: ScopeStamp,
     pub(crate) tag: ScopeTag,
+}
+
+/// Refuse before relaying a flow bind unless the target promises flow
+/// behaviour. Decoding the stamp does not prove correct handling of approvals,
+/// writes or grants. Never strip the field: without it a flow could run as
+/// its owner's ordinary session.
+pub(crate) fn check_target_flow_support(
+    stamp: &ScopeStamp,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    if stamp.attributes.flow_id.is_none() {
+        return Ok(());
+    }
+    let supported = capabilities.is_some_and(|capabilities| {
+        capabilities
+            .provides
+            .iter()
+            .any(|capability| capability == FLOW_SCOPES_CAPABILITY)
+    });
+    if supported {
+        return Ok(());
+    }
+    Err(ScopeAdmissionRefusal {
+        code: error_codes::TARGET_FLOW_UNSUPPORTED,
+        message: format!(
+            "target module '{target_module}' does not provide capability \
+             '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
+        ),
+    })
 }
 
 /// A refused scoped open: a code from `error_codes` and why.
@@ -374,6 +406,8 @@ pub(crate) struct ScopeTable {
     /// Source of every `version`. One counter for the whole table, so a version
     /// is never reused within an incarnation even across an epoch change.
     last_version: u64,
+    #[cfg(test)]
+    link_lookups: std::sync::atomic::AtomicUsize,
 }
 
 fn reserved_module_id(principal: &Principal) -> Option<&str> {
@@ -395,12 +429,23 @@ type RecordRefusal = (&'static str, String);
 /// The owner whose sync is in progress, and its set as it will stand.
 type Overlay<'a> = Option<(&'a str, &'a BTreeMap<String, ScopeRecord>)>;
 
+type ScopeLinkKey<'a> = (&'a str, &'a str, u64);
+
+#[derive(Default)]
+struct LinkCycleCache<'a> {
+    acyclic: HashSet<ScopeLinkKey<'a>>,
+    cycles: HashMap<ScopeLinkKey<'a>, usize>,
+    members: Vec<HashSet<(&'a str, &'a str)>>,
+}
+
 impl ScopeTable {
     pub(crate) fn new(authority_owners: impl IntoIterator<Item = String>) -> Self {
         Self {
             authority_owners: authority_owners.into_iter().collect(),
             owners: HashMap::new(),
             last_version: 0,
+            #[cfg(test)]
+            link_lookups: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -458,16 +503,19 @@ impl ScopeTable {
         // The refresh can change parent states and versions, so the reply is
         // read from the table after it rather than before.
         let state = &self.owners[owner];
+        let moved: HashSet<_> = applied
+            .tag_changes
+            .iter()
+            .filter(|change| change.owner == owner)
+            .map(|change| change.scope_ref.as_str())
+            .collect();
         for result in &mut applied.results {
             let live = state.live.get(&result.scope_ref);
             result.version = live.map(|scope| scope.version);
             result.parent_state = live.and_then(|scope| scope.parent_state);
             // A record re-sent unchanged can still change here, when the same
             // sync ended the parent its link names.
-            let tag_moved = applied
-                .tag_changes
-                .iter()
-                .any(|change| change.owner == owner && change.scope_ref == result.scope_ref);
+            let tag_moved = moved.contains(result.scope_ref.as_str());
             if result.outcome == ScopeRecordOutcome::Unchanged && tag_moved {
                 result.outcome = ScopeRecordOutcome::Updated;
             }
@@ -518,52 +566,94 @@ impl ScopeTable {
             }
         }
 
-        // Parent links are checked against the set as it will stand, so a
-        // record refused here can invalidate a link another record depends on
-        // (a parent reverting to an older epoch, say). Repeat until no record
-        // is newly refused; each pass refuses at least one or stops.
+        // Refusing a parent only invalidates its direct children. Settle these
+        // dependencies with a queue before walking ancestry for cycles, so a
+        // leaf-first chain with a refused root does not repeatedly walk every
+        // surviving ancestor under the scope write lock.
+        let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut new_links = vec![false; scopes.len()];
+        for (index, record) in scopes.iter().enumerate() {
+            let Some(parent) = record.parent.as_ref() else {
+                continue;
+            };
+            new_links[index] = state.live.get(&record.scope_ref).is_none_or(|held| {
+                held.record.scope_epoch != record.scope_epoch
+                    || held.record.parent.as_ref() != Some(parent)
+            });
+            if reserved_module_id(&parent.owner) == Some(owner) {
+                children.entry(&parent.scope_ref).or_default().push(index);
+            }
+        }
+        let mut pending: VecDeque<usize> = (0..scopes.len()).collect();
+        let mut queued = vec![true; scopes.len()];
         let mut new_link_states: HashMap<String, ParentState> = HashMap::new();
         loop {
-            let mut refused_this_pass = false;
-            for (index, record) in scopes.iter().enumerate() {
-                if refusals.contains_key(&index) {
+            let mut rejected = None;
+            while let Some(index) = pending.pop_front() {
+                queued[index] = false;
+                if refusals.contains_key(&index) || !new_links[index] {
                     continue;
                 }
-                let Some(parent) = record.parent.as_ref() else {
-                    continue;
-                };
+                let record = &scopes[index];
+                let parent = record.parent.as_ref().expect("new link has a parent");
                 // A link the daemon already accepted is not re-checked when the
                 // owner re-sends it unchanged: its state is kept current by the
                 // parent's owner's syncs. Re-checking it would refuse the child
                 // record on every later sync once its parent ended, although
                 // the link was valid when it was made.
-                let held = state.live.get(&record.scope_ref);
-                let link_is_new = held.is_none_or(|held| {
-                    held.record.scope_epoch != record.scope_epoch
-                        || held.record.parent.as_ref() != Some(parent)
-                });
-                if !link_is_new {
-                    continue;
-                }
-                match self.check_new_link(owner, &record.scope_ref, parent, &next) {
+                match self.check_new_link(owner, parent, &next) {
                     Ok(link_state) => {
                         new_link_states.insert(record.scope_ref.clone(), link_state);
                     }
                     Err(message) => {
-                        refusals.insert(index, (error_codes::SCOPE_PARENT_NOT_PERMITTED, message));
-                        new_link_states.remove(&record.scope_ref);
-                        match held {
-                            Some(held) => {
-                                next.insert(record.scope_ref.clone(), held.record.clone())
-                            }
-                            None => next.remove(&record.scope_ref),
-                        };
-                        refused_this_pass = true;
+                        rejected = Some((index, message));
+                        break;
                     }
                 }
             }
-            if !refused_this_pass {
+            if rejected.is_none() {
+                // Memoize ancestry only for this stable overlay. A
+                // refused cyclic link can restore an older record, so any
+                // topology change discards the cache before checking again.
+                let mut cache = LinkCycleCache::default();
+                for (index, record) in scopes.iter().enumerate() {
+                    if new_link_states.get(&record.scope_ref) == Some(&ParentState::Linked)
+                        && self.link_closes_cycle_cached(
+                            Some((owner, &next)),
+                            owner,
+                            &record.scope_ref,
+                            record.parent.as_ref().unwrap(),
+                            &mut cache,
+                        )
+                    {
+                        rejected = Some((index, "the parent link would close a cycle".to_string()));
+                        break;
+                    }
+                }
+            }
+            let Some((index, message)) = rejected else {
                 break;
+            };
+            let record = &scopes[index];
+            refusals.insert(index, (error_codes::SCOPE_PARENT_NOT_PERMITTED, message));
+            new_link_states.remove(&record.scope_ref);
+            match state.live.get(&record.scope_ref) {
+                Some(held) => {
+                    next.insert(record.scope_ref.clone(), held.record.clone());
+                }
+                None => {
+                    next.remove(&record.scope_ref);
+                }
+            }
+            for &child in children
+                .get(record.scope_ref.as_str())
+                .into_iter()
+                .flatten()
+            {
+                if !queued[child] {
+                    pending.push_back(child);
+                    queued[child] = true;
+                }
             }
         }
 
@@ -750,6 +840,12 @@ impl ScopeTable {
                     message: format!("scope ref '{}' appears more than once", record.scope_ref),
                 });
             }
+            if let Some(flow_id) = &record.attributes.flow_id {
+                subc_protocol::scope::validate_flow_id(flow_id).map_err(|error| SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message: error.to_string(),
+                })?;
+            }
             let attribute_bytes = serde_json::to_vec(&record.attributes)
                 .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX);
@@ -791,7 +887,7 @@ impl ScopeTable {
         if !record.attributes.is_empty() && !owner_authorized {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id and delegates may be set only by an owner listed in \
+                "agent_id, delegates and flow_id may be set only by an owner listed in \
                  scope_authority_owners"
                     .to_string(),
             ));
@@ -849,6 +945,9 @@ impl ScopeTable {
         owner: &str,
         scope_ref: &str,
     ) -> Option<&'a ScopeRecord> {
+        #[cfg(test)]
+        self.link_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match overlay {
             Some((syncing_owner, next)) if syncing_owner == owner => next.get(scope_ref),
             _ => self
@@ -868,7 +967,6 @@ impl ScopeTable {
     fn check_new_link(
         &self,
         owner: &str,
-        scope_ref: &str,
         parent: &ScopeParent,
         next: &BTreeMap<String, ScopeRecord>,
     ) -> Result<ParentState, String> {
@@ -904,10 +1002,67 @@ impl ScopeTable {
                 parent.scope_ref
             ));
         }
-        if self.link_closes_cycle(overlay, owner, scope_ref, parent) {
-            return Err("the parent link would close a cycle".to_string());
-        }
         Ok(ParentState::Linked)
+    }
+
+    /// Cache both terminating paths and cycle membership, sharing the work
+    /// across children of the same ancestry. An unrelated cycle does not make
+    /// a child cyclic, but its members must still be refused when examined.
+    fn link_closes_cycle_cached<'a>(
+        &'a self,
+        overlay: Overlay<'a>,
+        child_owner: &str,
+        child_ref: &str,
+        parent: &'a ScopeParent,
+        cache: &mut LinkCycleCache<'a>,
+    ) -> bool {
+        let mut visited = HashMap::new();
+        let mut path: Vec<ScopeLinkKey<'a>> = Vec::new();
+        let mut link = parent;
+        while let Some(owner) = reserved_module_id(&link.owner) {
+            let key = (owner, link.scope_ref.as_str(), link.scope_epoch);
+            if owner == child_owner && link.scope_ref == child_ref {
+                return true;
+            }
+            if cache.acyclic.contains(&key) {
+                break;
+            }
+            if let Some(&cycle) = cache.cycles.get(&key) {
+                let closes_cycle = cache.members[cycle].contains(&(child_owner, child_ref));
+                if !closes_cycle {
+                    cache.acyclic.extend(path);
+                }
+                return closes_cycle;
+            }
+            if let Some(&start) = visited.get(&key) {
+                let cycle = cache.members.len();
+                cache.members.push(
+                    path[start..]
+                        .iter()
+                        .map(|&(owner, scope_ref, _)| (owner, scope_ref))
+                        .collect(),
+                );
+                for &member in &path[start..] {
+                    cache.cycles.insert(member, cycle);
+                }
+                cache.acyclic.extend(path[..start].iter().copied());
+                return false;
+            }
+            visited.insert(key, path.len());
+            path.push(key);
+            let Some(record) = self.lookup(overlay, owner, &link.scope_ref) else {
+                break;
+            };
+            if record.scope_epoch != link.scope_epoch {
+                break;
+            }
+            let Some(up) = record.parent.as_ref() else {
+                break;
+            };
+            link = up;
+        }
+        cache.acyclic.extend(path);
+        false
     }
 
     /// Whether following parent links up from `parent` reaches
@@ -1328,6 +1483,7 @@ mod tests {
         gated.attributes = ScopeAttributes {
             agent_id: Some("agent".to_string()),
             delegates: false,
+            flow_id: None,
         };
         let mut delegating = head("d", 1);
         delegating.attributes.delegates = true;
@@ -1407,6 +1563,75 @@ mod tests {
             );
         }
         assert_eq!(outcome(&applied, "ok").outcome, ScopeRecordOutcome::Created);
+    }
+
+    #[test]
+    fn flow_id_from_a_non_authority_owner_is_refused_like_agent_id() {
+        let mut table = table();
+        let mut flow = head("flow", 1);
+        flow.attributes.flow_id = Some("flow:7".to_string());
+        let mut agent = head("agent", 1);
+        agent.attributes.agent_id = Some("agent-7".to_string());
+        let applied = sync(
+            &mut table,
+            BROCA,
+            conn(2),
+            1,
+            vec![flow, agent, head("plain", 1)],
+        );
+        let flow_result = outcome(&applied, "flow");
+        let agent_result = outcome(&applied, "agent");
+        assert_eq!(flow_result.outcome, ScopeRecordOutcome::Refused);
+        assert_eq!(
+            flow_result.code.as_deref(),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+        assert_eq!(flow_result.code, agent_result.code);
+        assert_eq!(flow_result.message, agent_result.message);
+        assert_eq!(flow_result.version, None);
+        assert_eq!(describe(&table, BROCA, "flow").status, ScopeStatus::NotLive);
+        assert_eq!(
+            outcome(&applied, "plain").outcome,
+            ScopeRecordOutcome::Created
+        );
+    }
+
+    #[test]
+    fn malformed_flow_id_refuses_sync_by_name_without_applying_it() {
+        let mut table = table();
+        sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            1,
+            vec![head("original", 1)],
+        );
+        for bad in [
+            "".to_string(),
+            "f".repeat(257),
+            "flow 7".to_string(),
+            "flow\n7".to_string(),
+        ] {
+            let mut flow = head("flow", 1);
+            flow.attributes.flow_id = Some(bad);
+            let refusal = table
+                .sync(PREFRONTAL, conn(1), any_current, 2, vec![flow])
+                .unwrap_err();
+            assert_eq!(refusal.code, INVALID_CONTROL_BODY);
+            assert!(
+                refusal.message.starts_with("flow_id"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(
+                describe(&table, PREFRONTAL, "original").status,
+                ScopeStatus::Live
+            );
+            assert_eq!(
+                describe(&table, PREFRONTAL, "flow").status,
+                ScopeStatus::NotLive
+            );
+        }
     }
 
     // ---- sync authority -----------------------------------------------------
@@ -1902,6 +2127,86 @@ mod tests {
         );
         // p was refused, so m's parent is absent in prefrontal's synced set.
         assert_eq!(parent_state(&table, MAGIC, "m"), Some(ParentState::Ended));
+    }
+
+    #[test]
+    fn leaf_first_parent_chains_use_bounded_link_work() {
+        for size in [100, 1000] {
+            for refuse_root in [false, true] {
+                let mut table = table();
+                let mut root = head("0", 1);
+                if refuse_root {
+                    root.attributes.delegates = true;
+                }
+                let mut records = (1..size)
+                    .rev()
+                    .map(|index| {
+                        child_of(&index.to_string(), PREFRONTAL, &(index - 1).to_string(), 1)
+                    })
+                    .collect::<Vec<_>>();
+                records.push(root);
+                let applied = sync(&mut table, PREFRONTAL, conn(1), 1, records);
+                assert!(applied.results.iter().all(|result| result.outcome
+                    == if refuse_root {
+                        ScopeRecordOutcome::Refused
+                    } else {
+                        ScopeRecordOutcome::Created
+                    }));
+                let lookups = table
+                    .link_lookups
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    lookups <= size * 20,
+                    "{size} records used {lookups} parent lookups (refused root: {refuse_root})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cyclic_ancestry_is_walked_once_per_overlay() {
+        let table = table();
+        let size = 100;
+        let next = (0..size)
+            .map(|index| {
+                let record = child_of(
+                    &index.to_string(),
+                    PREFRONTAL,
+                    &((index + 1) % size).to_string(),
+                    1,
+                );
+                (record.scope_ref.clone(), record)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let parent = ScopeParent {
+            owner: reserved(PREFRONTAL),
+            scope_ref: "0".to_string(),
+            scope_epoch: 1,
+        };
+        let mut cache = Default::default();
+        for index in 0..size {
+            assert!(!table.link_closes_cycle_cached(
+                Some((PREFRONTAL, &next)),
+                PREFRONTAL,
+                &format!("leaf-{index}"),
+                &parent,
+                &mut cache
+            ));
+        }
+        let lookups = table
+            .link_lookups
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(lookups <= size * 2, "shared cycle needed {lookups} lookups");
+        assert!(
+            table.link_closes_cycle_cached(
+                Some((PREFRONTAL, &next)),
+                PREFRONTAL,
+                "50",
+                &parent,
+                &mut cache
+            ),
+            "memoization must still refuse a member of the cycle"
+        );
     }
 
     /// Every order in which a parent's owner and a child's owner can sync after

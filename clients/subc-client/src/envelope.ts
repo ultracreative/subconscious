@@ -172,16 +172,17 @@ function validateHeaderFields(header: EnvelopeHeader): void {
       "sheddable_illegal_frame_type",
     );
   }
-  if (channel === 0 && epoch !== 0) {
-    throw new DecodeError(
-      `control channel carried nonzero epoch ${epoch}`,
-      "nonzero_epoch_on_control_channel",
-    );
-  }
+  // Match the wire decoder's precedence when a header violates both rules.
   if (isPureHeader(ty) && len !== 0) {
     throw new DecodeError(
       `pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`,
       "pure_header_frame_with_body",
+    );
+  }
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(
+      `control channel carried nonzero epoch ${epoch}`,
+      "nonzero_epoch_on_control_channel",
     );
   }
 }
@@ -233,16 +234,17 @@ export function decodeHeader(bytes: Uint8Array): EnvelopeHeader {
   }
   const channel = view.getUint16(7, true);
   const epoch = view.getUint32(9, true);
-  if (channel === 0 && epoch !== 0) {
-    throw new DecodeError(
-      `control channel carried nonzero epoch ${epoch}`,
-      "nonzero_epoch_on_control_channel",
-    );
-  }
+  // Body length is checked before the control epoch in Rust and Swift too.
   if (isPureHeader(ty) && len !== 0) {
     throw new DecodeError(
       `pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`,
       "pure_header_frame_with_body",
+    );
+  }
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(
+      `control channel carried nonzero epoch ${epoch}`,
+      "nonzero_epoch_on_control_channel",
     );
   }
   return { len, ver, ty, flags, channel, epoch, corr: view.getBigUint64(13, true) };
@@ -278,7 +280,17 @@ export function buildFrameWithVersion(
   return { header, body };
 }
 
-/** Encode a frame to wire bytes: header followed by exactly `len` body bytes. */
+/**
+ * Encode a frame to wire bytes: header followed by exactly `len` body bytes.
+ *
+ * Refuses, before producing any bytes, a frame the peer's decoder would reject:
+ * a header that fails any wire decode rule, or a body over MAX_FRAME_BODY_LEN.
+ * A `Frame` can be assembled by hand without going through `buildFrame`, and
+ * once a rejected header is on the socket the peer tears the whole connection
+ * down, so the refusal has to happen here rather than on the far side. The
+ * header check runs the encoded bytes through `decodeHeader` itself, so the
+ * writer cannot drift from the reader's rules.
+ */
 export function encodeFrame(frame: Frame): Uint8Array {
   if (frame.header.len !== frame.body.length) {
     throw new DecodeError(
@@ -286,7 +298,14 @@ export function encodeFrame(frame: Frame): Uint8Array {
       "frame_length_mismatch",
     );
   }
+  if (frame.body.length > MAX_FRAME_BODY_LEN) {
+    throw new DecodeError(
+      `frame body ${frame.body.length} exceeds max ${MAX_FRAME_BODY_LEN}`,
+      "frame_body_too_large",
+    );
+  }
   const header = encodeHeader(frame.header);
+  decodeHeader(header);
   const output = new Uint8Array(header.length + frame.body.length);
   output.set(header, 0);
   output.set(frame.body, header.length);

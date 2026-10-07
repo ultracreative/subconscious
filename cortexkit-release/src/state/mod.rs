@@ -117,9 +117,16 @@ impl JournalStore {
         append_record(&self.journal_path(), record)
     }
 
-    /// Returns the durable `<train>-<id>` identifier used by operator ceremonies.
+    /// Returns the journal file's basename, `<train>-<id>`, which names this
+    /// journal on disk. Operator commands take the bare train name instead
+    /// (see `train_name`), so do not pass this value to them.
     pub fn train_journal_id(&self) -> String {
         self.identity.file_stem()
+    }
+
+    /// Operator commands select a declaration's train name rather than its journal basename.
+    pub(crate) fn train_name(&self) -> &str {
+        self.identity.train.as_str()
     }
 
     /// Finds predecessor journals that recorded mutations of the supplied repository paths.

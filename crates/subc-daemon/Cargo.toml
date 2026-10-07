@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.29.2"
+version = "0.32.5"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -10,7 +10,12 @@ repository = "https://github.com/cortexkit/subconscious"
 [features]
 bench-harness = []
 loom = []
-test-support = []
+test-support = ["subc-os/test-support"]
+
+[[bin]]
+name = "privacy-trampoline-fixture"
+path = "tests/fixtures/privacy-trampoline.rs"
+required-features = ["test-support"]
 
 [dependencies]
 cortexkit-log = { version = "0.3.3" }
@@ -22,22 +27,22 @@ rlimit = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-subc-control = { path = "../subc-control", version = "0.27" }
+subc-control = { path = "../subc-control", version = "0.28" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
-subc-os = { path = "../subc-os", version = "0.1.3" }
-subc-protocol = { path = "../subc-protocol", version = "0.28.0" }
-subc-transport = { path = "../subc-transport", version = "0.9" }
+subc-os = { path = "../subc-os", version = "0.1.8" }
+subc-protocol = { path = "../subc-protocol", version = "0.29.1" }
+subc-transport = { path = "../subc-transport", version = "0.10" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-subc-cgroup = { path = "../subc-cgroup", version = "0.1.4" }
+subc-cgroup = { path = "../subc-cgroup", version = "0.1.5" }
 
 [target.'cfg(windows)'.dependencies]
 # Job-object containment for module grandchildren (issue #109). A leaf crate
 # because this crate forbids unsafe code and the Win32 calls need it.
-subc-jobobject = { path = "../subc-jobobject", version = "0.1.0" }
+subc-jobobject = { path = "../subc-jobobject", version = "0.2.0" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
@@ -46,6 +51,7 @@ subc-jobobject = { path = "../subc-jobobject", version = "0.1.0" }
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
+subc-os = { path = "../subc-os", version = "0.1.8", features = ["test-support"] }
 subc-test-support = { path = "../subc-test-support" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"

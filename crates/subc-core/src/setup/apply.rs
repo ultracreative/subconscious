@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use subc_transport::connection_file;
 
 use super::{
+    bus_monitoring::{self, BusMonitoring},
     components::{self, ReleaseArtifactSource},
     config,
     conversion::selected_components,
@@ -96,9 +97,20 @@ impl SetupBackend {
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         #[cfg(feature = "test-support")]
         if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
-            self.runtime_status = RuntimeStatus {
-                registered: true,
-                live: true,
+            // `CK_TEST_SETUP_CONTROL_OK` is the test-support control that stubs
+            // out setup's calls to the real platform. Here it replaces observing
+            // the daemon's service registration: the runtime is reported
+            // registered and live, or, with `CK_TEST_SETUP_RUNTIME_MISSING`, not
+            // registered at all. The second state lets a test run fresh setup that
+            // registers the runtime and then validates it, without the stub
+            // claiming the runtime was registered before setup began.
+            self.runtime_status = if env::var_os("CK_TEST_SETUP_RUNTIME_MISSING").is_some() {
+                RuntimeStatus::default()
+            } else {
+                RuntimeStatus {
+                    registered: true,
+                    live: true,
+                }
             };
         } else {
             self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
@@ -199,7 +211,9 @@ impl SetupBackend {
         observed.components = components;
         observed.releases = releases;
         observed.requires_core = requires_core;
-        if observed.component_state(Component::Core) != ComponentState::Missing
+        observed.core_binary_present =
+            self.paths.runtime_paths.daemon.is_file() || self.runtime_status.live;
+        if observed.core_binary_present
             && selected.iter().any(|component| {
                 component.module_id().is_some()
                     && observed.requires_core.contains_key(component)
@@ -220,6 +234,13 @@ impl SetupBackend {
         };
         observed.configuration = configuration;
         observed.running_ck_adoption = self.running_ck_adoption();
+        if !request.uninstall {
+            observed.bus_monitoring =
+                bus_monitoring::observe(&self.paths.config_path, &mut bus_monitoring::CkBusCommand);
+            if let BusMonitoring::Skipped { .. } = &observed.bus_monitoring {
+                println!("{}", observed.bus_monitoring);
+            }
+        }
         // AFT automatic detection is disabled for alpha until its owner supplies
         // a marker contract with false-positive classification rules.
         observed.detections.remove(&Component::Aft);
@@ -321,6 +342,16 @@ impl SetupBackend {
                 )),
                 SetupOperation::RetainUserData => {
                     steps.push("would retain configuration and component stores".to_string())
+                }
+                SetupOperation::MonitorNatsServer { target } => {
+                    steps.push(format!(
+                        "would add nats-server's loopback monitoring listener to {} (ck-bus install-apply --conf-only)",
+                        components::display_home_path(&target.nats_dir.join("server.conf"))
+                    ));
+                    steps.push(format!(
+                        "would then add the nats-server health check to {}, unless one is already set",
+                        components::display_home_path(&self.paths.config_path)
+                    ));
                 }
                 SetupOperation::ObservePlatform
                 | SetupOperation::OfferOptionalComponents
@@ -720,6 +751,16 @@ impl SetupExecutor for SetupBackend {
             // separate operation remains in the plan so its current-liveness
             // requirement is visible before execution.
             SetupOperation::StartRuntime => Ok(()),
+            SetupOperation::MonitorNatsServer { target } => {
+                for line in bus_monitoring::apply(
+                    &self.paths.config_path,
+                    target,
+                    &mut bus_monitoring::CkBusCommand,
+                )? {
+                    println!("  {line}");
+                }
+                Ok(())
+            }
             SetupOperation::DeregisterRuntime => Ok(()),
             SetupOperation::RemoveManagedComponent { .. } if self.uninstall_report.is_none() => {
                 // The daemon's own connection file names the pid to stop on a

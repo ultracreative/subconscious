@@ -2,15 +2,18 @@
 //! a vault delete.
 //!
 //! Three ordered steps, each idempotent:
-//! 1. Add the user's public key to the box account JWT's `revocations`. The account JWT
-//!    is read from the server through the claims lookup immediately before the update,
-//!    never from a cache (ck-bus is its single writer). The operator signer (never the
-//!    operator root) signs the updated JWT through `credential.sign`, and it is pushed
-//!    over the system user's claims-update subject. The push counts only once the
-//!    lookup reads back exactly the pushed token: the server saves a claims update
-//!    without checking its issuer, so the update's own reply proves nothing. From then
-//!    on the server refuses the user's JWT on every connect, across a server restart,
-//!    and closes its live connections itself.
+//! 1. Add the user's public key to the `revocations` of the box account JWT (the NATS
+//!    account every participant on this box connects under). The account JWT is read
+//!    from the server through the claims lookup (the `$SYS` request that returns the
+//!    account JWT the server currently holds) immediately before the update, never from
+//!    a cache (ck-bus is its single writer). The operator signer (the operator's signing
+//!    key listed in the operator JWT, never the operator's root identity key) signs the
+//!    updated JWT through `credential.sign`, and the result is pushed over the
+//!    claims-update subject of the system user (ck-bus's user in the `$SYS` system
+//!    account). The push counts only once the lookup reads back exactly the pushed
+//!    token: the server saves a claims update without checking its issuer, so the
+//!    update's own reply proves nothing. From then on the server refuses the user's JWT
+//!    on every connect, across a server restart, and closes its live connections itself.
 //! 2. Delete the module's census key, but only while it still names this credential
 //!    (the same generation, epoch and key), as a compare-and-delete on its revision. A
 //!    superseded credential's key was already overwritten by its successor, which is
@@ -23,19 +26,21 @@
 //! before step (1), replaced after each step, and removed after step (3). On restart
 //! every record resumes at the step after its last completed one. A damaged record is
 //! recovered from the census entry for its module: at exactly its (generation, epoch),
-//! the inputs are re-derived and the steps replay; absent or at another pair, step (2)
-//! had committed, so the record is cleared and nothing is issued; unreadable, recovery
-//! waits for the next period.
+//! the inputs are re-derived and the steps replay. An absent, replaced, damaged or
+//! unreadable census cannot prove a revocation committed: recovery keeps the damaged
+//! record and defers rather than guessing a key or claiming success.
 //!
 //! What triggers a revocation here: a module fetching a new credential while its census
 //! entry names another one. The entry read just before the issue is the superseded
 //! credential, whether this process issued it or an earlier ck-bus process did (which is
 //! how a restart finds superseded users: the census outlives the process, the in-memory
 //! record of issued credentials does not). The other trigger, a census entry whose
-//! module has no live process in the supervisor's spawn snapshot (the process exited),
-//! belongs to ck-bus's spawn-stream consumer, which calls `Revoker::revoke_module`.
+//! module has no live process in the supervisor's spawn snapshot (the daemon's list of
+//! live module processes and their spawn generations; a missing module means its process
+//! exited), belongs to ck-bus's spawn-stream consumer, which calls
+//! `Revoker::revoke_module`.
 //!
-//! JWT expiry is the other half of revocation (R16): every user JWT expires 15 minutes
+//! JWT expiry is the other half of revocation: every user JWT expires 15 minutes
 //! after issue, and a key whose revocation is recorded is never renewed, so a
 //! credential whose revocation was lost to damage stays valid for at most 15 minutes.
 
@@ -385,28 +390,21 @@ impl Revoker {
             .map_err(|error| deferred(0, cause::CENSUS_READ_FAILED, error.message))?;
         let current = entry
             .as_ref()
-            .and_then(|entry| CensusValue::parse(&entry.value).ok())
+            .map(|entry| CensusValue::parse(&entry.value))
+            .transpose()
+            .map_err(|reason| deferred(0, cause::CENSUS_VALUE_DAMAGED, reason))?
             .filter(|value| {
                 value.spawn_generation == identity.spawn_generation
                     && value.credential_epoch == identity.credential_epoch
             });
         let Some(value) = current else {
-            self.progress
-                .clear(identity)
-                .map_err(|error| deferred(0, cause::PROGRESS_UNWRITABLE, error.to_string()))?;
-            log_event(
-                "ckbus.revocation.recovered",
-                json!({
-                    "module_id": identity.module_id,
-                    "spawn_generation": identity.spawn_generation,
-                    "credential_epoch": identity.credential_epoch,
-                    "path": path.display().to_string(),
-                    "damage": reason,
-                    "case": if entry.is_none() { "census-entry-absent" } else { "census-entry-at-another-pair" },
-                    "action": "cleared; step (2) had committed, so step (1) had too; nothing issued",
-                }),
-            );
-            return Ok(Completed::default());
+            // Issuance can replace the census before step (1); a later revocation
+            // can also delete that successor. Neither state proves this key was revoked.
+            return Err(deferred(
+                0,
+                cause::CENSUS_VALUE_DAMAGED,
+                format!("{}: {reason}; census no longer names the lost inputs; repair the progress record", path.display()),
+            ));
         };
         let record = Record {
             identity: identity.clone(),
@@ -575,6 +573,11 @@ impl Revoker {
             ));
         }
         let now = unix_now();
+        crate::bootstrap::account_jwt::prune_revocations(
+            &mut revoked,
+            now,
+            self.credentials.lifetime,
+        );
         revoked.insert(record.user_public.clone(), now);
         // The server keeps the newer of two account JWTs by `iat`, so an update in the
         // same second as the one it replaces is dated one second later.

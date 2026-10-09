@@ -455,35 +455,75 @@ impl Drop for RouteBindReservationGuard {
 /// contention.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteBindBreakers {
-    modules: Arc<Mutex<HashMap<String, ModuleBreakerState>>>,
+    scopes: Arc<Mutex<HashMap<RouteBindScope, ModuleBreakerState>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RouteBindScope {
+    pub module_id: String,
+    pub project_root: Option<PathBuf>,
+}
+
+impl RouteBindScope {
+    pub(crate) fn new(module_id: impl Into<String>, project_root: Option<PathBuf>) -> Self {
+        Self {
+            module_id: module_id.into(),
+            project_root,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteBindConcurrency {
     modules: Arc<Mutex<HashMap<String, usize>>>,
+    per_scope: Arc<Mutex<HashMap<RouteBindScope, usize>>>,
 }
 
+#[derive(Debug)]
 struct RouteBindConcurrencyGuard {
     concurrency: RouteBindConcurrency,
     module_id: String,
+    scope: RouteBindScope,
 }
 
 impl RouteBindConcurrency {
+    /// Max concurrency per individual project root, enforcing fair queuing so a single
+    /// root burst cannot starve sibling projects under the same module.
+    pub const PER_ROOT_LIMIT: usize = 16;
+
     /// Admit without waiting. Waiting here would move the bind stall from the
     /// module reply to a semaphore and restore reader head-of-line blocking.
-    fn try_admit(&self, module_id: &str, limit: usize) -> Result<RouteBindConcurrencyGuard, usize> {
+    fn try_admit(
+        &self,
+        module_id: &str,
+        scope: RouteBindScope,
+        module_limit: usize,
+    ) -> Result<RouteBindConcurrencyGuard, usize> {
         let mut modules = self
             .modules
             .lock()
             .expect("route.bind concurrency mutex poisoned");
-        let in_flight = modules.entry(module_id.to_string()).or_default();
-        if *in_flight >= limit {
-            return Err(*in_flight);
+        let in_flight_module = modules.entry(module_id.to_string()).or_default();
+        if *in_flight_module >= module_limit {
+            return Err(*in_flight_module);
         }
-        *in_flight += 1;
+
+        let mut per_scope = self
+            .per_scope
+            .lock()
+            .expect("route.bind per_scope concurrency mutex poisoned");
+        let in_flight_scope = per_scope.entry(scope.clone()).or_default();
+        if *in_flight_scope >= Self::PER_ROOT_LIMIT {
+            return Err(*in_flight_scope);
+        }
+
+        *in_flight_module += 1;
+        *in_flight_scope += 1;
+
         Ok(RouteBindConcurrencyGuard {
             concurrency: self.clone(),
             module_id: module_id.to_string(),
+            scope,
         })
     }
 }
@@ -495,15 +535,31 @@ impl Drop for RouteBindConcurrencyGuard {
             .modules
             .lock()
             .expect("route.bind concurrency mutex poisoned");
-        let remove = {
+        let remove_mod = {
             let in_flight = modules
                 .get_mut(&self.module_id)
-                .expect("admitted route.bind has a concurrency entry");
+                .expect("admitted route.bind has a module concurrency entry");
             *in_flight -= 1;
             *in_flight == 0
         };
-        if remove {
+        if remove_mod {
             modules.remove(&self.module_id);
+        }
+
+        let mut per_scope = self
+            .concurrency
+            .per_scope
+            .lock()
+            .expect("route.bind per_scope concurrency mutex poisoned");
+        let remove_scope = {
+            let in_flight = per_scope
+                .get_mut(&self.scope)
+                .expect("admitted route.bind has a scope concurrency entry");
+            *in_flight -= 1;
+            *in_flight == 0
+        };
+        if remove_scope {
+            per_scope.remove(&self.scope);
         }
     }
 }
@@ -523,9 +579,9 @@ struct ModuleBreakerState {
 }
 
 /// What the breaker decided for one `route.open`, before any relay work.
-enum RouteBindAdmission<'a> {
+enum RouteBindAdmission {
     Admitted {
-        guard: RouteBindBreakerGuard<'a>,
+        guard: RouteBindBreakerGuard,
         /// This open is the single half-open probe, so the transition is worth
         /// one log line.
         probe: bool,
@@ -546,20 +602,20 @@ enum RouteBindAdmission<'a> {
 /// the relay -- or the whole handler being cancelled when the client
 /// disconnects -- releases a half-open probe slot instead of leaving the
 /// breaker wedged half-open with no further probes.
-struct RouteBindBreakerGuard<'a> {
+struct RouteBindBreakerGuard {
     breakers: RouteBindBreakers,
-    module_id: &'a str,
+    scope: RouteBindScope,
     probe_token: Option<Arc<()>>,
     settled: bool,
 }
 
-impl RouteBindBreakerGuard<'_> {
+impl RouteBindBreakerGuard {
     /// The module answered within the budget and took the bind. THE ONLY
     /// OUTCOME THAT CLEARS THE COUNT. Returns true when this closed an open
     /// breaker, which is a transition worth logging.
     fn record_accepted(&mut self) -> bool {
         self.settled = true;
-        self.breakers.record_accepted(self.module_id)
+        self.breakers.record_accepted(&self.scope)
     }
 
     /// The relay burned the whole budget with no answer. THE ONLY ARM THAT
@@ -567,7 +623,7 @@ impl RouteBindBreakerGuard<'_> {
     fn record_timeout(&mut self, threshold: u32, cooldown: Duration) -> Option<BreakerOpened> {
         self.settled = true;
         self.breakers.record_timeout(
-            self.module_id,
+            &self.scope,
             self.probe_token.as_ref(),
             threshold,
             cooldown,
@@ -585,15 +641,15 @@ impl RouteBindBreakerGuard<'_> {
     fn record_inconclusive(&mut self) {
         self.settled = true;
         self.breakers
-            .record_inconclusive(self.module_id, self.probe_token.as_ref());
+            .record_inconclusive(&self.scope, self.probe_token.as_ref());
     }
 }
 
-impl Drop for RouteBindBreakerGuard<'_> {
+impl Drop for RouteBindBreakerGuard {
     fn drop(&mut self) {
         if !self.settled {
             self.breakers
-                .record_inconclusive(self.module_id, self.probe_token.as_ref());
+                .record_inconclusive(&self.scope, self.probe_token.as_ref());
         }
     }
 }
@@ -609,27 +665,27 @@ struct BreakerOpened {
 }
 
 impl RouteBindBreakers {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ModuleBreakerState>> {
-        self.modules
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RouteBindScope, ModuleBreakerState>> {
+        self.scopes
             .lock()
             .expect("route.bind breaker mutex poisoned")
     }
 
     /// Decide whether this `route.open` may attempt its relay. Takes the map
     /// lock and nothing else, and never awaits.
-    fn admit<'a>(&self, module_id: &'a str) -> RouteBindAdmission<'a> {
+    fn admit(&self, scope: &RouteBindScope) -> RouteBindAdmission {
         let admitted = |probe_token: Option<Arc<()>>| RouteBindAdmission::Admitted {
             probe: probe_token.is_some(),
             guard: RouteBindBreakerGuard {
                 breakers: self.clone(),
-                module_id,
+                scope: scope.clone(),
                 probe_token,
                 settled: false,
             },
         };
 
-        let mut modules = self.lock();
-        let Some(state) = modules.get_mut(module_id) else {
+        let mut scopes = self.lock();
+        let Some(state) = scopes.get_mut(scope) else {
             return admitted(None);
         };
         let Some(cooldown_until) = state.cooldown_until else {
@@ -655,21 +711,21 @@ impl RouteBindBreakers {
         admitted(Some(token))
     }
 
-    fn record_accepted(&self, module_id: &str) -> bool {
+    fn record_accepted(&self, scope: &RouteBindScope) -> bool {
         self.lock()
-            .remove(module_id)
+            .remove(scope)
             .is_some_and(|state| state.cooldown_until.is_some())
     }
 
     fn record_timeout(
         &self,
-        module_id: &str,
+        scope: &RouteBindScope,
         probe_token: Option<&Arc<()>>,
         threshold: u32,
         cooldown: Duration,
     ) -> Option<BreakerOpened> {
-        let mut modules = self.lock();
-        let state = modules.entry(module_id.to_string()).or_default();
+        let mut scopes = self.lock();
+        let state = scopes.entry(scope.clone()).or_default();
         let was_open = state.cooldown_until.is_some();
         let was_probe = Self::owns_probe(state, probe_token);
         if was_probe {
@@ -697,59 +753,87 @@ impl RouteBindBreakers {
             .is_some_and(|(active, token)| Arc::ptr_eq(active, token))
     }
 
-    fn record_inconclusive(&self, module_id: &str, probe_token: Option<&Arc<()>>) {
-        if let Some(state) = self.lock().get_mut(module_id) {
+    fn record_inconclusive(&self, scope: &RouteBindScope, probe_token: Option<&Arc<()>>) {
+        if let Some(state) = self.lock().get_mut(scope) {
             if Self::owns_probe(state, probe_token) {
                 state.probe_in_flight = None;
             }
         }
     }
 
-    /// Discard what was learned about a module, because the process it was
-    /// learned about is gone. Returns the discarded count when it was non-zero.
-    ///
-    /// A BREAKER IS A CACHED VERDICT ABOUT A PROCESS, NOT ABOUT A NAME. A
-    /// `module_id` is a configuration identity that outlives any particular
-    /// child; what the breaker observed was the process behind the module
-    /// connection of the moment. When a new connection registers under that id
-    /// the verdict's subject no longer exists, so the verdict is stale by
-    /// construction rather than merely likely to be wrong. Keeping it would
-    /// apply a dead process's record to a live one, which is the same defect
-    /// class this breaker exists to stop the daemon committing.
-    ///
-    /// A half-open probe in flight is discarded with the rest: it was a
-    /// question about the old process.
+    /// Discard what was learned about a module across all its scopes, because
+    /// the process behind it is gone. Returns the highest discarded count when non-zero.
     pub(crate) fn reset_for_new_module_connection(&self, module_id: &str) -> Option<u32> {
-        self.lock()
-            .remove(module_id)
-            .map(|state| state.consecutive_timeouts)
-            .filter(|discarded| *discarded > 0)
+        let mut scopes = self.lock();
+        let matching_keys: Vec<RouteBindScope> = scopes
+            .keys()
+            .filter(|scope| scope.module_id == module_id)
+            .cloned()
+            .collect();
+
+        let mut max_discarded = 0;
+        for key in matching_keys {
+            if let Some(state) = scopes.remove(&key) {
+                max_discarded = max_discarded.max(state.consecutive_timeouts);
+            }
+        }
+
+        (max_discarded > 0).then_some(max_discarded)
     }
 
-    /// Open breakers, for the `server.describe` counters object. `None` when
-    /// none is open, so the key stays absent rather than present-and-empty.
-    ///
-    /// This is the operator's answer to "is this module refusing instantly or
-    /// is it fine?", which look identical from a client that retries and then
-    /// succeeds.
+    /// Open breakers, for the `server.describe` counters object.
     fn open_snapshot(&self) -> Option<serde_json::Value> {
         let now = Instant::now();
-        let modules = self.lock();
-        let open = modules
-            .iter()
-            .filter_map(|(module_id, state)| {
-                let cooldown_until = state.cooldown_until?;
-                Some((
-                    module_id.clone(),
-                    serde_json::json!({
-                        "consecutive_timeouts": state.consecutive_timeouts,
-                        "cooldown_remaining_ms":
-                            cooldown_until.saturating_duration_since(now).as_millis() as u64,
-                        "probe_in_flight": state.probe_in_flight.is_some(),
-                    }),
-                ))
-            })
-            .collect::<serde_json::Map<String, serde_json::Value>>();
+        let scopes = self.lock();
+        let mut open = serde_json::Map::new();
+
+        for (scope, state) in scopes.iter() {
+            let Some(cooldown_until) = state.cooldown_until else {
+                continue;
+            };
+            let cooldown_remaining_ms =
+                cooldown_until.saturating_duration_since(now).as_millis() as u64;
+
+            let root_str = scope
+                .project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "_global".to_string());
+
+            let scope_val = serde_json::json!({
+                "consecutive_timeouts": state.consecutive_timeouts,
+                "cooldown_remaining_ms": cooldown_remaining_ms,
+                "probe_in_flight": state.probe_in_flight.is_some(),
+                "project_root": scope.project_root.as_ref().map(|p| p.to_string_lossy().to_string()),
+            });
+
+            let entry = open
+                .entry(scope.module_id.clone())
+                .or_insert_with(|| serde_json::json!({
+                    "consecutive_timeouts": state.consecutive_timeouts,
+                    "cooldown_remaining_ms": cooldown_remaining_ms,
+                    "probe_in_flight": state.probe_in_flight.is_some(),
+                    "scoped_breakers": {}
+                }));
+
+            if let Some(obj) = entry.as_object_mut() {
+                let prev_timeouts = obj.get("consecutive_timeouts").and_then(|v| v.as_u64()).unwrap_or(0);
+                if (state.consecutive_timeouts as u64) > prev_timeouts {
+                    obj.insert("consecutive_timeouts".into(), state.consecutive_timeouts.into());
+                }
+                let prev_cd = obj.get("cooldown_remaining_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                if cooldown_remaining_ms > prev_cd {
+                    obj.insert("cooldown_remaining_ms".into(), cooldown_remaining_ms.into());
+                }
+                if state.probe_in_flight.is_some() {
+                    obj.insert("probe_in_flight".into(), true.into());
+                }
+                if let Some(scoped_obj) = obj.get_mut("scoped_breakers").and_then(|v| v.as_object_mut()) {
+                    scoped_obj.insert(root_str, scope_val);
+                }
+            }
+        }
+
         (!open.is_empty()).then_some(serde_json::Value::Object(open))
     }
 }
@@ -3476,9 +3560,14 @@ impl ControlHandler {
         // reader no longer waits for that budget, so cap each target explicitly;
         // serial dispatch used to provide the accidental cap of one relay per
         // connection. Admission is a mutex-protected count and never waits.
+        let bind_scope = RouteBindScope::new(
+            target_module_id.clone(),
+            Some(project_root.as_path().to_path_buf()),
+        );
+
         let _concurrency_guard = match self
             .route_bind_concurrency
-            .try_admit(&target_module_id, MAX_PENDING_ROUTE_BINDS_PER_TARGET)
+            .try_admit(&target_module_id, bind_scope.clone(), MAX_PENDING_ROUTE_BINDS_PER_TARGET)
         {
             Ok(guard) => guard,
             Err(in_flight) => {
@@ -3493,11 +3582,14 @@ impl ControlHandler {
 
         // A module that has already burned the whole budget `threshold` times
         // in a row does not get to charge it again until a probe says it recovered.
-        let mut breaker = match self.route_bind_breakers.admit(&target_module_id) {
+        // Breakers are scoped by (module_id, project_root) so slowness in one project
+        // root does not lock out sibling projects on the same workstation.
+        let mut breaker = match self.route_bind_breakers.admit(&bind_scope) {
             RouteBindAdmission::Admitted { guard, probe } => {
                 if probe {
                     info!(
                         module_id = %target_module_id,
+                        project_root = ?project_root.as_path(),
                         connection_id = ctx.connection_id.get(),
                         "route.bind breaker half-open: admitting one probe"
                     );
@@ -7505,19 +7597,100 @@ mod tests {
     }
 
     #[test]
+    fn route_bind_breaker_is_scoped_per_project_root() {
+        let breakers = RouteBindBreakers::default();
+        let scope_a = RouteBindScope::new("aft", Some(PathBuf::from("/projects/repo-a")));
+        let scope_b = RouteBindScope::new("aft", Some(PathBuf::from("/projects/repo-b")));
+
+        // Open breaker for repo-a with 3 timeouts
+        for _ in 0..3 {
+            let RouteBindAdmission::Admitted { mut guard, .. } = breakers.admit(&scope_a) else {
+                panic!("relay for repo-a must be admitted initially");
+            };
+            guard.record_timeout(3, Duration::from_secs(20));
+        }
+
+        // repo-a must now be refused by open breaker
+        assert!(matches!(
+            breakers.admit(&scope_a),
+            RouteBindAdmission::Refused {
+                consecutive_timeouts: 3,
+                ..
+            }
+        ));
+
+        // repo-b under the same module must remain admitted and unaffected!
+        assert!(matches!(
+            breakers.admit(&scope_b),
+            RouteBindAdmission::Admitted { probe: false, .. }
+        ));
+
+        // Global/unscoped route under the same module also remains unaffected
+        let scope_global = RouteBindScope::new("aft", None);
+        assert!(matches!(
+            breakers.admit(&scope_global),
+            RouteBindAdmission::Admitted { probe: false, .. }
+        ));
+
+        // Resetting the module connection clears all root scopes for that module
+        let discarded = breakers.reset_for_new_module_connection("aft");
+        assert_eq!(discarded, Some(3));
+        assert!(matches!(
+            breakers.admit(&scope_a),
+            RouteBindAdmission::Admitted { probe: false, .. }
+        ));
+    }
+
+    #[test]
+    fn route_bind_concurrency_enforces_per_root_fair_queuing() {
+        let concurrency = RouteBindConcurrency::default();
+        let scope_a = RouteBindScope::new("aft", Some(PathBuf::from("/projects/repo-a")));
+        let scope_b = RouteBindScope::new("aft", Some(PathBuf::from("/projects/repo-b")));
+
+        let mut guards_a = Vec::new();
+        for _ in 0..RouteBindConcurrency::PER_ROOT_LIMIT {
+            let guard = concurrency
+                .try_admit("aft", scope_a.clone(), 32)
+                .expect("admitted under per-root limit");
+            guards_a.push(guard);
+        }
+
+        // repo-a is now at the per-root limit (16) and must be refused
+        assert_eq!(
+            concurrency.try_admit("aft", scope_a.clone(), 32).unwrap_err(),
+            RouteBindConcurrency::PER_ROOT_LIMIT
+        );
+
+        // repo-b has not used its quota and can still be admitted
+        let guard_b = concurrency
+            .try_admit("aft", scope_b.clone(), 32)
+            .expect("repo-b must be admitted despite repo-a saturation");
+
+        // Dropping one repo-a guard frees a slot
+        drop(guards_a.pop());
+        let _new_a = concurrency
+            .try_admit("aft", scope_a.clone(), 32)
+            .expect("repo-a has room after guard drop");
+
+        drop(guard_b);
+        drop(guards_a);
+    }
+
+    #[test]
     fn stale_relay_settlement_cannot_release_the_half_open_probe() {
+        let scope = RouteBindScope::new("prov", None);
         for settlement in ["timeout", "inconclusive", "drop"] {
             let breakers = RouteBindBreakers::default();
             let RouteBindAdmission::Admitted {
                 guard: mut old,
                 probe: false,
-            } = breakers.admit("prov")
+            } = breakers.admit(&scope)
             else {
                 panic!("ordinary relay admitted")
             };
             let RouteBindAdmission::Admitted {
                 guard: mut opener, ..
-            } = breakers.admit("prov")
+            } = breakers.admit(&scope)
             else {
                 panic!("second relay admitted")
             };
@@ -7530,7 +7703,7 @@ mod tests {
             let RouteBindAdmission::Admitted {
                 guard: mut probe,
                 probe: true,
-            } = breakers.admit("prov")
+            } = breakers.admit(&scope)
             else {
                 panic!("one cooldown probe admitted")
             };
@@ -7546,7 +7719,7 @@ mod tests {
             }
             assert!(
                 matches!(
-                    breakers.admit("prov"),
+                    breakers.admit(&scope),
                     RouteBindAdmission::Refused {
                         probe_in_flight: true,
                         ..
@@ -7561,12 +7734,12 @@ mod tests {
                     .reopened_after_probe
             );
             assert!(matches!(
-                breakers.admit("prov"),
+                breakers.admit(&scope),
                 RouteBindAdmission::Admitted { probe: true, .. }
             ));
         }
         let breakers = RouteBindBreakers::default();
-        let admit = || match breakers.admit("prov") {
+        let admit = || match breakers.admit(&scope) {
             RouteBindAdmission::Admitted { guard, .. } => guard,
             _ => panic!("relay admitted"),
         };
@@ -7577,7 +7750,7 @@ mod tests {
         let _new_probe = admit();
         old_probe.record_inconclusive();
         assert!(matches!(
-            breakers.admit("prov"),
+            breakers.admit(&scope),
             RouteBindAdmission::Refused {
                 probe_in_flight: true,
                 ..
@@ -9760,15 +9933,16 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         let (ctx, _rx) = route_ctx(ConnectionId::new(97));
         let limit = MAX_PENDING_ROUTE_BINDS_PER_TARGET;
+        let scope = |i| RouteBindScope::new("busy", Some(PathBuf::from(format!("/tmp/root-{i}"))));
         let guards = (0..limit)
-            .map(|_| {
+            .map(|i| {
                 handler
                     .route_bind_concurrency
-                    .try_admit("busy", limit)
+                    .try_admit("busy", scope(i), limit)
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let in_flight = match handler.route_bind_concurrency.try_admit("busy", limit) {
+        let in_flight = match handler.route_bind_concurrency.try_admit("busy", scope(limit), limit) {
             Err(in_flight) => in_flight,
             Ok(_) => panic!("target cap must refuse after {limit} admissions"),
         };

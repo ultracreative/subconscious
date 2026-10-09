@@ -55,7 +55,7 @@ pub const MAX_PENDING_ROUTE_OPENS_PER_CONNECTION: usize = 8;
 /// Two safe per-connection bursts retain useful parallelism without restoring
 /// the hundreds-of-binds fanout that serial dispatch used to suppress.
 pub(crate) const MAX_PENDING_ROUTE_BINDS_PER_TARGET: usize =
-    MAX_PENDING_ROUTE_OPENS_PER_CONNECTION * 2;
+    MAX_PENDING_ROUTE_OPENS_PER_CONNECTION * 4;
 pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 // Sized for the restart-herd shape: after a daemon bounce, every live client
 // connection plus all supervised children re-dial within the same second

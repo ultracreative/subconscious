@@ -1,6 +1,6 @@
 # Arcus Packaging, Distribution & Submission Guide
 
-This document defines the canonical Arcus v0.4.0 packaging, dist directory hierarchy, and gateway submission standard for the `subconscious` repository.
+ This document defines the canonical Arcus v0.4.3 packaging, dist directory hierarchy, release tagging, and gateway submission standard for the `subconscious` repository.
 
 ---
 
@@ -98,7 +98,7 @@ bun run bootstrap:arcus
 ```
 - Installs `arcus-publisher` toolchain via `arcus install arcus-publisher`.
 - Symlinks `packages/arcus/toolchain`.
-- Symlinks `.opencode/skills/arcus-publisher`.
+ - Does NOT create `.opencode/skills/arcus-publisher` symlinks (Rule #6401: skills are delivered centrally via UC Studio Skill Loom).
 - Symlinks lifecycle scripts (`arcus-pipeline.sh`, `pack-arcus.sh`, `publish-arcus.sh`, `validate-arcus.sh`, `sign-arcus.sh`, `arcus-toolchain.json`, `submission.schema.json`) into `scripts/`.
 - Validates the toolchain headers (`publisher toolchain accepted: 0.4.0`).
 
@@ -119,31 +119,37 @@ sh scripts/validate-arcus.sh dist/<sequence>/ck-subc/<version>/releases/ck-subc-
 ```
 - Fail-closed verification of Ed25519 signatures, payload targets, and hash manifests.
 
-#### Step 4: Submission to Gateway & Intake Transition
-
-There are two submission paths depending on gateway feature deployment:
-
-1. **Active Direct Ingestion (Today)**:
-   - Deliver the generated bundle path under `dist/<sequence>/<package>/<version>/` via mailbox to `arcus` (`arcus-a3e4dd68`).
-   - The Arcus owner executes intake via `scripts/arcus-accept-submission.sh <bundle-dir> --commit --push`.
-   - Requires `"gateway": "https://arcus-auth.rustybret.com"` declared in `packages/arcus/*.json` for dynamic sequence allocation.
-2. **Automated HTTPS Submission (`arcus publish submit` / Arcus 0.4.1)**:
-   - When Cloudhome deploys `POST /v1/publish` on the gateway and Arcus 0.4.1 ships:
-     ```bash
-     # Single command pipeline with submission integration:
-     sh packages/arcus/toolchain/scripts/arcus-pipeline.sh all --submit
-
-     # Or via direct CLI:
-     arcus publish submit dist/<sequence>/ck-subc/<version>/ --wait
-     ```
-   - Running `bun run bootstrap:arcus` will automatically update `packages/arcus/toolchain` to enable `--submit` natively once released.
-
-#### Step 5: Query Submission Status
-```bash
-arcus publish status <submission-id>
-```
-- Displays verification diagnostics, hydration state, and catalog promotion progress once submitted.
-
+ #### Step 4: Staging to GitHub Release FIRST (Mandatory)
+ 
+ To prevent gateway fetch workers from failing with HTTP 404 or `SizeBytes == 0`, release archives must be uploaded to GitHub before gateway submission:
+ 
+ ```bash
+ # Release tag naming standard: <package_id>-v<version>_seq<sequence>
+ TAG="${PACKAGE_ID}-v${VERSION}_seq${SEQUENCE}"
+ 
+ gh release create "${TAG}" --title "${PACKAGE_ID} v${VERSION} (seq ${SEQUENCE})"
+ gh release upload "${TAG}" "dist/${SEQUENCE}/${PACKAGE_ID}/${VERSION}/"* --clobber
+ ```
+ 
+ *Invariant*: Release tags must end in `_seq<sequence>` rather than `-<seq>` to avoid SemVer pre-release parsing collisions.
+ 
+ #### Step 5: Submission to Gateway Intake
+ 
+ Submit the version directory directly via positional argument:
+ ```bash
+ arcus publish submit "dist/${SEQUENCE}/${PACKAGE_ID}/${VERSION}" --wait
+ ```
+ 
+ Gateway intake transitions through:
+ `queued` -> `fetching` -> `verifying` -> `testing` -> `awaiting_promotion` -> `published`.
+ 
+ #### Step 6: Query Submission Status
+ ```bash
+ arcus publish status <submission-id>
+ arcus publish list
+ ```
+ 
+ Promotion to `index.json` is signed exclusively by Cloudhome's Vault signer pod with key `CATALOG-1` via atomic CAS operations. Client/publisher keys never sign catalog indexes directly.
 ---
 
 ## 5. Pruned & Obsolete Practices
